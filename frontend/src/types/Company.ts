@@ -1,0 +1,20 @@
+export type SearchStatus = "Completed" | "Partial" | "Needs Review" | "Failed";
+
+export interface Company {
+  id: string;
+  name: string;
+  city: string;
+  state: string;
+  knownWebsite: string;
+  officialWebsite: string;
+  careersPageUrl: string;
+  jobBoardUrl: string;
+  jobBoardDiscoveryMethod: "Static Link" | "Browser Click" | "Manual" | "Not Found" | string;
+  jobsRssFeedUrl: string;
+  jobPlatform: string;
+  feedFound: boolean;
+  searchStatus: SearchStatus;
+  confidence: number;
+  lastChecked: string;
+  notes: string;
+}
