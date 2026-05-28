@@ -102,12 +102,19 @@ def find_careers_page(official_url: str, session: requests.Session) -> tuple[str
             continue
 
         links = extract_links(final_url, html)
+        careers_matches: list[tuple[str, str]] = []
         for text, href in links:
             platform = detect_job_platform(href)
             if platform:
                 platform_urls.append(href)
             if link_matches_careers(text, href):
-                return href, detect_job_platform(href), notes
+                careers_matches.append((text, href))
+
+        if platform_urls:
+            return platform_urls[0], detect_job_platform(platform_urls[0]), notes
+        if careers_matches:
+            href = careers_matches[0][1]
+            return href, detect_job_platform(href), notes
 
         for text, href in links:
             if href not in visited and is_same_registered_domain(official_url, href):

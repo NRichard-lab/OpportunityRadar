@@ -4,8 +4,15 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DEFAULT_INPUT = BASE_DIR / "sample_companies.xlsx"
-DEFAULT_OUTPUT = BASE_DIR / "output" / "financial_jobs_radar_enriched.xlsx"
+DEFAULT_MASTER = DATA_DIR / "master.xlsx"
+DEFAULT_JSON_OUTPUT = DATA_DIR / "companies.json"
+DEFAULT_FRONTEND_COMPANIES_JSON = BASE_DIR / "frontend" / "public" / "data" / "companies.json"
+DEFAULT_JOBS_JSON = DATA_DIR / "jobs.json"
+DEFAULT_FRONTEND_JOBS_JSON = BASE_DIR / "frontend" / "public" / "data" / "jobs.json"
+DEFAULT_APPLICATIONS_JSON = DATA_DIR / "applications.json"
+DEFAULT_JOBS_XLSX = BASE_DIR / "output" / "jobs_snapshot.xlsx"
 LOG_DIR = BASE_DIR / "logs"
 OUTPUT_DIR = BASE_DIR / "output"
 
@@ -18,10 +25,11 @@ POLITE_DELAY_SECONDS = 0.75
 MAX_CRAWL_PAGES = 8
 
 OFFICIAL_WEBSITE_SEARCH_PHRASES = [
-    "{company} credit union official website",
-    "{company} bank official website",
-    "{company} careers",
-    "{company} jobs",
+    "\"{company}\" \"credit union\"",
+    "\"{company}\" \"federal credit union\"",
+    "\"{company}\" \"bank\"",
+    "\"{company}\" official website",
+    "\"{company}\" careers",
 ]
 
 CAREERS_KEYWORDS = [
@@ -68,15 +76,27 @@ DISALLOWED_RESULT_DOMAINS = [
     "yellowpages.com",
     "opencorporates.com",
     "dnb.com",
+    "ncua.gov",
+    "routingnumber",
+    "usbanklocations.com",
+    "bankbranchlocator.com",
+    "branchspot.com",
 ]
 
 OUTPUT_COLUMNS = [
+    "Company ID",
     "Company Name",
     "City",
     "State",
     "Known Website",
     "Official Website",
+    "Website Discovery Method",
+    "Website Candidate URLs",
+    "Website Verification Notes",
+    "Website Verified",
     "Careers Page URL",
+    "Job Board URL",
+    "Job Board Discovery Method",
     "Jobs RSS Feed URL",
     "Job Platform",
     "Feed Found",

@@ -18,13 +18,19 @@ env/
 
 # Tool caches
 .pip-cache/
+.playwright-browsers/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+frontend/.npm-cache/
 
 # Generated runtime artifacts
 logs/
 output/
+frontend/dist/
+frontend/node_modules/
+frontend/*.log
+frontend/*.tsbuildinfo
 
 # Private/local input workbooks and Excel temp files
 DNAClients.xlsx
