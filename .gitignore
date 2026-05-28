@@ -1,0 +1,39 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# Tool caches
+.pip-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated runtime artifacts
+logs/
+output/
+
+# Private/local input workbooks and Excel temp files
+DNAClients.xlsx
+~$*.xlsx
+*.tmp.xlsx
+*.bak.xlsx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
