@@ -23,6 +23,8 @@ env/
 .ruff_cache/
 
 # Generated runtime artifacts
+data/*.db
+data/*.db-*
 logs/
 output/
 
@@ -37,3 +39,8 @@ DNAClients.xlsx
 Thumbs.db
 *.swp
 *.swo
+
+# Opportunity Radar frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
