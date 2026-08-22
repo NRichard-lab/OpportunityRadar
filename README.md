@@ -2,6 +2,37 @@
 
 Financial Jobs Radar is a local-first enrichment tool for banks and credit unions. Version 1 reads an Excel list of companies, finds or verifies each official website, looks for a careers/jobs page, checks for RSS or Atom feeds, detects common recruiting platforms, and writes the results to a new Excel workbook.
 
+## Opportunity Radar app (in progress)
+
+The repository now also contains the beginning of the later local-first **Opportunity Radar** app:
+
+- `backend/`: FastAPI API with SQLite as the source of truth.
+- `frontend/`: React/Vite dashboard with Dashboard, Companies, Job List, Jobs Applied For, and Resume Match tabs.
+- `data/opportunity_radar.db`: Created on first backend startup and intentionally excluded from Git.
+
+The dashboard starts with a small sample record so the data flow is visible. It does not search the web automatically, apply to jobs, log in to sites, bypass CAPTCHAs, or send resume/job text to AI services.
+
+### Run the app locally
+
+In one terminal:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn backend.main:app --reload
+```
+
+In another terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
 This first version intentionally does not include a dashboard, database, authentication, or job-listing scraper. The goal is to build clean source data first.
 
 ## Install
