@@ -10,6 +10,8 @@ from excel_tools import create_sample_workbook, read_companies, write_results
 from job_platforms import detect_job_platform
 from search_tools import choose_official_website
 from website_tools import find_careers_page, find_feed, make_session
+from backend.database import get_connection, initialize_database
+from backend.job_collection import run_collection
 
 
 def configure_logging() -> None:
@@ -33,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Enrich a bank/credit union Excel list with career site data.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Input Excel workbook path.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output Excel workbook path.")
+    parser.add_argument("--debug-job-collection", action="store_true", help="Collect jobs for verified companies and write detailed diagnostics.")
+    parser.add_argument("--company-id", type=int, help="Limit debug job collection to one company ID.")
     return parser.parse_args()
 
 
@@ -113,6 +117,25 @@ def enrich_company(company: dict[str, str], checked_at: str) -> dict[str, object
 def main() -> int:
     configure_logging()
     args = parse_args()
+    if args.debug_job_collection:
+        initialize_database()
+        with get_connection() as conn:
+            if args.company_id:
+                rows = conn.execute("SELECT id, name FROM companies WHERE id=? AND search_status='Verified'", (args.company_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT id, name FROM companies WHERE search_status='Verified' AND job_board_url<>'' ORDER BY name").fetchall()
+        if not rows:
+            logging.warning("No verified companies with job-board URLs matched the request.")
+            return 0
+        failures = 0
+        for row in rows:
+            try:
+                report = run_collection(row["id"], debug=True)
+                logging.info("Collected %s: %s", row["name"], report)
+            except Exception:
+                failures += 1
+                logging.exception("Debug job collection failed for %s", row["name"])
+        return 1 if failures else 0
     input_path = args.input.resolve()
     output_path = args.output.resolve()
 

@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 
 PLATFORM_DOMAIN_MAP = {
+    "dayforcehcm.com": "Dayforce",
     "myworkdayjobs.com": "Workday",
     "greenhouse.io": "Greenhouse",
     "lever.co": "Lever",
@@ -19,6 +20,7 @@ PLATFORM_DOMAIN_MAP = {
     "applicantpro.com": "ApplicantPro",
     "oraclecloud.com": "Oracle Recruiting",
     "successfactors.com": "SAP SuccessFactors",
+    "saashr.com": "SaaS HR",
 }
 
 
