@@ -3,8 +3,10 @@ export type SearchStatus = "Completed" | "Partial" | "Needs Review" | "Failed";
 export interface Company {
   id: string;
   name: string;
+  industry?: string;
   city: string;
   state: string;
+  country?: string;
   knownWebsite: string;
   officialWebsite: string;
   careersPageUrl: string;
@@ -17,4 +19,11 @@ export interface Company {
   confidence: number;
   lastChecked: string;
   notes: string;
+  activeJobCount?: number;
+  appliedCount?: number;
+  lastCollectionDate?: string;
+  foundedYear?: number;
+  totalAssets?: number;
+  assetsAsOfDate?: string;
+  companyInfoLastChecked?: string;
 }

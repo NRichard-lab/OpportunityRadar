@@ -1,0 +1,18 @@
+{
+  "name": "Opportunity Radar",
+  "short_name": "Opportunity Radar",
+  "description": "Track financial-sector companies, opportunities, applications, and job-board discovery.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#081016",
+  "theme_color": "#1F4E6B",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -27,6 +27,7 @@ class PaycorCollector(BaseCollector):
         source_url, source_type = self.source_url(company)
         if not source_url:
             return []
+        source_url = self.resolve_embedded_job_board_url(source_url, "Paycor")
 
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:

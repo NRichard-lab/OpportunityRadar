@@ -1,12 +1,12 @@
-import type { MatchRecommendation } from "../utils/resumeMatch";
-
 interface MatchScoreBadgeProps {
   score: number | null;
-  recommendation?: MatchRecommendation | string;
+  recommendation?: string;
+  status?: string;
 }
 
-export function MatchScoreBadge({ score, recommendation }: MatchScoreBadgeProps) {
+export function MatchScoreBadge({ score, recommendation, status }: MatchScoreBadgeProps) {
   const numericScore = score ?? 0;
+  const showRecommendation = Boolean(recommendation && recommendation !== status && score !== null);
   const tone =
     numericScore >= 80
       ? "border-green-400/50 bg-green-400/12 text-green-200"
@@ -18,8 +18,8 @@ export function MatchScoreBadge({ score, recommendation }: MatchScoreBadgeProps)
 
   return (
     <span className={`badge ${tone}`}>
-      {score === null ? "Resume Fit Score: Not scored" : `Resume Fit Score: ${score}%`}
-      {recommendation ? ` - ${recommendation}` : ""}
+      {score === null ? `Resume Fit: ${status || "Not Matched"}` : `Resume Fit Score: ${score}%`}
+      {showRecommendation ? ` - ${recommendation}` : ""}
     </span>
   );
 }

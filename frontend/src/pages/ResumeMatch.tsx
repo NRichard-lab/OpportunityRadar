@@ -1,88 +1,99 @@
 import { useMemo, useState } from "react";
+import { LoaderCircle, RefreshCw } from "lucide-react";
 import type { Job } from "../types/Job";
+import type { MaintenanceJobsState } from "../types/Maintenance";
 import type { ResumeProfile } from "../types/ResumeProfile";
-import { ResumeUpload } from "../components/ResumeUpload";
+import { JobDetailsModal } from "../components/JobDetailsModal";
 import { MatchScoreBadge } from "../components/MatchScoreBadge";
-import { compareResumeToJob } from "../utils/resumeMatch";
+import { ResumeUpload } from "../components/ResumeUpload";
+import { isCurrentJobRecord } from "../utils/jobRecords";
+import { API_BASE } from "../api";
 
 interface ResumeMatchProps {
-  jobs: Job[];
-  resume: ResumeProfile | null;
-  onResumeChange: (resume: ResumeProfile) => void;
+  jobs: Job[]; resume: ResumeProfile | null; onResumeChange: (resume: ResumeProfile) => void;
+  maintenance: MaintenanceJobsState; onMaintenanceRefresh: () => Promise<MaintenanceJobsState>;
+  onJobsReload: () => Promise<void>; onRematch: (jobId: string) => Promise<Job>;
+  utilitiesEnabled: boolean;
 }
 
-export function ResumeMatch({ jobs, resume, onResumeChange }: ResumeMatchProps) {
-  const [selectedJobId, setSelectedJobId] = useState(jobs[0]?.id ?? "");
-  const selectedJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
-  const result = useMemo(() => (selectedJob ? compareResumeToJob(resume, selectedJob) : null), [resume, selectedJob]);
+export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaintenanceRefresh, onJobsReload, onRematch, utilitiesEnabled }: ResumeMatchProps) {
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState("All statuses");
+  const [sort, setSort] = useState("Highest match");
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState("");
+  const matchJob = maintenance.jobs.find((item) => item.jobKey === "rematch-all-jobs");
+  const run = matchJob?.activeRun || matchJob?.latestRun || null;
+  const resumeNeedsReupload = Boolean(resume && (
+    resume.notes?.toLowerCase().includes("parsing is stubbed") || resume.yearsExperienceSummary?.toLowerCase().startsWith("todo: parse")
+  ));
 
-  return (
-    <div className="grid gap-6 xl:grid-cols-[0.85fr_1.15fr]">
-      <div className="space-y-5">
-        <ResumeUpload resume={resume} onResumeChange={onResumeChange} />
-        <div className="card p-5">
-          <label className="text-sm font-semibold text-white" htmlFor="job-select">Select job</label>
-          <select id="job-select" className="field mt-2" value={selectedJob?.id ?? ""} onChange={(event) => setSelectedJobId(event.target.value)}>
-            {jobs.map((job) => <option key={job.id} value={job.id}>{job.companyName} - {job.title}</option>)}
-          </select>
-          <p className="mt-4 text-sm text-slate-400">
-            Suggestions stay honest: this tool highlights focus areas and does not generate fake experience or exaggerated qualifications.
-          </p>
-        </div>
+  const visibleJobs = useMemo(() => jobs.filter(isCurrentJobRecord).filter((job) => {
+    const searchable = `${job.companyName} ${job.title}`.toLowerCase();
+    return searchable.includes(query.toLowerCase()) && (status === "All statuses" || (job.matchStatus || "Not Matched") === status);
+  }).sort((left, right) => {
+    if (sort === "Company") return left.companyName.localeCompare(right.companyName) || left.title.localeCompare(right.title);
+    if (sort === "Lowest match") return (left.matchScore ?? 101) - (right.matchScore ?? 101);
+    return (right.matchScore ?? -1) - (left.matchScore ?? -1) || left.companyName.localeCompare(right.companyName);
+  }), [jobs, query, sort, status]);
+
+  const startRematch = async () => {
+    if (!utilitiesEnabled) {
+      setError("Bulk rematching is disabled for the initial production release.");
+      return;
+    }
+    setStarting(true); setError("");
+    try {
+      const response = await fetch(`${API_BASE}/maintenance/jobs/rematch-all-jobs/run`, { method: "POST" });
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "Rematch All could not be started.");
+      await onMaintenanceRefresh();
+    } catch (startError) { setError(startError instanceof Error ? startError.message : "Rematch All could not be started."); }
+    finally { setStarting(false); }
+  };
+
+  const bulkRunning = Boolean(matchJob?.running);
+  const summary = run?.summary || {};
+  const processed = Number(summary.jobsProcessed ?? run?.current ?? 0);
+  const failed = Number(summary.jobsFailed ?? 0);
+  const remaining = Number(summary.jobsRemaining ?? Math.max(0, (run?.total || 0) - processed));
+
+  return <div className="space-y-5">
+    <ResumeUpload resume={resume} onResumeChange={onResumeChange} />
+    <section className="panel p-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div><h2 className="text-lg font-semibold text-white">Match Current Jobs</h2><p className="mt-1 max-w-2xl text-sm text-slate-400">Use the active resume to calculate and save a consistent fit score for every current job. Existing scores remain available until a resume or job change requires rematching.</p></div>
+        <button className="btn btn-primary shrink-0" type="button" title={!utilitiesEnabled ? "Bulk rematching is disabled for the initial production release." : undefined} disabled={!utilitiesEnabled || !resume || resumeNeedsReupload || bulkRunning || starting} onClick={() => void startRematch()}>{bulkRunning || starting ? <LoaderCircle className="animate-spin" size={16} /> : <RefreshCw size={16} />}{bulkRunning ? "Matching..." : utilitiesEnabled ? "Rematch All Jobs" : "Rematch unavailable"}</button>
       </div>
-      <div className="panel p-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <p className="text-sm text-radar-cyan">{selectedJob?.companyName ?? "No job selected"}</p>
-            <h2 className="text-xl font-semibold text-white">{selectedJob?.title ?? "Resume match"}</h2>
-            <p className="mt-1 text-sm text-slate-400">
-              This is an estimated resume/job fit score, not a hiring prediction.
-            </p>
-          </div>
-          {result ? <MatchScoreBadge score={result.score} recommendation={result.recommendation} /> : null}
-        </div>
-        {result ? (
-          <div className="mt-6 space-y-5">
-            <Section title="Matched keywords" items={result.matchedKeywords} />
-            <Section title="Missing keywords" items={result.missingKeywords} />
-            <div className="grid gap-4 md:grid-cols-2">
-              <Block title="Experience alignment" body={result.experienceAlignment} />
-              <Block title="Title alignment" body={result.titleAlignment} />
-            </div>
-            <Block
-              title="Suggested resume focus areas"
-              body={
-                result.missingKeywords.length
-                  ? `If accurate, consider making relevant experience easier to find for: ${result.missingKeywords.slice(0, 5).join(", ")}.`
-                  : "The visible keywords already overlap well. Keep the resume specific and evidence-based."
-              }
-            />
-            <Block title="Summary" body={result.summary} />
-          </div>
-        ) : (
-          <p className="mt-6 text-slate-400">Add a job to compare against your resume.</p>
-        )}
+      {!resume ? <p className="mt-4 text-sm text-amber-200">Upload an active resume before matching jobs.</p> : null}
+      {resumeNeedsReupload ? <p className="mt-4 text-sm text-amber-200">Re-upload this resume so Opportunity Radar can read the actual PDF or DOCX contents before matching jobs.</p> : null}
+      {!utilitiesEnabled ? <p className="mt-4 text-sm text-slate-400">Bulk rematching is disabled for the initial production release.</p> : null}
+      {error ? <p className="mt-4 text-sm text-red-300" role="alert">{error}</p> : null}
+      {run ? <div className="mt-4 rounded-md border border-radar-line bg-radar-bg p-4" aria-live="polite">
+        <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm text-slate-300"><span>Total: {run.total || processed}</span><span>Completed: {processed}</span><span>Failed: {failed}</span><span>Remaining: {remaining}</span><span>Elapsed: {formatDuration(run.runtimeSeconds)}</span>{run.total ? <span>{run.progress ?? 0}% complete</span> : null}</div>
+        {run.currentCompany ? <p className="mt-2 text-sm text-slate-400">Current job: {run.currentCompany}</p> : null}
+        {run.currentMessage ? <p className="mt-2 text-sm text-slate-300">{run.currentMessage}</p> : null}
+        {run.total ? <div className="mt-3 h-2 overflow-hidden rounded-full bg-radar-panel"><div className="h-full bg-radar-accent transition-all" style={{ width: `${run.progress ?? 0}%` }} /></div> : null}
+      </div> : null}
+    </section>
+
+    <section className="panel overflow-hidden">
+      <header className="grid gap-3 border-b border-radar-line p-4 md:grid-cols-[1fr_220px_200px]">
+        <input className="field" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search company or job title" aria-label="Search matched jobs" />
+        <select className="field" value={status} onChange={(event) => setStatus(event.target.value)} aria-label="Filter match status"><option>All statuses</option><option>Matched</option><option>Needs Rematch</option><option>Not Matched</option><option>Match Failed</option></select>
+        <select className="field" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort matched jobs"><option>Highest match</option><option>Lowest match</option><option>Company</option></select>
+      </header>
+      <div className="divide-y divide-radar-line">
+        {visibleJobs.map((job) => <button className="grid w-full gap-3 p-4 text-left transition hover:bg-radar-bg/60 md:grid-cols-[1fr_auto] md:items-center" type="button" key={job.id} onClick={() => setSelectedJob(job)}>
+          <span className="min-w-0"><span className="block break-words font-semibold text-radar-highlight">{job.title}</span><span className="mt-1 block text-sm text-slate-400">{job.companyName}</span><span className="mt-1 block text-xs text-slate-500">Last matched: {formatTimestamp(job.matchedAt)}</span></span>
+          <MatchScoreBadge score={job.matchScore} recommendation={job.matchLabel} status={job.matchStatus} />
+        </button>)}
+        {!visibleJobs.length ? <p className="p-8 text-center text-slate-400">No current jobs match these filters.</p> : null}
       </div>
-    </div>
-  );
+    </section>
+    <JobDetailsModal job={selectedJob} onClose={() => setSelectedJob(null)} onRematch={async (jobId) => { const updated = await onRematch(jobId); await onJobsReload(); return updated; }} />
+  </div>;
 }
 
-function Section({ title, items }: { title: string; items: string[] }) {
-  return (
-    <div>
-      <h3 className="font-semibold text-white">{title}</h3>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {items.length ? items.map((item) => <span className="badge border-radar-line text-slate-200" key={item}>{item}</span>) : <span className="text-sm text-slate-400">Not listed</span>}
-      </div>
-    </div>
-  );
-}
-
-function Block({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="rounded-md bg-radar-bg p-4">
-      <p className="text-xs uppercase tracking-wide text-slate-500">{title}</p>
-      <p className="mt-2 text-sm leading-6 text-slate-300">{body}</p>
-    </div>
-  );
-}
+function formatTimestamp(value?: string): string { return value ? new Date(value).toLocaleString() : "Not Matched"; }
+function formatDuration(seconds: number | null): string { if (seconds === null) return "Not available"; const total = Math.max(0, Math.round(seconds)); return total < 60 ? `${total}s` : `${Math.floor(total / 60)}m ${total % 60}s`; }

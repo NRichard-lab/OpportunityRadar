@@ -80,6 +80,19 @@ def extract_links(base_url: str, html: str) -> list[tuple[str, str]]:
     return links
 
 
+def extract_embedded_urls(base_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+    for iframe in soup.find_all("iframe"):
+        source = str(iframe.get("src") or iframe.get("data-src") or "").strip()
+        if not source or source.startswith(("javascript:", "data:")):
+            continue
+        absolute = urldefrag(urljoin(base_url, source))[0]
+        if absolute not in urls:
+            urls.append(absolute)
+    return urls
+
+
 def find_careers_page(official_url: str, session: requests.Session) -> tuple[str, str, list[str]]:
     if not official_url:
         return "", "", ["no official website available"]
@@ -103,6 +116,9 @@ def find_careers_page(official_url: str, session: requests.Session) -> tuple[str
 
         links = extract_links(final_url, html)
         careers_matches: list[tuple[str, str]] = []
+        for embedded_url in extract_embedded_urls(final_url, html):
+            if detect_job_platform(embedded_url):
+                platform_urls.append(embedded_url)
         for text, href in links:
             platform = detect_job_platform(href)
             if platform:

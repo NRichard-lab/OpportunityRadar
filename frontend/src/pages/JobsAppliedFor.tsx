@@ -58,7 +58,7 @@ export function JobsAppliedFor({ jobs, onUpdateStatus, onUpdateFollowUp, onUpdat
                     <input className="field min-w-36" type="date" value={job.followUpDate} onChange={(event) => onUpdateFollowUp(job.id, event.target.value)} />
                   </td>
                   <td className="p-3">Current resume</td>
-                  <td className="p-3"><a className="text-radar-cyan" href={job.sourceUrl} target="_blank">Open</a></td>
+                  <td className="p-3"><a className="text-radar-highlight" href={job.sourceUrl} target="_blank">Open</a></td>
                   <td className="p-3">
                     <input className="field min-w-56" value={job.notes} onChange={(event) => onUpdateNotes(job.id, event.target.value)} />
                   </td>

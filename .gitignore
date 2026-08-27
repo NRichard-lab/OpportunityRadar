@@ -5,9 +5,14 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # Virtual environments
 .venv/
+.codex-venv/
 venv/
 env/
 
@@ -15,6 +20,18 @@ env/
 .env
 .env.*
 !.env.example
+**/.email_secret.key
+secrets/
+secrets.local.*
+*.secret
+*.secrets
+*.key
+*.pem
+app-client-secret*
+app-client-secrets*
+smtp-secret*
+smtp-credentials*
+credentials.local.*
 
 # Tool caches
 .pip-cache/
@@ -23,20 +40,50 @@ env/
 .mypy_cache/
 .ruff_cache/
 frontend/.npm-cache/
+playwright-report/
+test-results/
+.browser-profile/
+browser-profiles/
 
-# Generated runtime artifacts
+# Private runtime data and generated artifacts
+/data/
+/Input/
+/imports/
+/backups/
+/exports/
+/resumes/
+/tmp/
 logs/
 output/
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+*.db-journal
+*.log
+frontend/public/data/
+/companies.json
+/jobs.json
+/applications.json
 frontend/dist/
 frontend/node_modules/
 frontend/*.log
 frontend/*.tsbuildinfo
 
 # Private/local input workbooks and Excel temp files
+*.xls
+*.xlsx
+!sample_companies.xlsx
+!tests/fixtures/**/*.xls
+!tests/fixtures/**/*.xlsx
 DNAClients.xlsx
 ~$*.xlsx
 *.tmp.xlsx
 *.bak.xlsx
+
+# Local review notes that are not current product documentation
+CODE_REVIEW.md
 
 # OS/editor noise
 .DS_Store

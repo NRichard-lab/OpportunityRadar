@@ -9,14 +9,21 @@ interface JobCardProps {
   onNotInterested: (jobId: string) => void;
   onUpdateNotes: (jobId: string, notes: string) => void;
   onViewDetails?: (job: Job) => void;
+  onViewCompany?: (companyName: string) => void;
 }
 
-export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, onViewDetails }: JobCardProps) {
+export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, onViewDetails, onViewCompany }: JobCardProps) {
   return (
     <article className={`card p-4 ${job.notInterested ? "opacity-55" : ""}`}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <p className="text-sm text-radar-cyan">{job.companyName}</p>
+          <button
+            className="text-left text-sm text-radar-highlight underline-offset-4 hover:text-white hover:underline"
+            onClick={() => onViewCompany?.(job.companyName)}
+            type="button"
+          >
+            {job.companyName}
+          </button>
           <h3 className="mt-1 text-lg font-semibold text-white">{job.title}</h3>
           <p className="mt-2 text-sm text-slate-400">{job.descriptionSnippet || "Not listed"}</p>
           <div className="mt-3 flex flex-wrap gap-2">
@@ -24,7 +31,7 @@ export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, on
             <span className="badge border-radar-line text-slate-200">{notListed(job.roleType || "UNKNOWN")}</span>
             <span className="badge border-radar-line text-slate-200">{notListed(job.location)}</span>
             <span className="badge border-radar-line text-slate-200">{notListed(job.jobPlatform)}</span>
-            <MatchScoreBadge score={job.matchScore} />
+            <MatchScoreBadge score={job.matchScore} recommendation={job.matchLabel} status={job.matchStatus} />
           </div>
           {job.matchScore !== null ? (
             <p className="mt-2 text-xs text-slate-500">

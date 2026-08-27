@@ -25,6 +25,7 @@ class PaylocityCollector(BaseCollector):
         from playwright.sync_api import sync_playwright
 
         source_url, source_type = self.source_url(company)
+        source_url = self.resolve_embedded_job_board_url(source_url, "Paylocity")
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -37,13 +38,20 @@ class PaylocityCollector(BaseCollector):
                 pass
             self.final_url_after_redirect = page.url
 
-            links = page.locator("a[href*='/Recruiting/Jobs/Details/'], a[href*='/recruiting/jobs/details/']")
+            listing_scope = find_paylocity_listing_scope(page)
+            if listing_scope is None:
+                self.reject_candidate(source_url, "Paylocity listing page or iframe not found", source_url)
+                self.flush_debug(company)
+                browser.close()
+                return []
+            self.final_url_after_redirect = listing_scope.url
+            links = listing_scope.locator("a[href*='/Recruiting/Jobs/Details/'], a[href*='/recruiting/jobs/details/']")
             listings: list[tuple[str, str]] = []
             for index in range(links.count()):
                 link = links.nth(index)
                 try:
                     title = normalize_job_title(link.inner_text(timeout=2000))
-                    detail_url = urljoin(source_url, link.get_attribute("href") or "")
+                    detail_url = urljoin(listing_scope.url, link.get_attribute("href") or "")
                 except Exception:
                     continue
                 self.record_candidate(title, detail_url)
@@ -86,6 +94,16 @@ class PaylocityCollector(BaseCollector):
             self.flush_debug(company)
             browser.close()
         return jobs
+
+
+def find_paylocity_listing_scope(page):
+    if "recruiting.paylocity.com" in page.url.lower():
+        return page
+    for frame in page.frames:
+        frame_url = frame.url.lower()
+        if "recruiting.paylocity.com" in frame_url and "/recruiting/jobs/" in frame_url:
+            return frame
+    return None
 
 
 def fetch_detail(page, detail_url: str, title: str) -> dict[str, str]:

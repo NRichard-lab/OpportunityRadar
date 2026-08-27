@@ -1,6 +1,7 @@
-import { Upload } from "lucide-react";
+import { useState } from "react";
+import { LoaderCircle, Upload } from "lucide-react";
 import type { ResumeProfile } from "../types/ResumeProfile";
-import { extractKeywords, extractResumeTextFromFileName } from "../utils/resumeMatch";
+import { API_BASE } from "../api";
 
 interface ResumeUploadProps {
   resume: ResumeProfile | null;
@@ -8,21 +9,26 @@ interface ResumeUploadProps {
 }
 
 export function ResumeUpload({ resume, onResumeChange }: ResumeUploadProps) {
-  const handleFile = (file: File | null) => {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleFile = async (file: File | null) => {
     if (!file) return;
-    const rawText = extractResumeTextFromFileName(file.name);
-    const profile: ResumeProfile = {
-      id: crypto.randomUUID(),
-      fileName: file.name,
-      uploadedAt: new Date().toISOString(),
-      rawText,
-      skills: extractKeywords(rawText),
-      titles: [],
-      yearsExperienceSummary: "TODO: Parse PDF/DOCX text in a later version.",
-      notes: "File metadata is stored locally. Full PDF/DOCX parsing is stubbed for version 1.",
-    };
-    localStorage.setItem("financial-jobs-radar-resume", JSON.stringify(profile));
-    onResumeChange(profile);
+    setUploading(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/resume/upload?filename=${encodeURIComponent(file.name)}`, {
+        method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file,
+      });
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "Resume upload failed.");
+      const profile = await response.json() as ResumeProfile;
+      localStorage.setItem("financial-jobs-radar-resume", JSON.stringify(profile));
+      onResumeChange(profile);
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : "Resume upload failed.");
+    } finally {
+      setUploading(false);
+    }
   };
 
   return (
@@ -31,14 +37,15 @@ export function ResumeUpload({ resume, onResumeChange }: ResumeUploadProps) {
         <div>
           <p className="text-sm font-semibold text-white">Resume upload</p>
           <p className="mt-1 text-sm text-slate-400">
-            PDF and DOCX are accepted. Version 1 stores the file name and a parsing placeholder locally.
+            PDF and DOCX are accepted. Opportunity Radar reads the document and stores the active resume securely in its local database.
           </p>
         </div>
         <label className="btn btn-primary cursor-pointer">
-          <Upload size={16} />
-          Upload
+          {uploading ? <LoaderCircle className="animate-spin" size={16} /> : <Upload size={16} />}
+          {uploading ? "Reading..." : "Upload"}
           <input
             className="hidden"
+            disabled={uploading}
             type="file"
             accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
@@ -55,6 +62,7 @@ export function ResumeUpload({ resume, onResumeChange }: ResumeUploadProps) {
           No resume stored yet.
         </div>
       )}
+      {error ? <p className="mt-3 text-sm text-red-300" role="alert">{error}</p> : null}
     </div>
   );
 }

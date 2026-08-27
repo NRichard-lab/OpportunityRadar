@@ -1,6 +1,10 @@
-# Financial Jobs Radar
+# Opportunity Radar
 
-Financial Jobs Radar is a local-first app for tracking banks and credit unions, discovered job openings, resume/job fit, and jobs applied for.
+Opportunity Radar tracks companies, discovered job openings, resume/job fit, and applications.
+
+The Phase 1A source baseline retains the existing Blue Ash shared-cookie integration as a
+transitional contract. It is not a production deployment or the final authentication handoff.
+See [docs/BLUEASH_AUTH_INTEGRATION.md](docs/BLUEASH_AUTH_INTEGRATION.md).
 
 The app is organized around one permanent company workbook and separate generated snapshots:
 
@@ -19,20 +23,41 @@ logs/
 
 ## Data Rules
 
-`data/master.xlsx` is the source of truth for company records. `data/companies.json` is generated from `master.xlsx` and overwritten on every export. It is never appended to.
+`data/opportunity_radar.db` is the source of truth for companies, jobs, applications, resumes, raw candidates, settings, utility history, and import history. The FastAPI routes and frontend read from SQLite.
 
-`data/jobs.json` is the current discovered job listing snapshot. It can be overwritten on every job refresh. User application tracking is stored separately in `data/applications.json` or browser local storage so it is not lost when job listings refresh.
+`data/master.xlsx`, `data/companies.json`, `data/jobs.json`, and `data/applications.json` are compatibility imports, exports, backups, and recovery snapshots. Company CRUD regenerates the relevant private snapshots, but runtime reads do not depend on them. Browser application and resume state is retained as a recovery copy and imported into SQLite when the frontend first connects.
 
-The frontend reads generated JSON from:
+## SQLite Migration
+
+Preview the migration without creating directories, backups, reports, or a database:
+
+```powershell
+py -m backend.cli migrate-to-sqlite --preview
+```
+
+Apply the migration transactionally:
+
+```powershell
+py -m backend.cli migrate-to-sqlite --apply
+```
+
+The apply command first copies every detected source artifact to `data/exports/pre_sqlite_migration_YYYYMMDD_HHMMSS/`. Its `manifest.json` records SHA-256 hashes, row counts, sizes, source timestamps, and the migration version. Import and CRUD/cascade validation occur against a temporary SQLite database; `data/opportunity_radar.db` is atomically activated only after foreign-key, record-ID, schema, integrity, and CRUD checks pass.
+
+JSON and XLSX reports are written to `output/sqlite_migration_report_YYYYMMDD_HHMMSS.*`. Duplicate legacy job IDs are repaired deterministically and listed individually in both reports. Stable company IDs are never regenerated during migration.
+
+Legacy local-development mirrors can be written to:
 
 ```text
 frontend/public/data/companies.json
 frontend/public/data/jobs.json
 ```
 
-The Python export commands mirror generated JSON into those frontend-safe paths.
+They are disabled by default and require an explicit development-only
+`APP_WRITE_FRONTEND_MIRRORS=true`. Production rejects that setting so private runtime data is never
+written into the frontend public directory. Runtime screens load authoritative records through the
+authenticated FastAPI/SQLite API.
 
-Official websites must not be guessed from a company name. Financial Jobs Radar only stores an official website after validating a provided Known Website, a real web search result, or a link discovered from an already verified source. Low-confidence matches are left for review unless explicitly allowed.
+Official websites must not be guessed from a company name. Opportunity Radar only stores an official website after validating a provided Known Website, a real web search result, or a link discovered from an already verified source. Low-confidence matches are left for review unless explicitly allowed.
 
 `Official Website` and `Careers Page URL` are discovery inputs only. They can help `fill-missing-job-boards` find the true public job board, but `collect-jobs` does not collect postings from them. If a careers page directly lists open roles, store that page in `Job Board URL` first.
 
@@ -41,11 +66,24 @@ Official websites must not be guessed from a company name. Financial Jobs Radar 
 Use Python 3.11 or newer.
 
 ```powershell
-cd C:\Users\dog10\Documents\Codex\FinancialJobsRadar
+cd <repository-path>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+The application does not automatically load `.env`. Set an explicit local environment before
+starting the backend:
+
+```powershell
+$env:APP_ENV = "development"
+$env:AUTH_MODE = "local"
+$env:APP_PUBLIC_URL = "http://127.0.0.1:5173"
+```
+
+Missing or misspelled environment/authentication modes fail startup. Local authentication is valid
+only in explicit development mode with a loopback public URL. Production requires Blue Ash
+configuration plus the exact portal UUID in `APP_TRUSTED_ADMIN_USER_ID`.
 
 Optional browser automation setup:
 
@@ -55,6 +93,19 @@ python -m playwright install chromium
 ```
 
 Browser automation is manual/on-demand only. It does not run during startup or `export-json`.
+Discovery and collection commands additionally require their corresponding explicit feature flags.
+
+## Runtime Paths and Initial Feature Policy
+
+Writable paths can be configured with `APP_DATA_DIR`, `DATABASE_URL`, `APP_IMPORT_DIR`,
+`APP_EXPORT_DIR`, `APP_BACKUP_DIR`, and `APP_LOG_DIR`. Keep them outside an immutable application
+image in a future hosted deployment.
+
+The first-release switches default off: `APP_ENABLE_BROWSER_JOBS`,
+`APP_ENABLE_COMPANY_REFRESH`, `APP_ENABLE_UTILITIES`, `APP_ENABLE_SCHEDULES`, and
+`APP_ENABLE_DISCOVERY`. The API enforces them before starting work, and the frontend displays
+disabled controls. The initial production mode also limits all protected APIs to the exact trusted
+administrator ID.
 
 ## Commands
 
@@ -156,19 +207,37 @@ Backend health check:
 GET http://127.0.0.1:8000/api/status
 ```
 
-The Dashboard button `Find Missing Job Board URLs` calls:
+## Utilities Tab
 
-```text
-POST http://127.0.0.1:8000/api/fill-missing-job-boards
-```
-
-That button runs the same on-demand logic as:
+The `Utilities` tab centralizes local refresh and maintenance actions. It is disabled by default.
+For intentional local development, set the required feature flags explicitly before starting the
+backend. These buttons only work when the local backend API is running:
 
 ```powershell
-python main.py --mode fill-missing-job-boards --master data\master.xlsx --output-json data\companies.json --limit 10 --use-browser-discovery
+python -m uvicorn server:app --reload --host 127.0.0.1 --port 8000
 ```
 
-It does not run on app startup. Browser automation only runs when the button is clicked.
+The frontend can then be started separately:
+
+```powershell
+cd frontend
+npm run dev
+```
+
+Utilities include company information refresh, company discovery, job collection, saved-job reprocessing, backup, export, and user-selected import. Technical worker, browser, delay, and debugging settings remain command-line concerns rather than normal-user controls.
+
+Every maintenance card shows its last run, last runtime, average runtime from the most recent 20 successful runs, result, and recent execution history. Runs and progress are persisted in SQLite, survive browser navigation, and are marked failed if the backend restarts while they are active.
+
+All utilities except user-selected import can be scheduled once per day. Schedules are backend-owned and continue without an open browser. The default application timezone is `America/Denver`; changing it in a schedule editor updates the shared scheduler timezone. Manual and scheduled triggers use the same registered maintenance function and create the same history records.
+
+Maintenance APIs:
+
+```text
+GET  /api/maintenance/jobs
+POST /api/maintenance/jobs/{job_key}/run
+PUT  /api/maintenance/jobs/{job_key}/schedule
+GET  /api/maintenance/jobs/{job_key}/history
+```
 
 ## Deduping Companies
 
@@ -237,4 +306,16 @@ The frontend Job List loads the generated job snapshot, removes invalid job reco
 
 ## Resume Fit
 
-The Resume Fit Score estimates how well the resume appears to match visible job requirements, title alignment, skills, experience keywords, and banking or credit union relevance. It is not a hiring prediction.
+The Resume Fit Score estimates how well the resume appears to match visible job requirements, title alignment, skills, and experience terms. It is not a hiring prediction.
+
+## Email Service
+
+SMTP provider and daily digest settings are managed under `Utilities > Email`. Passwords are encrypted before SQLite storage and are never returned by the API.
+
+For a hosted deployment, set a stable secret before starting the backend:
+
+```text
+OPPORTUNITY_RADAR_SECRET_KEY=<a long deployment secret>
+```
+
+Desktop installs without that environment variable use the protected `data/.email_secret.key` recovery key. Keep that file with database backups; losing it requires re-entering the SMTP password.

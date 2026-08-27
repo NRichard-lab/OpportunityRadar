@@ -51,6 +51,20 @@ class BaseCollector:
             return rss_url, "RSS Feed"
         return "", "None"
 
+    def resolve_embedded_job_board_url(self, source_url: str, expected_platform: str) -> str:
+        if detect_job_platform(source_url).casefold() == expected_platform.casefold():
+            return source_url
+        try:
+            from website_tools import extract_embedded_urls
+
+            response = self.get(source_url)
+            for embedded_url in extract_embedded_urls(response.url, response.text):
+                if detect_job_platform(embedded_url).casefold() == expected_platform.casefold():
+                    return embedded_url
+        except Exception:
+            pass
+        return source_url
+
     def record_candidate(self, text: str, url: str = "") -> None:
         self.candidate_count += 1
         if len(self.candidate_samples) < 20:
@@ -74,6 +88,7 @@ class BaseCollector:
             self.rejection_samples.append({"text": text, "url": url, "reason": reason})
         self.rejected_candidates.append(
             {
+                "companyId": str((company or {}).get("Company ID") or ""),
                 "companyName": str((company or {}).get("Company Name") or ""),
                 "jobBoardUrl": job_board_url or str((company or {}).get("Job Board URL") or ""),
                 "finalUrlAfterRedirect": self.final_url_after_redirect,

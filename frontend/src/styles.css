@@ -3,6 +3,11 @@
 @tailwind utilities;
 
 :root {
+  --brand-primary: 31 78 107;
+  --brand-deep: 23 58 80;
+  --brand-accent: 47 111 145;
+  --brand-highlight: 117 181 211;
+  --brand-tint: 234 242 246;
   color-scheme: dark;
   background: #081016;
 }
@@ -12,7 +17,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    radial-gradient(circle at 20% 0%, rgba(71, 213, 200, 0.12), transparent 26rem),
+    radial-gradient(circle at 20% 0%, rgb(var(--brand-accent) / 0.16), transparent 26rem),
     linear-gradient(145deg, #081016 0%, #0c151d 45%, #10151a 100%);
   color: #e6edf3;
 }
@@ -38,7 +43,7 @@ textarea {
   }
 
   .field {
-    @apply w-full rounded-md border border-radar-line bg-radar-bg px-3 py-2 text-sm text-slate-100 outline-none ring-0 transition focus:border-radar-cyan;
+    @apply w-full rounded-md border border-radar-line bg-radar-bg px-3 py-2 text-sm text-slate-100 outline-none ring-0 transition focus:border-radar-highlight focus:ring-2 focus:ring-radar-accent/35;
   }
 
   .badge {
@@ -46,10 +51,18 @@ textarea {
   }
 
   .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-md border border-radar-line bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:border-radar-cyan hover:text-white;
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-radar-line bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:border-radar-highlight hover:text-white focus:outline-none focus:ring-2 focus:ring-radar-accent/45 disabled:cursor-not-allowed disabled:opacity-55;
   }
 
   .btn-primary {
-    @apply border-radar-cyan bg-radar-cyan px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-300;
+    @apply border-radar-primary bg-radar-primary px-3 py-2 text-sm font-semibold text-white hover:border-radar-accent hover:bg-radar-accent;
+  }
+
+  .icon-btn {
+    @apply grid h-9 w-9 shrink-0 place-items-center rounded-md border border-radar-line bg-radar-bg text-slate-300 transition hover:border-radar-highlight hover:text-white focus:outline-none focus:ring-2 focus:ring-radar-accent/45;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-red-500 bg-red-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60;
   }
 }

@@ -113,6 +113,7 @@ GENERIC_ONLY_WORDS = {
 }
 
 ROLE_NOUNS = {
+    "accountant",
     "consultant",
     "teller",
     "banker",

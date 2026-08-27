@@ -6,11 +6,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openpyxl import Workbook
 
-from config import DEFAULT_FRONTEND_JOBS_JSON, LOG_DIR, OUTPUT_DIR
+from config import APP_WRITE_FRONTEND_MIRRORS, DEFAULT_FRONTEND_JOBS_JSON, LOG_DIR, OUTPUT_DIR
 from excel_tools import read_company_rows, stable_company_id
 from job_enrichment import classify_role_type, extract_pay_info
 from job_validation import is_valid_job_title, rejection_reason
@@ -73,6 +73,7 @@ DIAGNOSTIC_COLUMNS = [
 ]
 
 REJECTED_CANDIDATE_COLUMNS = [
+    "companyId",
     "companyName",
     "jobBoardUrl",
     "finalUrlAfterRedirect",
@@ -168,16 +169,21 @@ def collect_jobs(
     limit_companies: int | None = None,
     company_filter: str = "",
     company_filters: list[str] | None = None,
+    company_ids: set[str] | None = None,
     max_workers: int = 10,
     browser_workers: int = 3,
     delay_seconds: float = 1.0,
     dry_run: bool = False,
     debug_job_collection: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancellation_event: Any = None,
 ) -> dict[str, Any]:
     from collectors.base import pick_collector
 
     started = time.monotonic()
     companies = read_company_rows(master_path)
+    if company_ids is not None:
+        companies = [company for company in companies if str(company.get("Company ID") or "") in company_ids]
     filters = company_filters or ([company_filter] if company_filter else [])
     if filters:
         companies = [company for company in companies if company_matches_filters(company, filters)]
@@ -216,7 +222,7 @@ def collect_jobs(
 
     for company in candidates:
         log_company_input(company)
-        debug_dir = Path("logs") / "job_collection_debug" if debug_job_collection else None
+        debug_dir = LOG_DIR / "job_collection_debug" if debug_job_collection else None
         collector = pick_collector(company, delay_seconds=delay_seconds, debug=debug_job_collection, debug_dir=debug_dir)
         if collector.requires_browser:
             browser_companies.append((company, collector))
@@ -226,20 +232,22 @@ def collect_jobs(
     total_attempted = len(http_companies) + len(browser_companies)
     completed_counter = {"count": 0}
 
-    for jobs, had_error, diagnostic, rejected in run_collection_group(http_companies, max_workers, total_attempted, completed_counter, started, "HTTP"):
+    for jobs, had_error, diagnostic, rejected in run_collection_group(http_companies, max_workers, total_attempted, completed_counter, started, "HTTP", progress_callback, cancellation_event):
         all_jobs.extend(jobs)
         errors += int(had_error)
         diagnostics.append(diagnostic)
         rejected_candidates.extend(rejected)
 
-    for jobs, had_error, diagnostic, rejected in run_collection_group(browser_companies, browser_workers, total_attempted, completed_counter, started, "Browser"):
+    for jobs, had_error, diagnostic, rejected in run_collection_group(browser_companies, browser_workers, total_attempted, completed_counter, started, "Browser", progress_callback, cancellation_event):
         all_jobs.extend(jobs)
         errors += int(had_error)
         diagnostics.append(diagnostic)
         rejected_candidates.extend(rejected)
 
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise InterruptedError("Job refresh cancelled.")
     all_jobs = [enrich_job_record(job) for job in all_jobs]
-    final_jobs = merge_with_existing_jobs(jobs_json_path, all_jobs, candidates) if filters else [job for job in all_jobs if is_valid_job_record(job)]
+    final_jobs = merge_with_existing_jobs(jobs_json_path, all_jobs, candidates) if filters or company_ids is not None else [job for job in all_jobs if is_valid_job_record(job)]
     write_jobs_json(jobs_json_path, final_jobs)
     write_jobs_xlsx(jobs_xlsx_path, final_jobs)
     write_diagnostics(diagnostics)
@@ -268,6 +276,8 @@ def run_collection_group(
     completed_counter: dict[str, int],
     overall_started: float,
     worker_type: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancellation_event: Any = None,
 ):
     if not collection_jobs:
         return []
@@ -279,6 +289,10 @@ def run_collection_group(
         }
         for future in as_completed(futures):
             company, collector, started = futures[future]
+            if cancellation_event is not None and cancellation_event.is_set():
+                for pending in futures:
+                    pending.cancel()
+                raise InterruptedError("Job refresh cancelled.")
             try:
                 jobs = [enrich_job_record(job) for job in future.result()]
                 jobs = [job for job in jobs if is_valid_job_record(job)]
@@ -295,6 +309,8 @@ def run_collection_group(
                 log_collection_progress(diagnostic, worker_type, total_attempted, completed_counter["count"])
                 log_diagnostic(diagnostic)
                 results.append(([], True, diagnostic, list(getattr(collector, "rejected_candidates", []))))
+            if progress_callback:
+                progress_callback(completed_counter["count"], total_attempted, str(company.get("Company Name") or ""))
     return results
 
 
@@ -525,6 +541,8 @@ def write_jobs_json(path: Path, jobs: list[JobRecord]) -> None:
 
 
 def mirror_jobs_json(path: Path) -> None:
+    if not APP_WRITE_FRONTEND_MIRRORS:
+        return
     if path.resolve() == DEFAULT_FRONTEND_JOBS_JSON.resolve():
         return
     if path.name != "jobs.json":
@@ -569,11 +587,15 @@ def write_diagnostics(diagnostics: list[CollectionDiagnostic]) -> None:
     logger.info("Wrote job collection diagnostics to %s and %s", json_path, xlsx_path)
 
 
-def write_rejected_candidates(rejected_candidates: list[dict[str, Any]]) -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = LOG_DIR / "rejected_job_candidates.json"
-    xlsx_path = OUTPUT_DIR / "rejected_job_candidates.xlsx"
+def write_rejected_candidates(
+    rejected_candidates: list[dict[str, Any]],
+    json_path: Path | None = None,
+    xlsx_path: Path | None = None,
+) -> None:
+    json_path = json_path or LOG_DIR / "rejected_job_candidates.json"
+    xlsx_path = xlsx_path or OUTPUT_DIR / "rejected_job_candidates.xlsx"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(rejected_candidates, indent=2), encoding="utf-8")
 
     workbook = Workbook()

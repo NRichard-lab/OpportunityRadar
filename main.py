@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 from config import (
+    APP_ENABLE_BROWSER_JOBS,
+    APP_ENABLE_COMPANY_REFRESH,
+    APP_ENABLE_DISCOVERY,
     DATA_DIR,
     DEFAULT_APPLICATIONS_JSON,
     DEFAULT_INPUT,
@@ -58,7 +61,7 @@ def configure_logging() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Financial Jobs Radar company data tools.")
+    parser = argparse.ArgumentParser(description="Opportunity Radar company data tools.")
     parser.add_argument(
         "--mode",
         choices=sorted(VALID_MODES),
@@ -585,6 +588,7 @@ def resolve_input_path(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    validate_cli_feature_flags(args)
     configure_logging()
     input_path = resolve_input_path(args)
     master_path = args.master.resolve()
@@ -667,6 +671,31 @@ def main() -> int:
         raise ValueError(f"Unsupported mode: {args.mode}")
 
     return 0
+
+
+def validate_cli_feature_flags(args: argparse.Namespace) -> None:
+    requirements: dict[str, tuple[tuple[bool, str], ...]] = {
+        "bootstrap-enrich": (
+            (APP_ENABLE_COMPANY_REFRESH, "APP_ENABLE_COMPANY_REFRESH"),
+            (APP_ENABLE_DISCOVERY, "APP_ENABLE_DISCOVERY"),
+        ),
+        "fill-missing-job-boards": (
+            (APP_ENABLE_COMPANY_REFRESH, "APP_ENABLE_COMPANY_REFRESH"),
+            (APP_ENABLE_DISCOVERY, "APP_ENABLE_DISCOVERY"),
+        ),
+        "collect-jobs": ((APP_ENABLE_BROWSER_JOBS, "APP_ENABLE_BROWSER_JOBS"),),
+        "discover-job-board": ((APP_ENABLE_DISCOVERY, "APP_ENABLE_DISCOVERY"),),
+        "audit-websites": ((APP_ENABLE_DISCOVERY, "APP_ENABLE_DISCOVERY"),),
+        "repair-websites": (
+            (APP_ENABLE_COMPANY_REFRESH, "APP_ENABLE_COMPANY_REFRESH"),
+            (APP_ENABLE_DISCOVERY, "APP_ENABLE_DISCOVERY"),
+        ),
+    }
+    disabled = [name for enabled, name in requirements.get(args.mode, ()) if not enabled]
+    if disabled:
+        raise RuntimeError(
+            f"{args.mode} is disabled. Explicitly enable the required feature flags: {', '.join(disabled)}."
+        )
 
 
 def parse_company_filters(company: str, companies: str) -> list[str]:

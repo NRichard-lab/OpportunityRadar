@@ -32,6 +32,19 @@ export interface Job {
   roleTypeReason: string;
   rawData: Record<string, unknown>;
   matchScore: number | null;
+  matchStatus?: "Matched" | "Not Matched" | "Needs Rematch" | "Match Failed";
+  matchLabel?: string;
+  matchedAt?: string;
+  matchAlgorithmVersion?: string;
+  matchDetails?: {
+    matchedKeywords?: string[];
+    missingKeywords?: string[];
+    experienceAlignment?: string;
+    titleAlignment?: string;
+    summary?: string;
+  };
+  matchError?: string;
+  needsRematch?: boolean;
   applied: boolean;
   applicationStatus: ApplicationStatus;
   dateApplied: string;

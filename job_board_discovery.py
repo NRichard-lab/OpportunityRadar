@@ -19,7 +19,7 @@ from search_tools import (
     domain_matches_company,
     registered_domain,
 )
-from website_tools import extract_links, fetch_html, is_same_registered_domain, make_session, normalize_url
+from website_tools import extract_embedded_urls, extract_links, fetch_html, is_same_registered_domain, make_session, normalize_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -263,6 +263,17 @@ def static_scan(
             reached_from_official=True,
         )
         candidates.append(candidate)
+    for embedded_url in extract_embedded_urls(final_url, html):
+        if not detect_job_platform(embedded_url):
+            continue
+        candidates.append(evaluate_candidate(
+            company_name,
+            embedded_url,
+            text="Embedded job board",
+            source_url=final_url,
+            source_method=source_method,
+            reached_from_official=True,
+        ))
     return candidates
 
 

@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-from config import DEFAULT_FRONTEND_COMPANIES_JSON, OUTPUT_COLUMNS
+from config import APP_WRITE_FRONTEND_MIRRORS, DEFAULT_FRONTEND_COMPANIES_JSON, OUTPUT_COLUMNS
 
 
 INPUT_COLUMNS = ["Company Name", "City", "State", "Known Website", "Notes"]
@@ -28,8 +28,10 @@ URL_COLUMNS = {
 COLUMN_MAP = {
     "Company ID": "id",
     "Company Name": "name",
+    "Industry": "industry",
     "City": "city",
     "State": "state",
+    "Country": "country",
     "Known Website": "knownWebsite",
     "Official Website": "officialWebsite",
     "Website Discovery Method": "websiteDiscoveryMethod",
@@ -46,6 +48,10 @@ COLUMN_MAP = {
     "Confidence": "confidence",
     "Last Checked": "lastChecked",
     "Notes": "notes",
+    "Founded Year": "foundedYear",
+    "Total Assets": "totalAssets",
+    "Assets As Of Date": "assetsAsOfDate",
+    "Company Information Last Checked": "companyInfoLastChecked",
 }
 
 logger = logging.getLogger(__name__)
@@ -189,6 +195,8 @@ def export_excel_to_json(input_path: Path, output_path: Path) -> int:
 
 
 def mirror_companies_json(output_path: Path) -> None:
+    if not APP_WRITE_FRONTEND_MIRRORS:
+        return
     if output_path.resolve() == DEFAULT_FRONTEND_COMPANIES_JSON.resolve():
         return
     if output_path.name != "companies.json":
@@ -254,7 +262,8 @@ def dedupe_company_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
 
     output_rows = []
     for row in grouped.values():
-        row["Company ID"] = stable_company_id(row)
+        if not row.get("Company ID"):
+            row["Company ID"] = stable_company_id(row)
         output_rows.append(row)
 
     output_rows.sort(key=lambda row: str(row.get("Company Name", "")).lower())

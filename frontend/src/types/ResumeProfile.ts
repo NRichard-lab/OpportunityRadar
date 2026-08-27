@@ -3,6 +3,8 @@ export interface ResumeProfile {
   fileName: string;
   uploadedAt: string;
   rawText: string;
+  extractedText?: string;
+  version?: string;
   skills: string[];
   titles: string[];
   yearsExperienceSummary: string;
