@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
+from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from job_tools import JobRecord, make_job_id
 from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
@@ -29,16 +30,18 @@ class WorkdayCollector(BaseCollector):
 
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            browser = launch_playwright_chromium(playwright, headless=True)
             context = browser.new_context(
                 user_agent=(
                     "FinancialJobsRadar/1.0 "
                     "(public job listing collector; no applications or form submissions)"
-                )
+                ),
+                service_workers="block",
             )
+            install_playwright_url_guard(context)
             page = context.new_page()
             try:
-                page.goto(board_url, wait_until="domcontentloaded", timeout=45000)
+                safe_page_goto(page, board_url, wait_until="domcontentloaded", timeout=45000)
                 self.final_url_after_redirect = page.url
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeoutError:
@@ -121,7 +124,7 @@ class WorkdayCollector(BaseCollector):
     def fetch_detail(self, context, detail_url: str) -> dict[str, str]:
         page = context.new_page()
         try:
-            page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+            safe_page_goto(page, detail_url, wait_until="domcontentloaded", timeout=30000)
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:

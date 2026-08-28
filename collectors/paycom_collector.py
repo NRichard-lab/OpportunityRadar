@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
+from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_tools import JobRecord, make_job_id
@@ -27,10 +28,12 @@ class PaycomCollector(BaseCollector):
         source_url, source_type = self.source_url(company)
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page()
+            browser = launch_playwright_chromium(playwright, headless=True)
+            context = browser.new_context(service_workers="block")
+            install_playwright_url_guard(context)
+            page = context.new_page()
             try:
-                page.goto(source_url, wait_until="domcontentloaded", timeout=45000)
+                safe_page_goto(page, source_url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeoutError:
                 pass
@@ -89,7 +92,7 @@ class PaycomCollector(BaseCollector):
 
 
 def fetch_detail(page, detail_url: str) -> str:
-    page.goto(detail_url, wait_until="domcontentloaded", timeout=45000)
+    safe_page_goto(page, detail_url, wait_until="domcontentloaded", timeout=45000)
     try:
         page.wait_for_load_state("networkidle", timeout=12000)
     except Exception:

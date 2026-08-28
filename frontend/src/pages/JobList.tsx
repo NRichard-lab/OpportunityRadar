@@ -2,19 +2,25 @@ import { useEffect, useMemo, useState } from "react";
 import type { Job, RoleType, WorkType } from "../types/Job";
 import { JobCard } from "../components/JobCard";
 import { JobDetailsModal } from "../components/JobDetailsModal";
+import { DataStatePanel } from "../components/DataStatePanel";
+import type { DataLoadStatus } from "../types/DataLoadState";
 import { isCurrentJobRecord } from "../utils/jobRecords";
 
 interface JobListProps {
   jobs: Job[];
+  dataStatus: DataLoadStatus;
+  dataError: string;
+  onRetry: () => void;
   onRematch: (jobId: string) => Promise<Job>;
-  onMarkApplied: (jobId: string) => void;
-  onNotInterested: (jobId: string) => void;
-  onUpdateNotes: (jobId: string, notes: string) => void;
+  onMarkApplied: (jobId: string) => Promise<boolean>;
+  onNotInterested: (jobId: string) => Promise<boolean>;
+  onUpdateNotes: (jobId: string, notes: string) => Promise<boolean>;
+  pendingApplicationIds: Set<string>;
   selectedCompanyId?: string;
   onViewCompany?: (companyName: string) => void;
 }
 
-export function JobList({ jobs, onRematch, onMarkApplied, onNotInterested, onUpdateNotes, selectedCompanyId, onViewCompany }: JobListProps) {
+export function JobList({ jobs, dataStatus, dataError, onRetry, onRematch, onMarkApplied, onNotInterested, onUpdateNotes, pendingApplicationIds, selectedCompanyId, onViewCompany }: JobListProps) {
   const [query, setQuery] = useState("");
   const [workType, setWorkType] = useState<WorkType | "All work types">("All work types");
   const [companyFilter, setCompanyFilter] = useState("All companies");
@@ -80,6 +86,10 @@ export function JobList({ jobs, onRematch, onMarkApplied, onNotInterested, onUpd
     () => Array.from(new Set(validJobs.map((job) => job.location).filter(Boolean))).sort(),
     [validJobs],
   );
+
+  if (dataStatus === "loading" || dataStatus === "error") {
+    return <DataStatePanel status={dataStatus} error={dataError} loadingLabel="Loading jobs..." onRetry={onRetry} />;
+  }
 
   return (
     <div className="space-y-5">
@@ -165,11 +175,12 @@ export function JobList({ jobs, onRematch, onMarkApplied, onNotInterested, onUpd
             onMarkApplied={onMarkApplied}
             onNotInterested={onNotInterested}
             onUpdateNotes={onUpdateNotes}
+            updating={pendingApplicationIds.has(job.id)}
             onViewDetails={setDetailsJob}
             onViewCompany={onViewCompany}
           />
         ))}
-        {!jobs.length ? <div className="card p-8 text-center text-slate-400">No jobs loaded yet. Run job collection first.</div> : null}
+        {!jobs.length ? <div className="card p-8 text-center text-slate-400">No jobs are stored yet.</div> : null}
         {jobs.length && !filtered.length ? <div className="card p-8 text-center text-slate-400">No jobs match the current filters.</div> : null}
       </div>
       {filtered.length ? (

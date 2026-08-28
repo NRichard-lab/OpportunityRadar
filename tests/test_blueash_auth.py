@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from backend import blueash_auth
+from backend.outbound_security import UnsafeOutboundDestination
 
 
 class BlueAshAuthTests(unittest.TestCase):
@@ -11,7 +12,7 @@ class BlueAshAuthTests(unittest.TestCase):
         with patch.multiple(
             blueash_auth,
             APP_ENV="development", AUTH_MODE="local", APP_PUBLIC_URL="http://127.0.0.1:5173",
-        ), patch.object(blueash_auth.requests, "get") as request:
+        ), patch.object(blueash_auth.SSRFProtectedSession, "get") as request:
             identity = blueash_auth.BlueAshAuthClient().authenticate("")
 
         self.assertTrue(identity.development_bypass)
@@ -28,7 +29,7 @@ class BlueAshAuthTests(unittest.TestCase):
         applications.json.return_value = [{"slug": "opportunity-radar"}]
 
         with self.blueash_configuration(), patch.object(
-            blueash_auth.requests, "get", side_effect=[profile, applications]
+            blueash_auth.SSRFProtectedSession, "get", side_effect=[profile, applications]
         ) as request:
             identity = blueash_auth.BlueAshAuthClient().authenticate("shared-token")
 
@@ -40,10 +41,12 @@ class BlueAshAuthTests(unittest.TestCase):
                 call(
                     "https://api.blueashdigital.tech/api/profile/me",
                     headers={"Cookie": "blueash_session=shared-token"}, timeout=5.0,
+                    allow_redirects=True,
                 ),
                 call(
                     "https://api.blueashdigital.tech/api/apps",
                     headers={"Cookie": "blueash_session=shared-token"}, timeout=5.0,
+                    allow_redirects=True,
                 ),
             ],
         )
@@ -55,7 +58,7 @@ class BlueAshAuthTests(unittest.TestCase):
         applications.json.return_value = [{"slug": "another-app"}]
 
         with self.blueash_configuration(), patch.object(
-            blueash_auth.requests, "get", side_effect=[profile, applications]
+            blueash_auth.SSRFProtectedSession, "get", side_effect=[profile, applications]
         ):
             with self.assertRaises(blueash_auth.BlueAshAuthorizationError):
                 blueash_auth.BlueAshAuthClient().authenticate("shared-token")
@@ -63,10 +66,40 @@ class BlueAshAuthTests(unittest.TestCase):
     def test_expired_blueash_session_is_unauthenticated(self) -> None:
         response = Mock(ok=False, status_code=401)
         with self.blueash_configuration(), patch.object(
-            blueash_auth.requests, "get", return_value=response
+            blueash_auth.SSRFProtectedSession, "get", return_value=response
         ):
             with self.assertRaises(blueash_auth.BlueAshAuthenticationError):
                 blueash_auth.BlueAshAuthClient().authenticate("expired-token")
+
+    def test_unsafe_blueash_destination_returns_safe_unavailable_error(self) -> None:
+        with self.blueash_configuration(), patch.object(
+            blueash_auth.SSRFProtectedSession,
+            "get",
+            side_effect=UnsafeOutboundDestination("unsafe internal address 127.0.0.1"),
+        ):
+            with self.assertRaisesRegex(
+                blueash_auth.BlueAshUnavailableError,
+                "temporarily unavailable",
+            ) as raised:
+                blueash_auth.BlueAshAuthClient().authenticate("shared-token")
+
+        self.assertNotIn("127.0.0.1", str(raised.exception))
+
+    def test_logout_uses_protected_session(self) -> None:
+        response = Mock(status_code=204)
+        with self.blueash_configuration(), patch.object(
+            blueash_auth.SSRFProtectedSession,
+            "post",
+            return_value=response,
+        ) as request:
+            blueash_auth.BlueAshAuthClient().logout("shared-token")
+
+        request.assert_called_once_with(
+            "https://api.blueashdigital.tech/api/auth/logout",
+            headers={"Cookie": "blueash_session=shared-token"},
+            timeout=5.0,
+            allow_redirects=True,
+        )
 
     def test_login_url_only_accepts_opportunity_radar_paths(self) -> None:
         with (
@@ -87,6 +120,21 @@ class BlueAshAuthTests(unittest.TestCase):
         ):
             with self.assertRaises(blueash_auth.BlueAshConfigurationError):
                 blueash_auth.BlueAshAuthClient().authenticate("")
+
+    def test_production_rejects_browser_jobs_without_dns_pinned_egress(self) -> None:
+        with patch.multiple(
+            blueash_auth,
+            APP_ENV="production",
+            AUTH_MODE="blueash",
+            APP_ENABLE_BROWSER_JOBS=True,
+            APP_PUBLIC_URL="https://blueashdigital.tech/OpportunityRadar",
+            BLUEASH_API_URL="https://api.blueashdigital.tech",
+            BLUEASH_LOGIN_URL="https://blueashdigital.tech/",
+            BLUEASH_SESSION_COOKIE="blueash_session",
+            BLUEASH_APP_SLUG="opportunity-radar",
+        ):
+            with self.assertRaisesRegex(blueash_auth.BlueAshConfigurationError, "DNS-pinned"):
+                blueash_auth.validate_auth_configuration()
 
     def test_unknown_auth_mode_cannot_return_local_identity(self) -> None:
         with patch.multiple(
@@ -135,7 +183,7 @@ class BlueAshAuthTests(unittest.TestCase):
         applications = Mock(ok=True, status_code=200)
         applications.json.return_value = [{"slug": "opportunity-radar"}]
         with self.blueash_configuration(), patch.object(
-            blueash_auth.requests, "get", side_effect=[profile, applications]
+            blueash_auth.SSRFProtectedSession, "get", side_effect=[profile, applications]
         ):
             with self.assertRaises(blueash_auth.BlueAshAuthorizationError):
                 blueash_auth.BlueAshAuthClient().authenticate("shared-token")

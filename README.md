@@ -25,7 +25,7 @@ logs/
 
 `data/opportunity_radar.db` is the source of truth for companies, jobs, applications, resumes, raw candidates, settings, utility history, and import history. The FastAPI routes and frontend read from SQLite.
 
-`data/master.xlsx`, `data/companies.json`, `data/jobs.json`, and `data/applications.json` are compatibility imports, exports, backups, and recovery snapshots. Company CRUD regenerates the relevant private snapshots, but runtime reads do not depend on them. Browser application and resume state is retained as a recovery copy and imported into SQLite when the frontend first connects.
+`data/master.xlsx`, `data/companies.json`, `data/jobs.json`, and `data/applications.json` are compatibility imports, exports, backups, and recovery snapshots. Company CRUD regenerates the relevant private snapshots, but runtime reads do not depend on them. The browser does not retain raw resume or application recovery payloads; authenticated API/SQLite state is authoritative.
 
 ## SQLite Migration
 
@@ -101,6 +101,11 @@ Writable paths can be configured with `APP_DATA_DIR`, `DATABASE_URL`, `APP_IMPOR
 `APP_EXPORT_DIR`, `APP_BACKUP_DIR`, and `APP_LOG_DIR`. Keep them outside an immutable application
 image in a future hosted deployment.
 
+For a subpath deployment, set the frontend build-time `VITE_BASE_PATH` to the same path as
+`APP_BASE_PATH`, including a trailing slash. For the documented production URL, build with
+`VITE_BASE_PATH=/OpportunityRadar/`; `APP_BASE_PATH` alone does not configure Vite unless it is
+exported into the frontend build process.
+
 The first-release switches default off: `APP_ENABLE_BROWSER_JOBS`,
 `APP_ENABLE_COMPANY_REFRESH`, `APP_ENABLE_UTILITIES`, `APP_ENABLE_SCHEDULES`, and
 `APP_ENABLE_DISCOVERY`. The API enforces them before starting work, and the frontend displays
@@ -126,7 +131,7 @@ By default, `bootstrap-enrich` runs in fast static mode only. It performs websit
 Speed and caching controls:
 
 ```powershell
-python main.py --mode bootstrap-enrich --input input\companies.xlsx --master data\master.xlsx --max-workers 15 --browser-workers 3 --skip-recent-days 7
+python main.py --mode bootstrap-enrich --input input\companies.xlsx --master data\master.xlsx --max-workers 4 --browser-workers 1 --skip-recent-days 7
 python main.py --mode bootstrap-enrich --input input\companies.xlsx --master data\master.xlsx --force
 ```
 
@@ -166,7 +171,7 @@ python main.py --mode repair-websites --master data\master.xlsx --company "WECU"
 Useful collection controls:
 
 ```powershell
-python main.py --mode collect-jobs --max-workers 10 --browser-workers 3 --delay-seconds 1 --limit-companies 25 --company "WECU" --dry-run --debug-job-collection
+python main.py --mode collect-jobs --max-workers 4 --browser-workers 1 --delay-seconds 1 --limit-companies 25 --company "WECU" --dry-run --debug-job-collection
 ```
 
 `collect-jobs` splits work by collector type. HTTP/static collectors use `--max-workers`; Playwright/browser collectors use `--browser-workers` so the app does not launch too many browsers at once. Progress logs include company count, company name, collector, worker type, jobs saved, duration, average seconds per company, and estimated time remaining.
@@ -204,8 +209,10 @@ python -m uvicorn server:app --reload --host 127.0.0.1 --port 8000
 Backend health check:
 
 ```text
-GET http://127.0.0.1:8000/api/status
+GET http://127.0.0.1:8000/api/health
 ```
+
+See [Production runtime contract](docs/PRODUCTION_RUNTIME.md) before creating a hosted deployment.
 
 ## Utilities Tab
 
@@ -302,7 +309,7 @@ Rules:
 
 Use `--debug-job-collection` to write candidate/rejection debug files under `logs/job_collection_debug/`.
 
-The frontend Job List loads the generated job snapshot, removes invalid job records, applies filters and sorting, then paginates the results. Use the page size selector to show 10, 25, 50, or 100 jobs per page.
+The frontend Job List loads authoritative jobs from the authenticated API/SQLite store, removes invalid job records, applies filters and sorting, then paginates the results. Use the page size selector to show 10, 25, 50, or 100 jobs per page.
 
 ## Resume Fit
 

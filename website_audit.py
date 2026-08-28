@@ -9,6 +9,7 @@ from typing import Any
 
 from openpyxl import Workbook
 
+from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
 from config import LOG_DIR, OUTPUT_DIR
 from excel_tools import read_company_rows, write_master
 from search_tools import WebsiteEvaluation, choose_official_website_details, evaluate_official_website_details, search_web, site_root
@@ -208,14 +209,14 @@ def write_audit_outputs(audit_rows: list[WebsiteAuditRow]) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     json_path = LOG_DIR / "website_audit.json"
     xlsx_path = OUTPUT_DIR / "website_audit.xlsx"
-    json_path.write_text(json.dumps([asdict(row) for row in audit_rows], indent=2), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps([asdict(row) for row in audit_rows], indent=2))
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Website Audit"
     sheet.append(AUDIT_COLUMNS)
     for row in audit_rows:
-        sheet.append([
+        sheet.append([sanitize_spreadsheet_value(value) for value in [
             row.company_name,
             row.state,
             row.current_official_website,
@@ -224,10 +225,10 @@ def write_audit_outputs(audit_rows: list[WebsiteAuditRow]) -> None:
             row.issue,
             row.suggested_candidate_urls,
             row.notes,
-        ])
+        ]])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(xlsx_path)
+    atomic_save_workbook(xlsx_path, workbook)
     logger.info("Wrote website audit to %s and %s", json_path, xlsx_path)
 
 

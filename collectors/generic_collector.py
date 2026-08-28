@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
+from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_enrichment import extract_json_ld_pay_info, extract_pay_info
@@ -65,12 +66,13 @@ class GenericCollector(BaseCollector):
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context()
+            browser = launch_playwright_chromium(playwright, headless=True)
+            context = browser.new_context(service_workers="block")
+            install_playwright_url_guard(context)
             self._detail_context = context
             page = context.new_page()
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                safe_page_goto(page, url, wait_until="domcontentloaded", timeout=45000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except PlaywrightTimeoutError:
@@ -275,7 +277,7 @@ class GenericCollector(BaseCollector):
     def fetch_detail_page_with_browser(self, context, href: str) -> dict[str, str]:
         page = context.new_page()
         try:
-            page.goto(href, wait_until="domcontentloaded", timeout=45000)
+            safe_page_goto(page, href, wait_until="domcontentloaded", timeout=45000)
             try:
                 page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:

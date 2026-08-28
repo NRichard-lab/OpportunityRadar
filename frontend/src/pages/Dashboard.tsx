@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ArrowRight } from "lucide-react";
 import type { Company } from "../types/Company";
+import type { DataLoadStatus } from "../types/DataLoadState";
 import type { Job } from "../types/Job";
 import { JobDetailsModal } from "../components/JobDetailsModal";
 import { StatCard } from "../components/StatCard";
@@ -9,14 +10,18 @@ import { isCurrentJobRecord, newestJobFirst } from "../utils/jobRecords";
 interface DashboardProps {
   companies: Company[];
   jobs: Job[];
-  loaded: boolean;
+  status: DataLoadStatus;
+  error: string;
+  onRetry: () => void;
   onNavigate: (tab: string) => void;
   onRematch: (jobId: string) => Promise<Job>;
 }
 
-export function Dashboard({ companies, jobs, loaded, onNavigate, onRematch }: DashboardProps) {
+export function Dashboard({ companies, jobs, status, error, onRetry, onNavigate, onRematch }: DashboardProps) {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
-  if (!loaded) return <div className="panel p-8 text-center text-slate-400">Loading dashboard data...</div>;
+  if (status === "loading") return <div className="panel p-8 text-center text-slate-400" role="status">Loading dashboard data...</div>;
+  if (status === "error") return <div className="panel p-8 text-center" role="alert"><h3 className="text-lg font-semibold text-white">Dashboard data is unavailable</h3><p className="mt-2 text-sm text-red-300">{error || "Dashboard data could not be loaded."}</p><button className="btn mt-5" type="button" onClick={onRetry}>Retry</button></div>;
+  if (status === "empty") return <div className="panel p-8 text-center"><h3 className="text-lg font-semibold text-white">No opportunity data yet</h3><p className="mt-2 text-sm text-slate-400">Opportunity Radar connected successfully, but no companies, jobs, or applications are stored.</p><button className="btn mt-5" type="button" onClick={() => onNavigate("Companies")}>Open Companies</button></div>;
   const currentJobs = jobs.filter(isCurrentJobRecord).sort(newestJobFirst);
   const recentJobs = currentJobs.slice(0, 5);
   const applications = jobs.filter((job) => job.applied).length;
@@ -36,7 +41,7 @@ export function Dashboard({ companies, jobs, loaded, onNavigate, onRematch }: Da
         </div>
         <button className="btn shrink-0" type="button" onClick={() => onNavigate("Job List")}>View All Jobs<ArrowRight size={16} /></button>
       </header>
-      {recentJobs.length ? <div className="divide-y divide-radar-line">{recentJobs.map((job) => <RecentJob key={job.id} job={job} onOpen={() => setSelectedJob(job)} />)}</div> : <div className="p-8 text-center text-slate-400">No current jobs are available. Run job collection from Utilities.</div>}
+      {recentJobs.length ? <div className="divide-y divide-radar-line">{recentJobs.map((job) => <RecentJob key={job.id} job={job} onOpen={() => setSelectedJob(job)} />)}</div> : <div className="p-8 text-center text-slate-400">No current jobs are stored.</div>}
     </section>
     <JobDetailsModal job={selectedJob} onClose={() => setSelectedJob(null)} onRematch={onRematch} />
   </div>;

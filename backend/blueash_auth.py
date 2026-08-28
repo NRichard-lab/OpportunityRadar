@@ -9,8 +9,10 @@ from uuid import UUID
 
 import requests
 
+from backend.outbound_security import OutboundSecurityError, SSRFProtectedSession
 from config import (
     APP_BASE_PATH,
+    APP_ENABLE_BROWSER_JOBS,
     APP_ENV,
     APP_PUBLIC_URL,
     APP_TRUSTED_ADMIN_USER_ID,
@@ -110,6 +112,11 @@ def validate_auth_configuration() -> None:
     if BLUEASH_COOKIE_DOMAIN and any(character in BLUEASH_COOKIE_DOMAIN for character in "/:@?# "):
         raise BlueAshConfigurationError("BLUEASH_COOKIE_DOMAIN is invalid.")
     if APP_ENV == "production":
+        if APP_ENABLE_BROWSER_JOBS:
+            raise BlueAshConfigurationError(
+                "APP_ENABLE_BROWSER_JOBS cannot be enabled in production in this release; "
+                "browser traffic does not yet have a DNS-pinned network egress boundary."
+            )
         if not _canonical_uuid(APP_TRUSTED_ADMIN_USER_ID):
             raise BlueAshConfigurationError("Production requires APP_TRUSTED_ADMIN_USER_ID to be a valid UUID.")
         if APP_WRITE_FRONTEND_MIRRORS:
@@ -195,24 +202,28 @@ class BlueAshAuthClient:
         if AUTH_MODE == "local" or not session_token:
             return
         try:
-            response = requests.post(
-                f"{BLUEASH_API_URL}/api/auth/logout",
-                headers={"Cookie": f"{BLUEASH_SESSION_COOKIE}={session_token}"},
-                timeout=self.timeout_seconds,
-            )
-        except requests.RequestException as exc:
+            with SSRFProtectedSession() as session:
+                response = session.post(
+                    f"{BLUEASH_API_URL}/api/auth/logout",
+                    headers={"Cookie": f"{BLUEASH_SESSION_COOKIE}={session_token}"},
+                    timeout=self.timeout_seconds,
+                    allow_redirects=True,
+                )
+        except (OutboundSecurityError, requests.RequestException) as exc:
             raise BlueAshUnavailableError("Blue Ash logout is temporarily unavailable.") from exc
         if response.status_code >= 500:
             raise BlueAshUnavailableError("Blue Ash logout is temporarily unavailable.")
 
     def _get(self, path: str, session_token: str) -> Any:
         try:
-            response = requests.get(
-                f"{BLUEASH_API_URL}{path}",
-                headers={"Cookie": f"{BLUEASH_SESSION_COOKIE}={session_token}"},
-                timeout=self.timeout_seconds,
-            )
-        except requests.RequestException as exc:
+            with SSRFProtectedSession() as session:
+                response = session.get(
+                    f"{BLUEASH_API_URL}{path}",
+                    headers={"Cookie": f"{BLUEASH_SESSION_COOKIE}={session_token}"},
+                    timeout=self.timeout_seconds,
+                    allow_redirects=True,
+                )
+        except (OutboundSecurityError, requests.RequestException) as exc:
             raise BlueAshUnavailableError("Blue Ash authentication is temporarily unavailable.") from exc
         if response.status_code == 401:
             raise BlueAshAuthenticationError("Your Blue Ash session has expired.")

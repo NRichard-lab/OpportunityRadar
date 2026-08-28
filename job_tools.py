@@ -10,7 +10,16 @@ from typing import Any, Callable
 
 from openpyxl import Workbook
 
-from config import APP_WRITE_FRONTEND_MIRRORS, DEFAULT_FRONTEND_JOBS_JSON, LOG_DIR, OUTPUT_DIR
+from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
+from config import (
+    APP_ENABLE_BROWSER_JOBS,
+    APP_MAX_BROWSER_WORKERS,
+    APP_MAX_HTTP_WORKERS,
+    APP_WRITE_FRONTEND_MIRRORS,
+    DEFAULT_FRONTEND_JOBS_JSON,
+    LOG_DIR,
+    OUTPUT_DIR,
+)
 from excel_tools import read_company_rows, stable_company_id
 from job_enrichment import classify_role_type, extract_pay_info
 from job_validation import is_valid_job_title, rejection_reason
@@ -56,6 +65,8 @@ DIAGNOSTIC_COLUMNS = [
     "candidateElementsRejected",
     "validJobsSaved",
     "status",
+    "outcome",
+    "dataDisposition",
     "errorMessage",
     "durationSeconds",
     "averageSecondsPerCompany",
@@ -146,6 +157,8 @@ class CollectionDiagnostic:
     candidateElementsRejected: int = 0
     validJobsSaved: int = 0
     status: str = ""
+    outcome: str = ""
+    dataDisposition: str = ""
     errorMessage: str = ""
     durationSeconds: float = 0
     averageSecondsPerCompany: float = 0
@@ -170,8 +183,8 @@ def collect_jobs(
     company_filter: str = "",
     company_filters: list[str] | None = None,
     company_ids: set[str] | None = None,
-    max_workers: int = 10,
-    browser_workers: int = 3,
+    max_workers: int = APP_MAX_HTTP_WORKERS,
+    browser_workers: int = APP_MAX_BROWSER_WORKERS,
     delay_seconds: float = 1.0,
     dry_run: bool = False,
     debug_job_collection: bool = False,
@@ -202,7 +215,12 @@ def collect_jobs(
     missing_skipped = sum(1 for diagnostic in diagnostics if diagnostic.status == "Missing Job Board URL")
     invalid_skipped = sum(1 for diagnostic in diagnostics if diagnostic.status == "Invalid Job Board URL")
     if limit_companies:
+        omitted_candidates = candidates[limit_companies:]
         candidates = candidates[:limit_companies]
+        diagnostics.extend(
+            build_scope_retained_diagnostic(company, "Not selected by the collection limit.")
+            for company in omitted_candidates
+        )
 
     logger.info("Total companies reviewed: %s", reviewed)
     logger.info("Companies skipped because no usable source URL: %s", skipped)
@@ -215,6 +233,7 @@ def collect_jobs(
         return summary
 
     all_jobs: list[JobRecord] = []
+    successful_companies: list[dict[str, Any]] = []
     rejected_candidates: list[dict[str, Any]] = []
     errors = 0
     http_companies = []
@@ -232,27 +251,41 @@ def collect_jobs(
     total_attempted = len(http_companies) + len(browser_companies)
     completed_counter = {"count": 0}
 
-    for jobs, had_error, diagnostic, rejected in run_collection_group(http_companies, max_workers, total_attempted, completed_counter, started, "HTTP", progress_callback, cancellation_event):
-        all_jobs.extend(jobs)
-        errors += int(had_error)
-        diagnostics.append(diagnostic)
-        rejected_candidates.extend(rejected)
+    http_workers = min(APP_MAX_HTTP_WORKERS, max(1, int(max_workers or 1)))
+    browser_workers = min(APP_MAX_BROWSER_WORKERS, max(1, int(browser_workers or 1))) if APP_ENABLE_BROWSER_JOBS else 0
 
-    for jobs, had_error, diagnostic, rejected in run_collection_group(browser_companies, browser_workers, total_attempted, completed_counter, started, "Browser", progress_callback, cancellation_event):
+    for company, jobs, had_error, diagnostic, rejected in run_collection_group(http_companies, http_workers, total_attempted, completed_counter, started, "HTTP", progress_callback, cancellation_event):
         all_jobs.extend(jobs)
         errors += int(had_error)
         diagnostics.append(diagnostic)
         rejected_candidates.extend(rejected)
+        if not had_error:
+            successful_companies.append(company)
+
+    if browser_workers:
+        for company, jobs, had_error, diagnostic, rejected in run_collection_group(browser_companies, browser_workers, total_attempted, completed_counter, started, "Browser", progress_callback, cancellation_event):
+            all_jobs.extend(jobs)
+            errors += int(had_error)
+            diagnostics.append(diagnostic)
+            rejected_candidates.extend(rejected)
+            if not had_error:
+                successful_companies.append(company)
+    else:
+        for company, collector in browser_companies:
+            diagnostics.append(build_retained_diagnostic(company, collector, "Browser collection is disabled."))
 
     if cancellation_event is not None and cancellation_event.is_set():
         raise InterruptedError("Job refresh cancelled.")
     all_jobs = [enrich_job_record(job) for job in all_jobs]
-    final_jobs = merge_with_existing_jobs(jobs_json_path, all_jobs, candidates) if filters or company_ids is not None else [job for job in all_jobs if is_valid_job_record(job)]
+    final_jobs = merge_with_existing_jobs(jobs_json_path, all_jobs, successful_companies)
     write_jobs_json(jobs_json_path, final_jobs)
     write_jobs_xlsx(jobs_xlsx_path, final_jobs)
     write_diagnostics(diagnostics)
     write_rejected_candidates(rejected_candidates)
-    summary = build_summary(reviewed, skipped, missing_skipped, invalid_skipped, len(candidates), len(all_jobs), errors, started)
+    summary = build_summary(
+        reviewed, skipped, missing_skipped, invalid_skipped, len(candidates), len(all_jobs), errors, started,
+        diagnostics=diagnostics,
+    )
     log_summary(summary)
     return summary
 
@@ -301,14 +334,18 @@ def run_collection_group(
                 update_progress_diagnostic(diagnostic, total_attempted, completed_counter, overall_started)
                 log_collection_progress(diagnostic, worker_type, total_attempted, completed_counter["count"])
                 log_diagnostic(diagnostic)
-                results.append((jobs, False, diagnostic, list(getattr(collector, "rejected_candidates", []))))
+                results.append((company, jobs, False, diagnostic, list(getattr(collector, "rejected_candidates", []))))
             except Exception as exc:
                 logger.exception("Collector failed.")
-                diagnostic = build_diagnostic(company, collector, collector.candidate_count, 0, str(exc), started)
+                outcome = "timed-out" if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold() else "failed"
+                diagnostic = build_diagnostic(
+                    company, collector, collector.candidate_count, 0, safe_collection_error(exc), started,
+                    outcome=outcome,
+                )
                 update_progress_diagnostic(diagnostic, total_attempted, completed_counter, overall_started)
                 log_collection_progress(diagnostic, worker_type, total_attempted, completed_counter["count"])
                 log_diagnostic(diagnostic)
-                results.append(([], True, diagnostic, list(getattr(collector, "rejected_candidates", []))))
+                results.append((company, [], True, diagnostic, list(getattr(collector, "rejected_candidates", []))))
             if progress_callback:
                 progress_callback(completed_counter["count"], total_attempted, str(company.get("Company Name") or ""))
     return results
@@ -321,6 +358,8 @@ def build_diagnostic(
     jobs_saved: int,
     error_message: str,
     started: float,
+    *,
+    outcome: str | None = None,
 ) -> CollectionDiagnostic:
     source_url, source_type = collector.source_url(company)
     return CollectionDiagnostic(
@@ -339,6 +378,8 @@ def build_diagnostic(
         candidateElementsRejected=int(getattr(collector, "rejected_count", 0)),
         validJobsSaved=jobs_saved,
         status=diagnostic_status(jobs_saved, error_message, collector),
+        outcome=outcome or ("success" if jobs_saved else "success-empty"),
+        dataDisposition="retained" if error_message else "replaced" if jobs_saved else "replaced-empty",
         errorMessage=error_message,
         durationSeconds=round(time.monotonic() - started, 2),
         notes=diagnostic_notes(collector, jobs_saved, error_message),
@@ -492,7 +533,11 @@ def merge_with_existing_jobs(path: Path, new_jobs: list[JobRecord], target_compa
     target_names = {str(company.get("Company Name") or "").lower() for company in target_companies}
     kept = [
         job for job in existing
-        if str(job.companyId) not in target_ids and str(job.companyName).lower() not in target_names
+        if (
+            str(job.companyId or "") not in target_ids
+            if str(job.companyId or "").strip()
+            else str(job.companyName).lower() not in target_names
+        )
     ]
     merged = [*kept, *new_jobs]
     unique: dict[str, JobRecord] = {}
@@ -533,9 +578,8 @@ def slug(value: str) -> str:
 
 
 def write_jobs_json(path: Path, jobs: list[JobRecord]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = [asdict(job) for job in jobs]
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(payload, indent=2))
     mirror_jobs_json(path)
     logger.info("Wrote %s jobs to %s", len(jobs), path)
 
@@ -547,8 +591,7 @@ def mirror_jobs_json(path: Path) -> None:
         return
     if path.name != "jobs.json":
         return
-    DEFAULT_FRONTEND_JOBS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_FRONTEND_JOBS_JSON.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    atomic_write_text(DEFAULT_FRONTEND_JOBS_JSON, path.read_text(encoding="utf-8"))
     logger.info("Mirrored jobs JSON to %s", DEFAULT_FRONTEND_JOBS_JSON)
 
 
@@ -560,10 +603,10 @@ def write_jobs_xlsx(path: Path, jobs: list[JobRecord]) -> None:
     sheet.append(JOB_COLUMNS)
     for job in jobs:
         row = asdict(job)
-        sheet.append([row.get(column, "") for column in JOB_COLUMNS])
+        sheet.append([sanitize_spreadsheet_value(row.get(column, "")) for column in JOB_COLUMNS])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(path)
+    atomic_save_workbook(path, workbook)
     logger.info("Wrote jobs snapshot to %s", path)
 
 
@@ -573,17 +616,17 @@ def write_diagnostics(diagnostics: list[CollectionDiagnostic]) -> None:
     json_path = LOG_DIR / "job_collection_diagnostics.json"
     xlsx_path = OUTPUT_DIR / "job_collection_diagnostics.xlsx"
     payload = [asdict(diagnostic) for diagnostic in diagnostics]
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps(payload, indent=2))
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Job Collection Diagnostics"
     sheet.append(DIAGNOSTIC_COLUMNS)
     for row in payload:
-        sheet.append([row.get(column, "") for column in DIAGNOSTIC_COLUMNS])
+        sheet.append([sanitize_spreadsheet_value(row.get(column, "")) for column in DIAGNOSTIC_COLUMNS])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(xlsx_path)
+    atomic_save_workbook(xlsx_path, workbook)
     logger.info("Wrote job collection diagnostics to %s and %s", json_path, xlsx_path)
 
 
@@ -596,17 +639,17 @@ def write_rejected_candidates(
     xlsx_path = xlsx_path or OUTPUT_DIR / "rejected_job_candidates.xlsx"
     json_path.parent.mkdir(parents=True, exist_ok=True)
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(rejected_candidates, indent=2), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps(rejected_candidates, indent=2))
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Rejected Job Candidates"
     sheet.append(REJECTED_CANDIDATE_COLUMNS)
     for row in rejected_candidates:
-        sheet.append([row.get(column, "") for column in REJECTED_CANDIDATE_COLUMNS])
+        sheet.append([sanitize_spreadsheet_value(row.get(column, "")) for column in REJECTED_CANDIDATE_COLUMNS])
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(xlsx_path)
+    atomic_save_workbook(xlsx_path, workbook)
     logger.info("Wrote rejected job candidates to %s and %s", json_path, xlsx_path)
 
 
@@ -634,6 +677,8 @@ def build_skip_diagnostic(
         collectorSelected="None",
         collectorSelectionReason=notes,
         status=status,
+        outcome="stale",
+        dataDisposition="retained",
         notes=notes,
     )
 
@@ -670,8 +715,14 @@ def build_summary(
     jobs_found: int,
     errors: int,
     started: float,
+    *,
+    diagnostics: list[CollectionDiagnostic] | None = None,
 ) -> dict[str, Any]:
     duration = max(0.001, time.monotonic() - started)
+    results = diagnostics or []
+    outcome_counts: dict[str, int] = {}
+    for result in results:
+        outcome_counts[result.outcome or "unknown"] = outcome_counts.get(result.outcome or "unknown", 0) + 1
     return {
         "total_companies_reviewed": reviewed,
         "companies_skipped_no_job_board_url": skipped,
@@ -681,9 +732,60 @@ def build_summary(
         "jobs_found": jobs_found,
         "jobs_saved": jobs_found,
         "errors": errors,
+        "outcome_counts": outcome_counts,
+        "collection_results": [
+            {
+                "companyName": result.companyName,
+                "outcome": result.outcome,
+                "dataDisposition": result.dataDisposition,
+                "status": result.status,
+            }
+            for result in results
+        ],
         "duration_seconds": round(duration, 2),
         "average_seconds_per_company": round(duration / attempted, 2) if attempted else 0,
     }
+
+
+def build_retained_diagnostic(company: dict[str, Any], collector: Any, reason: str) -> CollectionDiagnostic:
+    source_url, source_type = collector.source_url(company)
+    return CollectionDiagnostic(
+        companyName=str(company.get("Company Name") or ""),
+        jobBoardUrl=str(company.get("Job Board URL") or ""),
+        jobPlatform=str(company.get("Job Platform") or ""),
+        sourceUrlUsed=source_url,
+        sourceTypeUsed=source_type,
+        collectorSelected=collector.__class__.__name__,
+        collectorSelectionReason=reason,
+        playwrightUsed=True,
+        status="Collection Disabled",
+        outcome="stale",
+        dataDisposition="retained",
+        notes=reason,
+    )
+
+
+def build_scope_retained_diagnostic(company: dict[str, Any], reason: str) -> CollectionDiagnostic:
+    source_url, source_type = first_source(company)
+    return CollectionDiagnostic(
+        companyName=str(company.get("Company Name") or ""),
+        jobBoardUrl=str(company.get("Job Board URL") or ""),
+        jobPlatform=str(company.get("Job Platform") or ""),
+        sourceUrlUsed=source_url,
+        sourceTypeUsed=source_type,
+        collectorSelected="None",
+        collectorSelectionReason=reason,
+        status="Not Selected",
+        outcome="stale",
+        dataDisposition="retained",
+        notes=reason,
+    )
+
+
+def safe_collection_error(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold():
+        return "The collector timed out."
+    return "The collector could not complete."
 
 
 def log_summary(summary: dict[str, Any]) -> None:

@@ -17,6 +17,7 @@ from openpyxl import Workbook, load_workbook
 
 from backend import MIGRATION_VERSION
 from backend.db import connect, initialize_schema
+from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
 from backend.repository import company_api_to_excel, utc_now
 from excel_tools import read_company_rows
 
@@ -391,7 +392,7 @@ def create_backup(project_root: Path, database_path: Path, backup_dir: Path) -> 
         "projectRoot": str(project_root), "files": entries,
     }
     manifest_path = backup_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
     return manifest_path, sha256_file(manifest_path)
 
 
@@ -614,7 +615,7 @@ def cleanup_sqlite_sidecars(database_path: Path) -> None:
 
 
 def write_reports(report: dict[str, Any], json_path: Path, xlsx_path: Path) -> None:
-    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps(report, indent=2))
     workbook = Workbook()
     summary = workbook.active
     summary.title = "Summary"
@@ -639,4 +640,7 @@ def write_reports(report: dict[str, Any], json_path: Path, xlsx_path: Path) -> N
     for sheet in workbook.worksheets:
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
-    workbook.save(xlsx_path)
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.value = sanitize_spreadsheet_value(cell.value)
+    atomic_save_workbook(xlsx_path, workbook)

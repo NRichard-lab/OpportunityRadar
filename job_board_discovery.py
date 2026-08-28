@@ -12,6 +12,7 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
 from config import LOG_DIR, OUTPUT_DIR, POLITE_DELAY_SECONDS, REQUEST_TIMEOUT
 from job_platforms import detect_job_platform
 from search_tools import (
@@ -578,7 +579,7 @@ def write_job_board_audit(results: list[JobBoardDiscoveryResult]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     json_path = LOG_DIR / "job_board_discovery_audit.json"
     xlsx_path = OUTPUT_DIR / "job_board_discovery_audit.xlsx"
-    json_path.write_text(json.dumps([asdict(result) for result in results], indent=2), encoding="utf-8")
+    atomic_write_text(json_path, json.dumps([asdict(result) for result in results], indent=2))
 
     workbook = Workbook()
     sheet = workbook.active
@@ -599,7 +600,7 @@ def write_job_board_audit(results: list[JobBoardDiscoveryResult]) -> None:
     sheet.append(headers)
     for result in results:
         sheet.append(
-            [
+            [sanitize_spreadsheet_value(value) for value in [
                 result.company_name,
                 result.official_website,
                 result.careers_page_url,
@@ -611,7 +612,7 @@ def write_job_board_audit(results: list[JobBoardDiscoveryResult]) -> None:
                 result.status,
                 result.reason,
                 result.notes,
-            ]
+            ]]
         )
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
@@ -620,6 +621,6 @@ def write_job_board_audit(results: list[JobBoardDiscoveryResult]) -> None:
     widths = [28, 42, 42, 42, 55, 70, 42, 22, 18, 42, 55]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = width
-    workbook.save(xlsx_path)
+    atomic_save_workbook(xlsx_path, workbook)
     LOGGER.info("Wrote job board discovery audit JSON: %s", json_path)
     LOGGER.info("Wrote job board discovery audit workbook: %s", xlsx_path)

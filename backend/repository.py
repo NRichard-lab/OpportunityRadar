@@ -32,7 +32,7 @@ LEFT JOIN resume_fit_results f ON f.resume_id='current' AND f.job_id=j.id"""
 class OpportunityRepository:
     def __init__(self, database_path: Path, *, initialize: bool = False) -> None:
         self.database_path = Path(database_path)
-        if initialize or self.database_path.exists():
+        if initialize:
             with self.connection() as connection:
                 initialize_schema(connection)
 

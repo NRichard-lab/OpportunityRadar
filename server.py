@@ -4,11 +4,11 @@ import io
 import json
 import logging
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Any, Callable, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -18,6 +18,8 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, SecretStr
 
 from backend.exports import SnapshotExporter
+from backend.health import ReadinessCache
+from backend.import_security import stage_import_upload
 from backend.blueash_auth import (
     BlueAshAuthenticationError,
     BlueAshAuthorizationError,
@@ -34,10 +36,12 @@ from backend.blueash_auth import (
 from backend.email_service import EmailConfigurationError, EmailDeliveryError, EmailService
 from backend.migration import excel_company_to_api
 from backend.maintenance_scheduler import DEFAULT_TIMEZONE, MaintenanceScheduler
+from backend.operation_gate import GLOBAL_MUTATION_GATE, OperationConflictError
+from backend.outbound_security import OutboundSecurityError, validate_outbound_url
 from backend.repository import OpportunityRepository
 from backend.resume_files import build_resume_profile
 from backend.resume_matching import ResumeMatchService
-from backend.utility_runs import UtilityRunManager
+from backend.utility_runs import UtilityRunManager, reconcile_interrupted_runs
 from backend.utility_tasks import (
     create_backup,
     export_data,
@@ -55,11 +59,14 @@ from config import (
     APP_ENABLE_SCHEDULES,
     APP_ENABLE_UTILITIES,
     APP_ENV,
+    APP_MAX_BROWSER_WORKERS,
+    APP_MAX_HTTP_WORKERS,
     APP_PUBLIC_ORIGIN,
     APP_WRITE_FRONTEND_MIRRORS,
     BACKUP_DIR,
     BLUEASH_COOKIE_DOMAIN,
     BLUEASH_SESSION_COOKIE,
+    DATA_DIR,
     DEFAULT_APPLICATIONS_JSON,
     DEFAULT_DATABASE,
     DEFAULT_FRONTEND_COMPANIES_JSON,
@@ -68,8 +75,12 @@ from config import (
     DEFAULT_JOBS_XLSX,
     DEFAULT_JSON_OUTPUT,
     DEFAULT_MASTER,
+    DEPLOYMENT_VERSION,
+    EXPORT_DIR,
     IMPORT_DIR,
     LOG_DIR,
+    MAX_IMPORT_UPLOAD_BYTES,
+    MAX_RESUME_UPLOAD_BYTES,
     feature_flags_payload,
 )
 from excel_tools import read_company_rows
@@ -84,9 +95,10 @@ app = FastAPI(
     redoc_url=None if APP_ENV == "production" else "/redoc",
     openapi_url=None if APP_ENV == "production" else "/openapi.json",
 )
-company_refresh_lock = Lock()
 _utility_run_manager: UtilityRunManager | None = None
 _maintenance_scheduler: MaintenanceScheduler | None = None
+_service_initialization_lock = RLock()
+_health_readiness_cache = ReadinessCache()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(filter(None, [APP_PUBLIC_ORIGIN, "http://127.0.0.1:5173", "http://localhost:5173"])),
@@ -142,10 +154,12 @@ def _disabled_action_reason(action: str) -> str:
         "refresh-missing-company-information": (
             (APP_ENABLE_COMPANY_REFRESH, "Company refresh"),
             (APP_ENABLE_DISCOVERY, "Company discovery"),
+            (APP_ENABLE_BROWSER_JOBS, "Browser job collection"),
         ),
         "refresh-company-discovery": (
             (APP_ENABLE_COMPANY_REFRESH, "Company refresh"),
             (APP_ENABLE_DISCOVERY, "Company discovery"),
+            (APP_ENABLE_BROWSER_JOBS, "Browser job collection"),
         ),
         "refresh-all-job-listings": ((APP_ENABLE_BROWSER_JOBS, "Browser job collection"),),
     }
@@ -166,20 +180,39 @@ def _guarded_utility_worker(action: str, worker: Callable[..., dict[str, Any]]) 
     return guarded
 
 
+@contextmanager
+def api_mutation(operation_type: str):
+    try:
+        lease = GLOBAL_MUTATION_GATE.acquire(operation_type)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    try:
+        yield
+    finally:
+        lease.release()
+
+
 def utility_runs() -> UtilityRunManager:
     global _utility_run_manager
-    if _utility_run_manager is None:
-        validate_auth_configuration()
-        _utility_run_manager = UtilityRunManager(Path(DEFAULT_DATABASE))
+    with _service_initialization_lock:
+        if _utility_run_manager is None:
+            validate_auth_configuration()
+            # Schema migration and stale-run reconciliation are explicit startup
+            # responsibilities. Lazy service construction must stay read-only so
+            # a GET cannot block behind an active writer.
+            _utility_run_manager = UtilityRunManager(
+                Path(DEFAULT_DATABASE), initialize=False, reconcile=False
+            )
     return _utility_run_manager
 
 
 def scheduler() -> MaintenanceScheduler:
     global _maintenance_scheduler
-    if _maintenance_scheduler is None:
-        _maintenance_scheduler = MaintenanceScheduler(
-            Path(DEFAULT_DATABASE), utility_runs(), user_utility_definitions
-        )
+    with _service_initialization_lock:
+        if _maintenance_scheduler is None:
+            _maintenance_scheduler = MaintenanceScheduler(
+                Path(DEFAULT_DATABASE), utility_runs(), user_utility_definitions
+            )
     return _maintenance_scheduler
 
 
@@ -221,8 +254,8 @@ class UtilityRequest(BaseModel):
     limit: int = Field(default=10, ge=0)
     limitCompanies: int = Field(default=25, ge=0)
     company: str | None = None
-    maxWorkers: int = Field(default=10, ge=1)
-    browserWorkers: int = Field(default=3, ge=1)
+    maxWorkers: int = Field(default=APP_MAX_HTTP_WORKERS, ge=1, le=APP_MAX_HTTP_WORKERS)
+    browserWorkers: int = Field(default=APP_MAX_BROWSER_WORKERS, ge=1, le=APP_MAX_BROWSER_WORKERS)
     delaySeconds: float = Field(default=1.0, ge=0)
     dryRun: bool = False
     debug: bool = False
@@ -291,13 +324,18 @@ def status() -> dict[str, str]:
 
 
 @app.get("/api/health")
-def health_endpoint() -> dict[str, str]:
-    try:
-        with repository().connection(readonly=True) as connection:
-            connection.execute("SELECT 1").fetchone()
-    except Exception:
-        raise HTTPException(status_code=503, detail="Database unavailable.") from None
-    return {"status": "healthy"}
+def health_endpoint() -> JSONResponse:
+    result = _health_readiness_cache.get(
+        database_path=Path(DEFAULT_DATABASE),
+        data_dir=Path(DATA_DIR),
+        export_dir=Path(EXPORT_DIR),
+        version=DEPLOYMENT_VERSION,
+    )
+    return JSONResponse(
+        content=result.payload,
+        status_code=result.status_code,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/auth/session")
@@ -384,41 +422,55 @@ def list_applications_endpoint() -> dict[str, dict[str, Any]]:
 
 @app.put("/api/applications/{job_id}", dependencies=[Depends(require_administrator)])
 def update_application_endpoint(job_id: str, request: ApplicationPatch) -> dict[str, Any]:
-    try:
-        application = repository().upsert_application(job_id, request.model_dump(exclude_none=True))
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Job not found.") from None
-    exporter().export_applications()
+    with api_mutation("update-application"):
+        try:
+            application = repository().upsert_application(job_id, request.model_dump(exclude_none=True))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Job not found.") from None
+        exporter().export_applications()
     return {"message": "Application tracking updated.", "application": application}
 
 
 @app.post("/api/applications/import-browser-overrides", dependencies=[Depends(require_administrator)])
 def import_browser_overrides_endpoint(request: BrowserOverridesRequest) -> dict[str, Any]:
-    result = repository().import_application_overrides(request.overrides)
-    exporter().export_applications()
+    with api_mutation("import-browser-overrides"):
+        result = repository().import_application_overrides(request.overrides)
+        exporter().export_applications()
     return result
 
 
 @app.get("/api/resume", dependencies=[Depends(require_administrator)])
 def get_resume_endpoint() -> dict[str, Any] | None:
-    return repository().get_resume()
+    profile = repository().get_resume()
+    return public_resume_profile(profile) if profile is not None else None
 
 
 @app.put("/api/resume", dependencies=[Depends(require_administrator)])
 def update_resume_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
-    return repository().upsert_resume(payload)
+    with api_mutation("update-resume"):
+        return public_resume_profile(repository().upsert_resume(payload))
 
 
 @app.post("/api/resume/upload", dependencies=[Depends(require_administrator)])
 async def upload_resume_endpoint(request: Request, filename: str = Query(min_length=1, max_length=255)) -> dict[str, Any]:
-    contents = await request.body()
+    contents = await read_limited_request_body(
+        request,
+        maximum_bytes=MAX_RESUME_UPLOAD_BYTES,
+        limit_message="The resume exceeds the 10 MiB upload limit.",
+    )
     if not contents:
         raise HTTPException(status_code=422, detail="The selected resume is empty.")
     try:
-        profile = build_resume_profile(Path(filename).name, contents)
+        profile = await run_in_threadpool(
+            build_resume_profile,
+            Path(filename).name,
+            contents,
+            temporary_root=Path(IMPORT_DIR),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
-    return repository().upsert_resume(profile)
+    with api_mutation("upload-resume"):
+        return public_resume_profile(repository().upsert_resume(profile))
 
 
 @app.get("/api/jobs/{job_id}/match", dependencies=[Depends(require_administrator)])
@@ -432,12 +484,13 @@ def get_job_match_endpoint(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/match", dependencies=[Depends(require_administrator)])
 def rematch_job_endpoint(job_id: str) -> dict[str, Any]:
-    try:
-        job = resume_match_service().match_job(job_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Job not found.") from None
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
+    with api_mutation("rematch-job"):
+        try:
+            job = resume_match_service().match_job(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Job not found.") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
     return {"message": "Resume match updated.", "job": job, **match_response(job)}
 
 
@@ -445,7 +498,9 @@ def rematch_job_endpoint(job_id: str) -> dict[str, Any]:
 def create_company_endpoint(request: CompanyRequest) -> dict[str, Any]:
     if not request.name.strip():
         raise HTTPException(status_code=422, detail="Company Name is required.")
-    company = company_service().add_company(request.model_dump())
+    validate_company_request_urls(request)
+    with api_mutation("create-company"):
+        company = company_service().add_company(request.model_dump())
     return {"message": "Company added.", "company": company}
 
 
@@ -453,10 +508,12 @@ def create_company_endpoint(request: CompanyRequest) -> dict[str, Any]:
 def update_company_endpoint(company_id: str, request: CompanyRequest) -> dict[str, Any]:
     if not request.name.strip():
         raise HTTPException(status_code=422, detail="Company Name is required.")
-    try:
-        company = company_service().edit_company(company_id, request.model_dump())
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Company not found.") from None
+    validate_company_request_urls(request)
+    with api_mutation("update-company"):
+        try:
+            company = company_service().edit_company(company_id, request.model_dump())
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Company not found.") from None
     return {"message": "Company updated.", "company": company}
 
 
@@ -468,20 +525,17 @@ def update_company_endpoint(company_id: str, request: CompanyRequest) -> dict[st
     ],
 )
 def refresh_company_endpoint(company_id: str) -> dict[str, Any]:
-    if not company_refresh_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Another company refresh is already running. Please try again shortly.")
-    try:
+    with api_mutation("refresh-company"):
         return run_single_company_refresh(company_id)
-    finally:
-        company_refresh_lock.release()
 
 
 @app.delete("/api/companies/{company_id}", dependencies=[Depends(require_administrator)])
 def delete_company_endpoint(company_id: str) -> dict[str, Any]:
-    try:
-        return company_service().delete_company(company_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Company not found.") from None
+    with api_mutation("delete-company"):
+        try:
+            return company_service().delete_company(company_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Company not found.") from None
 
 
 @app.post(
@@ -507,6 +561,8 @@ def export_companies_json_endpoint(request: UtilityRequest) -> dict[str, Any]:
     ],
 )
 def fill_missing_job_boards_endpoint(request: UtilityRequest) -> dict[str, Any]:
+    if request.useBrowserDiscovery:
+        require_browser_jobs_enabled()
     return run_utility("Fill missing job board URLs", lambda: run_company_file_adapter(
         lambda: fill_missing_job_boards(
             master_path=Path(DEFAULT_MASTER), output_json_path=Path(DEFAULT_JSON_OUTPUT),
@@ -630,13 +686,18 @@ async def start_import_run(request: Request, filename: str) -> dict[str, Any]:
     suffix = Path(safe_name).suffix.lower()
     if suffix not in {".json", ".xlsx"}:
         raise HTTPException(status_code=422, detail="Import supports JSON and Excel (.xlsx) files.")
-    contents = await request.body()
+    contents = await read_limited_request_body(
+        request,
+        maximum_bytes=MAX_IMPORT_UPLOAD_BYTES,
+        limit_message="The import exceeds the 25 MiB upload limit.",
+    )
     if not contents:
         raise HTTPException(status_code=422, detail="The selected import file is empty.")
     import_dir = Path(IMPORT_DIR)
-    import_dir.mkdir(parents=True, exist_ok=True)
-    stored_path = import_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}"
-    stored_path.write_bytes(contents)
+    try:
+        stored_path = stage_import_upload(import_dir, safe_name, contents)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     def import_worker(progress: Callable[..., None], cancelled: Any) -> dict[str, Any]:
         summary = import_data_file(repository(), exporter(), stored_path, progress, cancelled)
         summary["matching"] = safe_auto_match(summary.get("jobIds", []))
@@ -646,10 +707,31 @@ async def start_import_run(request: Request, filename: str) -> dict[str, Any]:
         return utility_runs().start(
             action="import-data", task_name="Import Data", progress_verb="Importing",
             progress_unit="records", worker=import_worker, format_summary=format_import_summary,
+            after_finish=lambda: stored_path.unlink(missing_ok=True),
         )
     except RuntimeError as exc:
         stored_path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail=str(exc)) from None
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        logging.exception("Import maintenance could not be started.")
+        raise HTTPException(status_code=500, detail="The import could not be started.") from None
+
+
+async def read_limited_request_body(request: Request, *, maximum_bytes: int, limit_message: str) -> bytes:
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length:
+        try:
+            if int(content_length) > maximum_bytes:
+                raise HTTPException(status_code=413, detail=limit_message)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="The Content-Length header is invalid.") from None
+    contents = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > maximum_bytes - len(contents):
+            raise HTTPException(status_code=413, detail=limit_message)
+        contents.extend(chunk)
+    return bytes(contents)
 
 
 @app.get(
@@ -681,12 +763,13 @@ def get_email_settings_endpoint() -> dict[str, Any]:
     dependencies=[Depends(require_administrator), Depends(require_utilities_enabled)],
 )
 def update_email_settings_endpoint(request: EmailSettingsRequest) -> dict[str, Any]:
-    try:
-        payload = request.model_dump(exclude={"smtpPassword"})
-        payload["smtpPassword"] = request.smtpPassword.get_secret_value()
-        return email_service().save_settings(payload)
-    except EmailConfigurationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
+    with api_mutation("update-email-settings"):
+        try:
+            payload = request.model_dump(exclude={"smtpPassword"})
+            payload["smtpPassword"] = request.smtpPassword.get_secret_value()
+            return email_service().save_settings(payload)
+        except EmailConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 @app.post(
@@ -694,12 +777,13 @@ def update_email_settings_endpoint(request: EmailSettingsRequest) -> dict[str, A
     dependencies=[Depends(require_administrator), Depends(require_utilities_enabled)],
 )
 def test_email_endpoint(request: TestEmailRequest) -> dict[str, Any]:
-    try:
-        return email_service().send_test_email(request.recipient)
-    except EmailConfigurationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    except EmailDeliveryError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from None
+    with api_mutation("test-email"):
+        try:
+            return email_service().send_test_email(request.recipient)
+        except EmailConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except EmailDeliveryError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
 
 
 @app.get(
@@ -723,12 +807,13 @@ def email_history_endpoint(limit: int = Query(default=20, ge=1, le=100)) -> dict
     dependencies=[Depends(require_administrator), Depends(require_utilities_enabled)],
 )
 def send_new_jobs_endpoint() -> dict[str, Any]:
-    try:
-        result = email_service().send_new_jobs_digest(trigger_type="manual")
-    except EmailConfigurationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    if result.get("status") == "Failed":
-        raise HTTPException(status_code=502, detail=result.get("error") or "The daily job email could not be sent.")
+    with api_mutation("send-new-jobs-email"):
+        try:
+            result = email_service().send_new_jobs_digest(trigger_type="manual")
+        except EmailConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        if result.get("status") == "Failed":
+            raise HTTPException(status_code=502, detail=result.get("error") or "The daily job email could not be sent.")
     return result
 
 
@@ -783,14 +868,15 @@ def list_maintenance_jobs() -> dict[str, Any]:
 def update_maintenance_schedule(job_key: str, request: MaintenanceScheduleRequest) -> dict[str, Any]:
     if request.enabled:
         _require_action_features(job_key)
-    try:
-        return scheduler().update_schedule(
-            job_key, enabled=request.enabled, run_time=request.runTime, timezone=request.timezone
-        )
-    except KeyError:
-        raise HTTPException(status_code=404, detail="This maintenance job does not support scheduling.") from None
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
+    with api_mutation("update-maintenance-schedule"):
+        try:
+            return scheduler().update_schedule(
+                job_key, enabled=request.enabled, run_time=request.runTime, timezone=request.timezone
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="This maintenance job does not support scheduling.") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 @app.get(
@@ -887,13 +973,26 @@ def match_response(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def public_resume_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in profile.items()
+        if key not in {"rawText", "extractedText"}
+    }
+
+
 def safe_auto_match(job_ids: list[str]) -> dict[str, Any]:
     unique_ids = [job_id for job_id in dict.fromkeys(job_ids) if job_id]
     try:
         return resume_match_service().match_jobs_if_needed(unique_ids)
-    except Exception as exc:
+    except Exception:
         logging.exception("Automatic resume matching failed; saved jobs were retained.")
-        return {"matched": 0, "failed": len(unique_ids), "skipped": 0, "error": str(exc)}
+        return {
+            "matched": 0,
+            "failed": len(unique_ids),
+            "skipped": 0,
+            "error": "Automatic resume matching could not be completed.",
+        }
 
 
 def exporter() -> SnapshotExporter:
@@ -944,9 +1043,9 @@ def run_single_company_refresh(company_id: str) -> dict[str, Any]:
         company_after = company_result["company"]
         metadata_changed = bool(company_result["metadataChanged"])
         warnings.extend(company_result.get("warnings", []))
-    except Exception as exc:
+    except Exception:
         logging.exception("Company discovery failed for %s.", company_before["name"])
-        errors.append(f"Company information could not be refreshed: {exc}")
+        errors.append("Company information could not be refreshed.")
 
     current_exporter = exporter()
     current_exporter.export_companies(include_excel=True)
@@ -976,9 +1075,9 @@ def run_single_company_refresh(company_id: str) -> dict[str, Any]:
             warnings.append(f"{collection_summary['errors']} job source could not be fully processed.")
         if not collection_summary.get("companies_attempted"):
             warnings.append("No usable verified job board was available for job collection.")
-    except Exception as exc:
+    except Exception:
         logging.exception("Job collection failed for %s.", company_before["name"])
-        errors.append(f"Jobs could not be refreshed: {exc}")
+        errors.append("Jobs could not be refreshed.")
     finally:
         current_exporter.export_companies(include_excel=True)
         current_exporter.export_jobs(include_excel=True)
@@ -1013,6 +1112,23 @@ def job_record_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
         "status", "roleType", "roleTypeReason", "rawData",
     )
     return any(before.get(key) != after.get(key) for key in keys)
+
+
+def validate_company_request_urls(request: CompanyRequest) -> None:
+    for field_name, value in (
+        ("companyWebsite", request.companyWebsite),
+        ("careersPageUrl", request.careersPageUrl),
+        ("jobBoardUrl", request.jobBoardUrl),
+    ):
+        if not value.strip():
+            continue
+        try:
+            validate_outbound_url(value.strip())
+        except OutboundSecurityError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name} must be a safe public HTTP(S) URL.",
+            ) from exc
 
 
 def run_job_collection(request: UtilityRequest, progress: Callable[[int, int, str], None] | None = None, cancellation_event: Any = None) -> dict[str, Any]:
@@ -1059,7 +1175,8 @@ def user_utility_definitions() -> dict[str, dict[str, Any]]:
 
     def jobs_worker(progress: Callable[[int, int, str], None], cancelled: Any) -> dict[str, Any]:
         request = UtilityRequest(
-            limit=0, limitCompanies=0, maxWorkers=10, browserWorkers=3,
+            limit=0, limitCompanies=0, maxWorkers=APP_MAX_HTTP_WORKERS,
+            browserWorkers=APP_MAX_BROWSER_WORKERS,
             delaySeconds=0.75, dryRun=False, debug=False, useBrowserDiscovery=True,
             force=False, allowLowConfidence=False,
         )
@@ -1169,33 +1286,41 @@ def maintenance_result(run: dict[str, Any] | None) -> str:
 
 
 def run_utility(name: str, action: Callable[[], Any]) -> dict[str, Any]:
+    try:
+        lease = GLOBAL_MUTATION_GATE.acquire(name)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     configure_logging_once()
     started_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
     started = time.monotonic()
     stdout = io.StringIO()
     stderr = io.StringIO()
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            summary = action()
-        completed_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
-        response = {
-            "status": "completed", "message": f"{name} completed.", "startedAt": started_at,
-            "completedAt": completed_at, "durationSeconds": round(time.monotonic() - started, 2),
-            "summary": make_json_safe(summary), "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
-        }
-    except Exception as exc:
-        completed_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
-        logging.exception("%s endpoint failed.", name)
-        response = {
-            "status": "failed", "message": f"{name} failed.", "startedAt": started_at,
-            "completedAt": completed_at, "durationSeconds": round(time.monotonic() - started, 2),
-            "summary": {}, "error": str(exc), "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
-        }
-    try:
-        repository().record_utility_run(name, response["status"], started_at, completed_at, response)
-    except Exception:
-        logging.exception("Could not persist utility run history.")
-    return response
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                summary = action()
+            completed_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
+            response = {
+                "status": "completed", "message": f"{name} completed.", "startedAt": started_at,
+                "completedAt": completed_at, "durationSeconds": round(time.monotonic() - started, 2),
+                "summary": make_json_safe(summary), "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+            }
+        except Exception:
+            completed_at = datetime.now().astimezone().replace(microsecond=0).isoformat()
+            logging.exception("%s endpoint failed.", name)
+            response = {
+                "status": "failed", "message": f"{name} failed.", "startedAt": started_at,
+                "completedAt": completed_at, "durationSeconds": round(time.monotonic() - started, 2),
+                "summary": {}, "error": "The operation could not be completed.",
+                "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+            }
+        try:
+            repository().record_utility_run(name, response["status"], started_at, completed_at, response)
+        except Exception:
+            logging.exception("Could not persist utility run history.")
+        return response
+    finally:
+        lease.release()
 
 
 def summarize_audit_rows(rows: list[Any]) -> dict[str, Any]:
@@ -1225,15 +1350,33 @@ def configure_logging_once() -> None:
 
 @app.on_event("startup")
 def start_maintenance_scheduler() -> None:
+    GLOBAL_MUTATION_GATE.start_accepting()
+    if _utility_run_manager is not None:
+        _utility_run_manager.start_accepting()
     validate_auth_configuration()
-    email_service().bootstrap_from_environment()
+    if APP_ENABLE_SCHEDULES and not APP_ENABLE_UTILITIES:
+        raise BlueAshConfigurationError("APP_ENABLE_SCHEDULES requires APP_ENABLE_UTILITIES=true.")
+    database_path = Path(DEFAULT_DATABASE)
+    readiness = _health_readiness_cache.get(
+        database_path=database_path,
+        data_dir=Path(DATA_DIR),
+        export_dir=Path(EXPORT_DIR),
+        version=DEPLOYMENT_VERSION,
+    )
+    if readiness.status_code == 503:
+        logging.error("Opportunity Radar persistence is not ready; DB-backed startup services were not started.")
+        return
+    reconcile_interrupted_runs(database_path)
+    if APP_ENABLE_UTILITIES:
+        email_service().bootstrap_from_environment()
     if APP_ENABLE_SCHEDULES:
-        if not APP_ENABLE_UTILITIES:
-            raise BlueAshConfigurationError("APP_ENABLE_SCHEDULES requires APP_ENABLE_UTILITIES=true.")
         scheduler().start()
 
 
 @app.on_event("shutdown")
 def stop_maintenance_scheduler() -> None:
+    GLOBAL_MUTATION_GATE.stop_accepting()
     if _maintenance_scheduler is not None:
         _maintenance_scheduler.stop()
+    if _utility_run_manager is not None:
+        _utility_run_manager.shutdown()

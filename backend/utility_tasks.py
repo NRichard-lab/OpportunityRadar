@@ -15,8 +15,12 @@ from uuid import uuid4
 from bs4 import BeautifulSoup
 
 from backend.exports import SnapshotExporter
+from backend.file_security import atomic_write_text
+from backend.import_security import enforce_record_limit, validate_staged_import
 from backend.migration import excel_company_to_api
+from backend.outbound_security import OutboundSecurityError, validate_outbound_url
 from backend.repository import OpportunityRepository, company_api_to_excel, utc_now
+from config import APP_ENABLE_BROWSER_JOBS
 from excel_tools import read_company_rows
 from job_tools import JobRecord, enrich_job_record
 from main import enrich_company
@@ -35,7 +39,11 @@ def refresh_single_company_information(
     company_id: str,
 ) -> dict[str, Any]:
     before = repository.get_company(company_id)
-    discovered = enrich_company(company_api_to_excel(before), utc_now(), use_browser_discovery=True)
+    discovered = enrich_company(
+        company_api_to_excel(before),
+        utc_now(),
+        use_browser_discovery=APP_ENABLE_BROWSER_JOBS,
+    )
     updates = discovery_to_api(discovered)
     website = str(updates.get("officialWebsite") or before.get("officialWebsite") or before.get("knownWebsite") or "")
     if website:
@@ -66,7 +74,11 @@ def refresh_missing_company_information(
         check_cancelled(cancelled)
         progress(index, len(companies), company["name"])
         before = repository.get_company(company["id"])
-        discovered = enrich_company(company_api_to_excel(company), utc_now(), use_browser_discovery=True)
+        discovered = enrich_company(
+            company_api_to_excel(company),
+            utc_now(),
+            use_browser_discovery=APP_ENABLE_BROWSER_JOBS,
+        )
         updates = discovery_to_api(discovered)
         website = str(updates.get("officialWebsite") or company.get("officialWebsite") or company.get("knownWebsite") or "")
         if website:
@@ -116,7 +128,7 @@ def refresh_company_discovery(
         if invalid_board:
             discovery_row["Job Board URL"] = ""
         discovery = discover_job_board_for_row(
-            discovery_row, use_browser_discovery=True,
+            discovery_row, use_browser_discovery=APP_ENABLE_BROWSER_JOBS,
             max_pages=5, force=False, debug=False,
         )
         updates: dict[str, Any] = {"lastChecked": utc_now()}
@@ -213,7 +225,7 @@ def create_backup(
         else:
             shutil.copy2(source, destination)
         entries.append({"file": source.name, "bytes": destination.stat().st_size, "sha256": sha256_file(destination)})
-    (backup_dir / "manifest.json").write_text(json.dumps({"createdAt": utc_now(), "files": entries}, indent=2), encoding="utf-8")
+    atomic_write_text(backup_dir / "manifest.json", json.dumps({"createdAt": utc_now(), "files": entries}, indent=2))
     return {"backupDirectory": str(backup_dir), "filesBackedUp": len(entries)}
 
 
@@ -237,6 +249,7 @@ def import_data_file(
     progress: ProgressCallback,
     cancelled: Event,
 ) -> dict[str, Any]:
+    validate_staged_import(path)
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
         company_payloads = [excel_company_to_api(row) for row in read_company_rows(path)]
@@ -255,11 +268,14 @@ def import_data_file(
     else:
         raise ValueError("Import supports .xlsx and .json files.")
 
+    company_payloads, job_payloads = enforce_record_limit(company_payloads, job_payloads)
+    normalized_companies = [normalize_imported_company(source) for source in company_payloads]
+    normalized_jobs = [normalize_imported_job(source) for source in job_payloads]
+
     imported_companies = 0
-    total = len(company_payloads) + len(job_payloads)
-    for index, source in enumerate(company_payloads, start=1):
+    total = len(normalized_companies) + len(normalized_jobs)
+    for index, company in enumerate(normalized_companies, start=1):
         check_cancelled(cancelled)
-        company = normalize_imported_company(source)
         try:
             existing = repository.get_company(company["id"])
             company = {**existing, **{key: value for key, value in company.items() if value not in (None, "")}}
@@ -270,7 +286,7 @@ def import_data_file(
         imported_companies += 1
     imported_jobs = 0
     imported_job_ids: list[str] = []
-    for offset, job in enumerate(job_payloads, start=len(company_payloads) + 1):
+    for offset, job in enumerate(normalized_jobs, start=len(normalized_companies) + 1):
         check_cancelled(cancelled)
         progress(offset, total, str(job.get("companyName") or "Jobs"))
         imported_jobs += repository.upsert_jobs([job])
@@ -357,7 +373,30 @@ def normalize_imported_company(source: dict[str, Any]) -> dict[str, Any]:
     company["id"] = str(company.get("id") or f"company-{uuid4()}")
     company.setdefault("industry", "Financial Services")
     company.setdefault("country", "United States")
+    validate_imported_urls(
+        company,
+        ("knownWebsite", "companyWebsite", "officialWebsite", "careersPageUrl", "jobBoardUrl", "jobsRssFeedUrl"),
+    )
     return company
+
+
+def normalize_imported_job(source: dict[str, Any]) -> dict[str, Any]:
+    job = dict(source)
+    if not str(job.get("id") or "").strip() or not str(job.get("title") or "").strip():
+        raise ValueError("Every imported job must have an ID and title.")
+    validate_imported_urls(job, ("sourceUrl",))
+    return job
+
+
+def validate_imported_urls(record: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        value = str(record.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            validate_outbound_url(value)
+        except OutboundSecurityError as exc:
+            raise ValueError(f"Imported field {key} must contain a safe public HTTP(S) URL.") from exc
 
 
 def discoverable_keys() -> tuple[str, ...]:

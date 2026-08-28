@@ -12,6 +12,8 @@ from config import (
     APP_ENABLE_BROWSER_JOBS,
     APP_ENABLE_COMPANY_REFRESH,
     APP_ENABLE_DISCOVERY,
+    APP_MAX_BROWSER_WORKERS,
+    APP_MAX_HTTP_WORKERS,
     DATA_DIR,
     DEFAULT_APPLICATIONS_JSON,
     DEFAULT_INPUT,
@@ -22,6 +24,7 @@ from config import (
     LOG_DIR,
     OUTPUT_DIR,
 )
+from backend.file_security import atomic_write_text
 from excel_tools import (
     create_sample_workbook,
     export_excel_to_json,
@@ -79,8 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--careers-url", default="", help="Careers URL for discover-job-board mode.")
     parser.add_argument("--limit", type=int, default=0, help="Limit rows processed for fill-missing-job-boards.")
     parser.add_argument("--limit-companies", type=int, default=0, help="Limit companies processed for collect-jobs.")
-    parser.add_argument("--max-workers", type=int, default=10, help="Concurrent workers for HTTP/static enrichment and collectors.")
-    parser.add_argument("--browser-workers", type=int, default=3, help="Concurrent workers for browser collectors.")
+    parser.add_argument("--max-workers", type=int, default=APP_MAX_HTTP_WORKERS, help="Concurrent HTTP workers, clamped to APP_MAX_HTTP_WORKERS.")
+    parser.add_argument("--browser-workers", type=int, default=APP_MAX_BROWSER_WORKERS, help="Concurrent browser workers, clamped to APP_MAX_BROWSER_WORKERS.")
     parser.add_argument("--delay-seconds", type=float, default=1.0, help="Delay before collector requests.")
     parser.add_argument("--dry-run", action="store_true", help="Show planned work without writing job snapshots.")
     parser.add_argument("--allow-low-confidence", action="store_true", help="Allow repair/enrichment to store low-confidence website matches.")
@@ -260,11 +263,13 @@ def bootstrap_enrich(
     master_path: Path,
     output_json_path: Path,
     use_browser_discovery: bool = False,
-    max_workers: int = 15,
-    browser_workers: int = 3,
+    max_workers: int = APP_MAX_HTTP_WORKERS,
+    browser_workers: int = APP_MAX_BROWSER_WORKERS,
     skip_recent_days: int = 7,
     force: bool = False,
 ) -> list[dict[str, object]]:
+    if use_browser_discovery and not APP_ENABLE_BROWSER_JOBS:
+        raise RuntimeError("Browser discovery requires APP_ENABLE_BROWSER_JOBS=true.")
     logging.info("Mode: bootstrap-enrich")
     logging.info("Web enrichment started in fast static mode.")
     if use_browser_discovery:
@@ -320,7 +325,7 @@ def run_enrichment_static_phase(companies: list[dict[str, str]], checked_at: str
     results: list[dict[str, object]] = []
     started = time.monotonic()
     total = len(companies)
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+    with ThreadPoolExecutor(max_workers=clamp_http_workers(max_workers)) as executor:
         futures = {executor.submit(enrich_company, company, checked_at, False): company for company in companies}
         for completed, future in enumerate(as_completed(futures), start=1):
             result = future.result()
@@ -334,7 +339,7 @@ def run_enrichment_browser_phase(results: list[dict[str, object]], browser_worke
         return
     started = time.monotonic()
     total = len(results)
-    with ThreadPoolExecutor(max_workers=max(1, browser_workers)) as executor:
+    with ThreadPoolExecutor(max_workers=clamp_browser_workers(browser_workers)) as executor:
         futures = {executor.submit(apply_browser_discovery_to_result, result): result for result in results}
         for completed, future in enumerate(as_completed(futures), start=1):
             future.result()
@@ -388,10 +393,12 @@ def fill_missing_job_boards(
     force: bool = False,
     debug_job_board_discovery: bool = False,
     max_pages: int = 5,
-    max_workers: int = 15,
-    browser_workers: int = 3,
+    max_workers: int = APP_MAX_HTTP_WORKERS,
+    browser_workers: int = APP_MAX_BROWSER_WORKERS,
     skip_recent_days: int = 7,
 ) -> dict[str, object]:
+    if use_browser_discovery and not APP_ENABLE_BROWSER_JOBS:
+        raise RuntimeError("Browser discovery requires APP_ENABLE_BROWSER_JOBS=true.")
     logging.info("Mode: fill-missing-job-boards")
     if not use_browser_discovery:
         logging.info("Browser discovery disabled; static and verified-search discovery will still be attempted.")
@@ -424,7 +431,7 @@ def fill_missing_job_boards(
     from job_board_discovery import discover_job_board_for_row, write_job_board_audit
 
     started = time.monotonic()
-    worker_count = browser_workers if use_browser_discovery else max_workers
+    worker_count = clamp_browser_workers(browser_workers) if use_browser_discovery else clamp_http_workers(max_workers)
     discovery_results = []
     with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
         futures = {}
@@ -588,6 +595,8 @@ def resolve_input_path(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    args.max_workers = clamp_http_workers(args.max_workers)
+    args.browser_workers = clamp_browser_workers(args.browser_workers) if APP_ENABLE_BROWSER_JOBS else 0
     validate_cli_feature_flags(args)
     configure_logging()
     input_path = resolve_input_path(args)
@@ -673,6 +682,14 @@ def main() -> int:
     return 0
 
 
+def clamp_http_workers(value: int) -> int:
+    return min(APP_MAX_HTTP_WORKERS, max(1, int(value or 1)))
+
+
+def clamp_browser_workers(value: int) -> int:
+    return min(APP_MAX_BROWSER_WORKERS, max(1, int(value or 1)))
+
+
 def validate_cli_feature_flags(args: argparse.Namespace) -> None:
     requirements: dict[str, tuple[tuple[bool, str], ...]] = {
         "bootstrap-enrich": (
@@ -692,6 +709,11 @@ def validate_cli_feature_flags(args: argparse.Namespace) -> None:
         ),
     }
     disabled = [name for enabled, name in requirements.get(args.mode, ()) if not enabled]
+    if args.mode in {"bootstrap-enrich", "fill-missing-job-boards"} and args.use_browser_discovery:
+        if not APP_ENABLE_BROWSER_JOBS:
+            disabled.append("APP_ENABLE_BROWSER_JOBS")
+    if args.mode == "discover-job-board" and not APP_ENABLE_BROWSER_JOBS:
+        disabled.append("APP_ENABLE_BROWSER_JOBS")
     if disabled:
         raise RuntimeError(
             f"{args.mode} is disabled. Explicitly enable the required feature flags: {', '.join(disabled)}."
@@ -731,8 +753,8 @@ def prepare_company_sources_for_collection(master_path: Path, output_json_path: 
             force=False,
             debug_job_board_discovery=True,
             max_pages=5,
-            max_workers=15,
-            browser_workers=3,
+            max_workers=APP_MAX_HTTP_WORKERS,
+            browser_workers=APP_MAX_BROWSER_WORKERS,
             skip_recent_days=0,
         )
 
@@ -752,5 +774,5 @@ def log_company_source_data(row: dict[str, object]) -> None:
 if __name__ == "__main__":
     DEFAULT_APPLICATIONS_JSON.parent.mkdir(parents=True, exist_ok=True)
     if not DEFAULT_APPLICATIONS_JSON.exists():
-        DEFAULT_APPLICATIONS_JSON.write_text("[]\n", encoding="utf-8")
+        atomic_write_text(DEFAULT_APPLICATIONS_JSON, "[]\n")
     raise SystemExit(main())

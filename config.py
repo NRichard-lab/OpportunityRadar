@@ -22,6 +22,19 @@ def _read_bool(name: str, *, default: bool = False) -> bool:
     raise RuntimeError(f"{name} must be a boolean value (true or false).")
 
 
+def _read_positive_int(name: str, *, default: int, maximum: int = 256) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer.") from exc
+    if value < 1 or value > maximum:
+        raise RuntimeError(f"{name} must be between 1 and {maximum}.")
+    return value
+
+
 APP_ENV = os.environ.get("APP_ENV", "").strip().lower()
 APP_BASE_PATH = "/" + os.environ.get("APP_BASE_PATH", "").strip().strip("/") if os.environ.get("APP_BASE_PATH", "").strip().strip("/") else ""
 APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "").strip().rstrip("/")
@@ -42,6 +55,24 @@ APP_ENABLE_UTILITIES = _read_bool("APP_ENABLE_UTILITIES")
 APP_ENABLE_SCHEDULES = _read_bool("APP_ENABLE_SCHEDULES")
 APP_ENABLE_DISCOVERY = _read_bool("APP_ENABLE_DISCOVERY")
 APP_WRITE_FRONTEND_MIRRORS = _read_bool("APP_WRITE_FRONTEND_MIRRORS")
+
+# First-release in-process concurrency limits. Every caller is clamped to these
+# values; the global mutation gate still permits only one shared-data operation.
+APP_MAX_HTTP_WORKERS = _read_positive_int("APP_MAX_HTTP_WORKERS", default=4, maximum=32)
+APP_MAX_BROWSER_WORKERS = _read_positive_int("APP_MAX_BROWSER_WORKERS", default=1, maximum=4)
+APP_MAX_ACTIVE_MAINTENANCE = _read_positive_int("APP_MAX_ACTIVE_MAINTENANCE", default=1, maximum=1)
+
+MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_RESUME_PDF_PAGES = 100
+MAX_RESUME_DOCX_FILES = 2_000
+MAX_RESUME_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+MAX_RESUME_EXTRACTED_TEXT_CHARS = 2_000_000
+MAX_IMPORT_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_IMPORT_ROWS = 50_000
+MAX_IMPORT_WORKSHEETS = 10
+MAX_IMPORT_ARCHIVE_FILES = 5_000
+MAX_IMPORT_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+DEPLOYMENT_VERSION = os.environ.get("DEPLOYMENT_VERSION", "development").strip() or "development"
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", str(BASE_DIR / "data"))).resolve()
 IMPORT_DIR = Path(os.environ.get("APP_IMPORT_DIR", str(BASE_DIR / "Input" / "imports"))).resolve()

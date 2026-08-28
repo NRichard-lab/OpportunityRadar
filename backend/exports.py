@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+from backend.file_security import EXPORT_WRITE_LOCK, atomic_write_text
 from backend.repository import OpportunityRepository
 from excel_tools import write_results
 from job_tools import JobRecord, write_jobs_xlsx
@@ -37,27 +38,30 @@ class SnapshotExporter:
         self.write_frontend_mirrors = write_frontend_mirrors
 
     def export_companies(self, *, include_excel: bool = True) -> int:
-        companies = self.repository.list_companies()
-        _write_json(self.companies_json_path, companies)
-        if self.write_frontend_mirrors:
-            _write_json(self.frontend_companies_json_path, companies)
-        if include_excel:
-            write_results(self.master_path, self.repository.list_company_rows())
+        with EXPORT_WRITE_LOCK:
+            companies = self.repository.list_companies()
+            _write_json(self.companies_json_path, companies)
+            if self.write_frontend_mirrors:
+                _write_json(self.frontend_companies_json_path, companies)
+            if include_excel:
+                write_results(self.master_path, self.repository.list_company_rows())
         return len(companies)
 
     def export_jobs(self, *, include_excel: bool = False) -> int:
-        jobs = self.repository.list_jobs()
-        _write_json(self.jobs_json_path, jobs)
-        if self.write_frontend_mirrors:
-            _write_json(self.frontend_jobs_json_path, jobs)
-        if include_excel:
-            job_fields = {item.name for item in fields(JobRecord)}
-            write_jobs_xlsx(self.jobs_xlsx_path, [JobRecord(**{key: value for key, value in job.items() if key in job_fields}) for job in jobs])
+        with EXPORT_WRITE_LOCK:
+            jobs = self.repository.list_jobs()
+            _write_json(self.jobs_json_path, jobs)
+            if self.write_frontend_mirrors:
+                _write_json(self.frontend_jobs_json_path, jobs)
+            if include_excel:
+                job_fields = {item.name for item in fields(JobRecord)}
+                write_jobs_xlsx(self.jobs_xlsx_path, [JobRecord(**{key: value for key, value in job.items() if key in job_fields}) for job in jobs])
         return len(jobs)
 
     def export_applications(self) -> int:
-        applications = self.repository.list_applications()
-        _write_json(self.applications_json_path, applications)
+        with EXPORT_WRITE_LOCK:
+            applications = self.repository.list_applications()
+            _write_json(self.applications_json_path, applications)
         return len(applications)
 
     def export_all(self, *, include_excel: bool = True) -> dict[str, int]:
@@ -69,7 +73,4 @@ class SnapshotExporter:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_text(path, json.dumps(payload, indent=2))

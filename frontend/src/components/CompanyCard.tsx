@@ -18,14 +18,31 @@ interface CompanyCardProps {
 
 export interface CompanyRefreshResult {
   status: "completed" | "partial" | "failed";
+  companyId: string;
   companyName: string;
   companyMetadataChanged: boolean;
   totalJobsDiscovered: number;
   newJobs: number;
   updatedJobs: number;
   removedOrClosedJobs: number;
+  activeJobs: number;
   warnings: string[];
   errors: string[];
+}
+
+export function isCompanyRefreshResult(value: unknown): value is CompanyRefreshResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  const numericFields = ["totalJobsDiscovered", "newJobs", "updatedJobs", "removedOrClosedJobs", "activeJobs"];
+  return ["completed", "partial"].includes(String(result.status))
+    && typeof result.companyId === "string"
+    && typeof result.companyName === "string"
+    && typeof result.companyMetadataChanged === "boolean"
+    && numericFields.every((field) => typeof result[field] === "number" && Number.isInteger(result[field]) && Number(result[field]) >= 0)
+    && Array.isArray(result.warnings)
+    && result.warnings.every((item) => typeof item === "string")
+    && Array.isArray(result.errors)
+    && result.errors.every((item) => typeof item === "string");
 }
 
 export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdit, onDelete, onRefresh, refreshEnabled, isRefreshing, refreshResult, forceOpen }: CompanyCardProps) {
@@ -90,8 +107,8 @@ function RefreshResult({ result }: { result: CompanyRefreshResult }) {
       <li>{result.newJobs} new jobs added</li>
       <li>{result.updatedJobs} jobs updated</li>
       {result.removedOrClosedJobs ? <li>{result.removedOrClosedJobs} jobs removed or closed</li> : null}
-      {result.errors.map((message) => <li key={message}>{message}</li>)}
-      {result.warnings.map((message) => <li key={message}>{message}</li>)}
+      {result.errors.length ? <li>Some refresh steps failed. Retry the refresh or contact an administrator.</li> : null}
+      {result.warnings.length ? <li>Some refresh steps could not be completed.</li> : null}
     </ul>
   </div>;
 }

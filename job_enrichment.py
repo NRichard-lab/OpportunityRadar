@@ -4,18 +4,19 @@ import re
 from typing import Any
 
 
+_CURRENCY_MARKER = r"(?:US\$|CA\$|\$|£|€|USD|CAD|GBP|EUR)"
+_PAY_NUMBER = r"\d[\d,]*(?:\.\d{1,2})?\s*[kK]?"
+
 PAY_CONTEXT_PATTERN = re.compile(
-    r"(?i)\b(?:pay range|salary range|compensation|starting at|up to|salary|pay|wage|rate)\b"
-    r"[^.\n\r]{0,80}?\$\s?\d[\d,]*(?:\.\d{1,2})?"
-    r"(?:\s*(?:usd|dollars?))?"
-    r"(?:\s*(?:-|to|–|—)\s*\$?\s?\d[\d,]*(?:\.\d{1,2})?(?:\s*(?:usd|dollars?))?)?"
+    rf"(?i)\b(?:pay range|salary range|compensation|starting at|up to|salary|pay|wage|hourly rate|annual rate)\b"
+    rf"[^.;\n\r]{{0,40}}?(?:{_CURRENCY_MARKER}\s*)?{_PAY_NUMBER}(?:\s*(?:usd|cad|gbp|eur|dollars?))?"
+    rf"(?:\s*(?:-|to|–|—)\s*(?:{_CURRENCY_MARKER}\s*)?{_PAY_NUMBER}(?:\s*(?:usd|cad|gbp|eur|dollars?))?)?"
     r"(?:\s*(?:/|per)?\s*(?:hour|hr|year|yr|annually|annual|month|monthly|week|weekly))?"
 )
 
 PAY_PATTERN = re.compile(
-    r"(?i)\$\s?\d[\d,]*(?:\.\d{1,2})?\s*(?:k)?"
-    r"(?:\s*(?:usd|dollars?))?"
-    r"(?:\s*(?:-|to|–|—)\s*\$?\s?\d[\d,]*(?:\.\d{1,2})?\s*(?:k)?(?:\s*(?:usd|dollars?))?)?"
+    rf"(?i)(?:{_CURRENCY_MARKER}\s*{_PAY_NUMBER}|{_PAY_NUMBER}\s*(?:USD|CAD|GBP|EUR|dollars?))"
+    rf"(?:\s*(?:-|to|–|—)\s*(?:{_CURRENCY_MARKER}\s*)?{_PAY_NUMBER}(?:\s*(?:usd|cad|gbp|eur|dollars?))?)?"
     r"(?:\s*(?:/|per)?\s*(?:hour|hr|year|yr|annually|annual|month|monthly|week|weekly))?"
 )
 
@@ -55,8 +56,8 @@ MGR_DESCRIPTION_PATTERNS = [
     r"supervises employees",
     r"direct reports",
     r"performance reviews",
-    r"\bhiring\b",
     r"coaching staff",
+    r"\b(?:hire|hiring),?\s+(?:coach(?:ing)?|manage(?:ment)?|supervis(?:e|ing))\b",
     r"leads department",
     r"responsible for (?:a )?team",
     r"oversees staff",
@@ -99,7 +100,8 @@ def extract_pay_info(text: str) -> dict[str, Any]:
     if not value:
         return result
 
-    match = PAY_CONTEXT_PATTERN.search(value) or PAY_PATTERN.search(value)
+    context_match = PAY_CONTEXT_PATTERN.search(value)
+    match = context_match or PAY_PATTERN.search(value)
     if not match:
         return result
 
@@ -107,11 +109,14 @@ def extract_pay_info(text: str) -> dict[str, Any]:
     numbers = parse_pay_numbers(pay_text)
     if not numbers:
         return result
+    if not plausible_pay_match(value, match.end(), pay_text, numbers, context_match is not None):
+        return result
     result["payMin"] = numbers[0]
     result["payMax"] = numbers[1] if len(numbers) > 1 else None
     result["payText"] = pay_text
     result["payPeriod"] = detect_pay_period(pay_text)
-    result["payPatternMatched"] = "context" if PAY_CONTEXT_PATTERN.search(value) else "currency"
+    result["payCurrency"] = detect_currency(pay_text)
+    result["payPatternMatched"] = "context" if context_match is not None else "currency"
     return result
 
 
@@ -218,6 +223,49 @@ def detect_pay_period(text: str) -> str:
     if numbers and max(numbers) >= 1000:
         return "annual"
     return "unknown"
+
+
+def detect_currency(text: str) -> str:
+    value = str(text or "").upper()
+    if "CAD" in value or "CA$" in value:
+        return "CAD"
+    if "GBP" in value or "£" in value:
+        return "GBP"
+    if "EUR" in value or "€" in value:
+        return "EUR"
+    return "USD"
+
+
+def plausible_pay_match(
+    source_text: str,
+    match_end: int,
+    pay_text: str,
+    numbers: list[int],
+    context_match: bool,
+) -> bool:
+    """Reject common benefit/experience numbers that merely occur near pay language."""
+
+    explicit_currency = re.search(_CURRENCY_MARKER, pay_text, flags=re.IGNORECASE) is not None
+    period = detect_pay_period(pay_text)
+    maximum = max(numbers)
+    suffix = source_text[match_end:match_end + 24]
+    if not explicit_currency and re.match(r"\s*\(\s*k\s*\)", suffix, flags=re.IGNORECASE):
+        return False
+    if not explicit_currency and re.search(r"\b401\s*k\b", pay_text, flags=re.IGNORECASE):
+        return False
+    if not context_match:
+        return True
+    if period == "annual" and maximum < 10_000:
+        return False
+    if period == "monthly" and maximum < 500:
+        return False
+    if period == "weekly" and maximum < 100:
+        return False
+    if period == "hourly" and not 5 <= maximum <= 500:
+        return False
+    if not explicit_currency and period == "unknown" and maximum < 1_000:
+        return False
+    return True
 
 
 def clean_pay_text(value: str) -> str:

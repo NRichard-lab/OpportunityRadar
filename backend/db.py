@@ -239,13 +239,20 @@ def connect(database_path: Path, *, readonly: bool = False) -> sqlite3.Connectio
     else:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    if not readonly:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-    return connection
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        if not readonly:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+        return connection
+    except BaseException:
+        try:
+            connection.close()
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:

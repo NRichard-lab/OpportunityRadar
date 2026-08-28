@@ -1,5 +1,5 @@
-export type WorkType = "Remote" | "Hybrid" | "Onsite" | "Not Listed";
-export type RoleType = "IC" | "MGR" | "EXEC" | "UNKNOWN";
+export type WorkType = "Remote" | "Hybrid" | "Onsite" | "Not Listed" | (string & {});
+export type RoleType = "IC" | "MGR" | "EXEC" | "UNKNOWN" | (string & {});
 export type ApplicationStatus =
   | "Interested"
   | "Applied"
@@ -7,7 +7,8 @@ export type ApplicationStatus =
   | "Interview Scheduled"
   | "Rejected"
   | "Offer"
-  | "Archived";
+  | "Archived"
+  | (string & {});
 
 export interface Job {
   id: string;

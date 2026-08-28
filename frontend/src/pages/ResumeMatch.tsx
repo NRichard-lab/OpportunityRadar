@@ -1,22 +1,28 @@
 import { useMemo, useState } from "react";
 import { LoaderCircle, RefreshCw } from "lucide-react";
 import type { Job } from "../types/Job";
+import type { DataLoadStatus } from "../types/DataLoadState";
 import type { MaintenanceJobsState } from "../types/Maintenance";
 import type { ResumeProfile } from "../types/ResumeProfile";
 import { JobDetailsModal } from "../components/JobDetailsModal";
 import { MatchScoreBadge } from "../components/MatchScoreBadge";
 import { ResumeUpload } from "../components/ResumeUpload";
+import { DataStatePanel } from "../components/DataStatePanel";
 import { isCurrentJobRecord } from "../utils/jobRecords";
-import { API_BASE } from "../api";
+import { isUtilityRunResponse } from "../runtimeSchemas";
+import { ApiError, apiJson, userMessage } from "../api";
 
 interface ResumeMatchProps {
-  jobs: Job[]; resume: ResumeProfile | null; onResumeChange: (resume: ResumeProfile) => void;
+  jobs: Job[]; resume: ResumeProfile | null; onResumeChange: (resume: ResumeProfile) => Promise<void>;
   maintenance: MaintenanceJobsState; onMaintenanceRefresh: () => Promise<MaintenanceJobsState>;
-  onJobsReload: () => Promise<void>; onRematch: (jobId: string) => Promise<Job>;
+  onRematch: (jobId: string) => Promise<Job>;
   utilitiesEnabled: boolean;
+  dataStatus: DataLoadStatus;
+  dataError: string;
+  onRetry: () => void;
 }
 
-export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaintenanceRefresh, onJobsReload, onRematch, utilitiesEnabled }: ResumeMatchProps) {
+export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaintenanceRefresh, onRematch, utilitiesEnabled, dataStatus, dataError, onRetry }: ResumeMatchProps) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("All statuses");
   const [sort, setSort] = useState("Highest match");
@@ -45,10 +51,12 @@ export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaint
     }
     setStarting(true); setError("");
     try {
-      const response = await fetch(`${API_BASE}/maintenance/jobs/rematch-all-jobs/run`, { method: "POST" });
-      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "Rematch All could not be started.");
+      const startedRun = await apiJson<unknown>("/maintenance/jobs/rematch-all-jobs/run", { method: "POST" }, "Rematch All could not be started.");
+      if (!isUtilityRunResponse(startedRun) || startedRun.action !== "rematch-all-jobs" || startedRun.job_key !== "rematch-all-jobs") {
+        throw new ApiError("Rematch All could not be started. The server returned an invalid response.");
+      }
       await onMaintenanceRefresh();
-    } catch (startError) { setError(startError instanceof Error ? startError.message : "Rematch All could not be started."); }
+    } catch (startError) { setError(userMessage(startError, "Rematch All could not be started.")); }
     finally { setStarting(false); }
   };
 
@@ -57,6 +65,10 @@ export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaint
   const processed = Number(summary.jobsProcessed ?? run?.current ?? 0);
   const failed = Number(summary.jobsFailed ?? 0);
   const remaining = Number(summary.jobsRemaining ?? Math.max(0, (run?.total || 0) - processed));
+
+  if (dataStatus === "loading" || dataStatus === "error") {
+    return <DataStatePanel status={dataStatus} error={dataError} loadingLabel="Loading resume and match data..." onRetry={onRetry} />;
+  }
 
   return <div className="space-y-5">
     <ResumeUpload resume={resume} onResumeChange={onResumeChange} />
@@ -91,7 +103,7 @@ export function ResumeMatch({ jobs, resume, onResumeChange, maintenance, onMaint
         {!visibleJobs.length ? <p className="p-8 text-center text-slate-400">No current jobs match these filters.</p> : null}
       </div>
     </section>
-    <JobDetailsModal job={selectedJob} onClose={() => setSelectedJob(null)} onRematch={async (jobId) => { const updated = await onRematch(jobId); await onJobsReload(); return updated; }} />
+    <JobDetailsModal job={selectedJob} onClose={() => setSelectedJob(null)} onRematch={onRematch} />
   </div>;
 }
 

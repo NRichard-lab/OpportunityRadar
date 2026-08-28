@@ -29,8 +29,8 @@ class MaintenanceScheduler:
         self.registry_provider = registry_provider
         self.poll_seconds = poll_seconds
         self._stop_event = threading.Event()
+        self._schedule_lock = threading.RLock()
         self._thread: threading.Thread | None = None
-        self.ensure_schedule_rows()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -74,10 +74,22 @@ class MaintenanceScheduler:
             return DEFAULT_TIMEZONE
 
     def list_schedules(self) -> dict[str, dict[str, Any]]:
-        self.ensure_schedule_rows()
         with connection_scope(self.database_path, readonly=True) as connection:
             rows = connection.execute("SELECT * FROM maintenance_schedules ORDER BY job_key").fetchall()
-        return {row["job_key"]: schedule_snapshot(row) for row in rows}
+        schedules = {row["job_key"]: schedule_snapshot(row) for row in rows}
+        timezone = self.application_timezone()
+        for job_key, definition in self.registry_provider().items():
+            if definition.get("supports_scheduling", True) and job_key not in schedules:
+                schedules[job_key] = {
+                    "jobKey": job_key,
+                    "enabled": False,
+                    "frequency": "daily",
+                    "runTime": "02:00",
+                    "timezone": timezone,
+                    "lastScheduledDate": "",
+                    "updatedAt": "",
+                }
+        return dict(sorted(schedules.items()))
 
     def update_schedule(self, job_key: str, *, enabled: bool, run_time: str, timezone: str) -> dict[str, Any]:
         registry = self.registry_provider()
@@ -90,33 +102,43 @@ class MaintenanceScheduler:
         except ZoneInfoNotFoundError as exc:
             raise ValueError("Choose a valid IANA timezone, such as America/Denver.") from exc
 
-        now = datetime.now(zone)
-        last_scheduled_date = ""
-        if enabled and now.strftime("%H:%M") >= run_time:
-            last_scheduled_date = now.date().isoformat()
-        updated_at = timestamp()
-        with connection_scope(self.database_path) as connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO settings (key,value_json,updated_at) VALUES ('scheduler_timezone',?,?)",
-                (json.dumps(timezone), updated_at),
-            )
-            connection.execute(
-                "UPDATE maintenance_schedules SET timezone=?,updated_at=?",
-                (timezone, updated_at),
-            )
-            connection.execute(
-                """INSERT INTO maintenance_schedules
-                (job_key,enabled,frequency,run_time,timezone,last_scheduled_date,created_at,updated_at)
-                VALUES (?,?,'daily',?,?,?,?,?)
-                ON CONFLICT(job_key) DO UPDATE SET enabled=excluded.enabled,frequency='daily',
-                run_time=excluded.run_time,timezone=excluded.timezone,
-                last_scheduled_date=CASE WHEN excluded.enabled=1 THEN excluded.last_scheduled_date ELSE maintenance_schedules.last_scheduled_date END,
-                updated_at=excluded.updated_at""",
-                (job_key, int(enabled), run_time, timezone, last_scheduled_date, updated_at, updated_at),
-            )
-        return self.list_schedules()[job_key]
+        with self._schedule_lock:
+            now = datetime.now(zone)
+            last_scheduled_date = ""
+            if enabled and now.strftime("%H:%M") >= run_time:
+                last_scheduled_date = now.date().isoformat()
+            updated_at = timestamp()
+            with connection_scope(self.database_path) as connection:
+                connection.execute(
+                    "INSERT OR REPLACE INTO settings (key,value_json,updated_at) VALUES ('scheduler_timezone',?,?)",
+                    (json.dumps(timezone), updated_at),
+                )
+                # Avoid invalidating another occurrence claim when the shared
+                # timezone value did not actually change.
+                connection.execute(
+                    "UPDATE maintenance_schedules SET timezone=?,updated_at=? WHERE timezone<>?",
+                    (timezone, updated_at, timezone),
+                )
+                connection.execute(
+                    """INSERT INTO maintenance_schedules
+                    (job_key,enabled,frequency,run_time,timezone,last_scheduled_date,created_at,updated_at)
+                    VALUES (?,?,'daily',?,?,?,?,?)
+                    ON CONFLICT(job_key) DO UPDATE SET enabled=excluded.enabled,frequency='daily',
+                    run_time=excluded.run_time,timezone=excluded.timezone,
+                    last_scheduled_date=CASE WHEN excluded.enabled=1 THEN excluded.last_scheduled_date ELSE maintenance_schedules.last_scheduled_date END,
+                    updated_at=excluded.updated_at""",
+                    (job_key, int(enabled), run_time, timezone, last_scheduled_date, updated_at, updated_at),
+                )
+            return self.list_schedules()[job_key]
 
     def run_due_once(self, now_utc: datetime | None = None) -> list[dict[str, Any]]:
+        # Schedule edits and due-run claims share this lock. The supported
+        # deployment is one process, so a user edit cannot race a stale read or
+        # prevent a failed global-gate claim from being released for retry.
+        with self._schedule_lock:
+            return self._run_due_once_locked(now_utc)
+
+    def _run_due_once_locked(self, now_utc: datetime | None = None) -> list[dict[str, Any]]:
         registry = self.registry_provider()
         outcomes: list[dict[str, Any]] = []
         for job_key, schedule in self.list_schedules().items():
@@ -128,7 +150,17 @@ class MaintenanceScheduler:
             local_date = local_now.date().isoformat()
             if local_now.strftime("%H:%M") < schedule["runTime"] or schedule["lastScheduledDate"] == local_date:
                 continue
-            if not self._claim_occurrence(job_key, local_date):
+            previous_scheduled_date = str(schedule["lastScheduledDate"])
+            claim_marker = datetime.now().astimezone().isoformat(timespec="microseconds")
+            if not self._claim_occurrence(
+                job_key,
+                local_date,
+                previous_scheduled_date=previous_scheduled_date,
+                claim_marker=claim_marker,
+                observed_run_time=str(schedule["runTime"]),
+                observed_timezone=str(schedule["timezone"]),
+                observed_updated_at=str(schedule["updatedAt"]),
+            ):
                 continue
             if not definition.get("enabled", True):
                 reason = definition.get("disabled_reason") or f"{definition['task_name']} is disabled."
@@ -153,7 +185,13 @@ class MaintenanceScheduler:
                     after_success=definition.get("after_scheduled_success"),
                 )
             except RuntimeError:
-                reason = f"{definition['task_name']} was skipped because the same job is already running."
+                self._release_occurrence(
+                    job_key,
+                    local_date,
+                    previous_scheduled_date=previous_scheduled_date,
+                    claim_marker=claim_marker,
+                )
+                reason = f"{definition['task_name']} was skipped because another mutating operation is active."
                 run = self.run_manager.record_skipped(
                     action=job_key,
                     task_name=definition["task_name"],
@@ -161,15 +199,59 @@ class MaintenanceScheduler:
                     reason=reason,
                 )
                 logging.info(reason)
+            except Exception:
+                self._release_occurrence(
+                    job_key,
+                    local_date,
+                    previous_scheduled_date=previous_scheduled_date,
+                    claim_marker=claim_marker,
+                )
+                raise
             outcomes.append(run)
         return outcomes
 
-    def _claim_occurrence(self, job_key: str, local_date: str) -> bool:
+    def _claim_occurrence(
+        self,
+        job_key: str,
+        local_date: str,
+        *,
+        previous_scheduled_date: str,
+        claim_marker: str,
+        observed_run_time: str,
+        observed_timezone: str,
+        observed_updated_at: str,
+    ) -> bool:
         with connection_scope(self.database_path) as connection:
             cursor = connection.execute(
                 """UPDATE maintenance_schedules SET last_scheduled_date=?,updated_at=?
-                WHERE job_key=? AND enabled=1 AND last_scheduled_date<>?""",
-                (local_date, timestamp(), job_key, local_date),
+                WHERE job_key=? AND enabled=1 AND last_scheduled_date=?
+                AND last_scheduled_date<>? AND run_time=? AND timezone=? AND updated_at=?""",
+                (
+                    local_date,
+                    claim_marker,
+                    job_key,
+                    previous_scheduled_date,
+                    local_date,
+                    observed_run_time,
+                    observed_timezone,
+                    observed_updated_at,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def _release_occurrence(
+        self,
+        job_key: str,
+        local_date: str,
+        *,
+        previous_scheduled_date: str,
+        claim_marker: str,
+    ) -> bool:
+        with connection_scope(self.database_path) as connection:
+            cursor = connection.execute(
+                """UPDATE maintenance_schedules SET last_scheduled_date=?,updated_at=?
+                WHERE job_key=? AND enabled=1 AND last_scheduled_date=? AND updated_at=?""",
+                (previous_scheduled_date, timestamp(), job_key, local_date, claim_marker),
             )
             return cursor.rowcount == 1
 

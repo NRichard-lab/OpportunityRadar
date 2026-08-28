@@ -2,16 +2,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Building2, ClipboardList, FileCheck2, Gauge, LogOut, Radar, Wrench } from "lucide-react";
 import type { Company } from "./types/Company";
 import type { ApplicationStatus, Job } from "./types/Job";
-import type { ResumeProfile } from "./types/ResumeProfile";
+import { isResumeProfile, withoutResumeText, type ResumeProfile } from "./types/ResumeProfile";
 import { emptyMaintenanceState, type MaintenanceJobsState, type MaintenanceRun } from "./types/Maintenance";
-import { normalizeFeatureFlags, type FeatureFlags } from "./types/FeatureFlags";
+import type { FeatureFlags } from "./types/FeatureFlags";
+import type { DataLoadStatus } from "./types/DataLoadState";
+import {
+  isApplicationOverrides,
+  isApplicationPatchResponse,
+  isCompanyArray,
+  isJobArray,
+  isJobMatchMutationResponse,
+  isLogoutResponse,
+  isMaintenanceJobsState,
+  isRecord,
+  normalizeSessionPayload,
+  type ApplicationOverrides,
+  type JobPayload,
+  type SessionPayload,
+} from "./runtimeSchemas";
 import { Dashboard } from "./pages/Dashboard";
 import { Companies } from "./pages/Companies";
 import { JobList } from "./pages/JobList";
 import { JobsAppliedFor } from "./pages/JobsAppliedFor";
 import { ResumeMatch } from "./pages/ResumeMatch";
 import { Utilities } from "./pages/Utilities";
-import { API_BASE, APP_BASE, appPath } from "./api";
+import { ApiError, API_BASE, APP_BASE, AUTH_REQUIRED_EVENT, apiJson, appPath, userMessage } from "./api";
 
 type Tab = "Dashboard" | "Companies" | "Job List" | "Jobs Applied For" | "Resume Match" | "Utilities";
 
@@ -24,83 +39,127 @@ const tabs: { name: Tab; icon: typeof Gauge }[] = [
   { name: "Utilities", icon: Wrench },
 ];
 
-type ApplicationOverrides = Record<string, Partial<Job>>;
-type Session = { authenticated: true; email: string; displayName: string; role: string; features: FeatureFlags; developmentBypass?: boolean };
-
 function App() {
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<SessionPayload | null>(null);
   const [authError, setAuthError] = useState("");
+  const [authAttempt, setAuthAttempt] = useState(0);
+  const [legacyStorageWarning, setLegacyStorageWarning] = useState("");
+  useEffect(() => {
+    try {
+      localStorage.removeItem("financial-jobs-radar-applications");
+      localStorage.removeItem("financial-jobs-radar-resume");
+    } catch {
+      setLegacyStorageWarning("Legacy browser storage could not be cleared. Opportunity Radar will not use browser-cached personal data, but you may need to clear this site's storage manually.");
+    }
+  }, []);
+  useEffect(() => {
+    const requireAuthentication = () => {
+      setAuthError("");
+      setSession(null);
+      setAuthAttempt((value) => value + 1);
+    };
+    window.addEventListener(AUTH_REQUIRED_EVENT, requireAuthentication);
+    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, requireAuthentication);
+  }, []);
   useEffect(() => {
     let stopped = false;
+    let activeRequest: AbortController | null = null;
+    let requestNumber = 0;
     const check = async () => {
+      const currentRequest = ++requestNumber;
+      activeRequest?.abort();
+      const controller = new AbortController();
+      activeRequest = controller;
       try {
         const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-        const response = await fetch(`${API_BASE}/auth/session?returnTo=${encodeURIComponent(returnTo)}`, { cache: "no-store", credentials: "same-origin" });
-        const payload = await response.json().catch(() => ({})) as { detail?: string | { message?: string; loginUrl?: string }; loginUrl?: string } & Partial<Session>;
+        const response = await fetch(`${API_BASE}/auth/session?returnTo=${encodeURIComponent(returnTo)}`, { cache: "no-store", credentials: "same-origin", signal: controller.signal });
+        const payload: unknown = await response.json().catch(() => ({}));
+        if (stopped || currentRequest !== requestNumber) return;
         if (response.status === 401) {
-          const destination = typeof payload.detail === "object" ? payload.detail.loginUrl : payload.loginUrl;
-          window.location.assign(destination || "https://blueashdigital.tech/");
+          window.location.assign(loginUrlFromPayload(payload) || "https://blueashdigital.tech/");
           return;
         }
-        if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : payload.detail?.message || "Authentication is temporarily unavailable.");
+        if (response.status === 403) throw new ApiError("Your account does not have access to Opportunity Radar.", 403);
+        if (!response.ok) throw new ApiError("Authentication is temporarily unavailable.", response.status);
+        const nextSession = normalizeSessionPayload(payload);
+        if (!nextSession) throw new ApiError("Authentication returned an invalid response.");
         if (!stopped) {
-          setSession({ ...payload, features: normalizeFeatureFlags(payload.features) } as Session);
+          setSession(nextSession);
           setAuthError("");
         }
       } catch (caught) {
-        if (!stopped) setAuthError(caught instanceof Error ? caught.message : "Authentication is temporarily unavailable.");
+        if (!isAbortError(caught) && !stopped && currentRequest === requestNumber) {
+          setAuthError(userMessage(caught, "Authentication is temporarily unavailable."));
+        }
+      } finally {
+        if (activeRequest === controller) activeRequest = null;
       }
     };
     void check();
     const timer = window.setInterval(() => void check(), 60_000);
     const onVisibility = () => { if (document.visibilityState === "visible") void check(); };
     document.addEventListener("visibilitychange", onVisibility);
-    return () => { stopped = true; window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibility); };
-  }, []);
-  if (authError) return <div className="grid min-h-screen place-items-center px-4 text-center text-red-300"><div><h1 className="text-xl font-semibold text-white">Opportunity Radar is unavailable</h1><p className="mt-2">{authError}</p></div></div>;
-  if (session === null) return <div className="grid min-h-screen place-items-center text-slate-400">Loading Opportunity Radar...</div>;
-  return <OpportunityApp sessionEmail={session.email} features={session.features} onLogout={async () => {
-    const response = await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "same-origin" });
-    const result = await response.json().catch(() => ({})) as { redirectUrl?: string };
-    window.location.assign(result.redirectUrl || "https://blueashdigital.tech/");
+    return () => { stopped = true; requestNumber += 1; activeRequest?.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibility); };
+  }, [authAttempt]);
+  if (authError) return <div className="grid min-h-screen place-items-center px-4 text-center text-red-300"><div className="panel max-w-lg p-6"><h1 className="text-xl font-semibold text-white">Opportunity Radar is unavailable</h1><p className="mt-2">{authError}</p>{legacyStorageWarning ? <p className="mt-3 text-sm text-amber-200">{legacyStorageWarning}</p> : null}<button className="btn mt-5" type="button" onClick={() => { setAuthError(""); setSession(null); setAuthAttempt((value) => value + 1); }}>Retry authentication</button></div></div>;
+  if (session === null) return <div className="grid min-h-screen place-items-center px-4 text-center text-slate-400"><div><p>Loading Opportunity Radar...</p>{legacyStorageWarning ? <p className="mt-3 max-w-lg text-sm text-amber-200">{legacyStorageWarning}</p> : null}</div></div>;
+  return <OpportunityApp key={session.id} sessionEmail={session.email} features={session.features} initialOperationError={legacyStorageWarning} onLogout={async () => {
+    const result = await apiJson<unknown>("/auth/logout", { method: "POST" }, "Opportunity Radar could not sign you out.");
+    if (!isLogoutResponse(result)) throw new ApiError("Opportunity Radar could not sign you out. The server returned an invalid response.");
+    window.location.assign(result.redirectUrl);
   }} />;
 }
 
-function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: string; features: FeatureFlags; onLogout: () => Promise<void> }) {
+function OpportunityApp({ sessionEmail, features, initialOperationError, onLogout }: { sessionEmail: string; features: FeatureFlags; initialOperationError: string; onLogout: () => Promise<void> }) {
   const [activeTab, setActiveTab] = useState<Tab>(() => tabFromLocation());
   const [companies, setCompanies] = useState<Company[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [applicationOverrides, setApplicationOverrides] = useState<ApplicationOverrides>(() => {
-    const stored = localStorage.getItem("financial-jobs-radar-applications");
-    return stored ? JSON.parse(stored) : {};
-  });
-  const [resume, setResume] = useState<ResumeProfile | null>(() => {
-    const stored = localStorage.getItem("financial-jobs-radar-resume");
-    return stored ? JSON.parse(stored) : null;
-  });
+  const [resume, setResume] = useState<ResumeProfile | null>(null);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | undefined>();
   const [selectedCompanyName, setSelectedCompanyName] = useState<string | undefined>();
   const [maintenance, setMaintenance] = useState<MaintenanceJobsState>(emptyMaintenanceState);
-  const [initialDataLoaded, setInitialDataLoaded] = useState(false);
+  const [dataStatus, setDataStatus] = useState<DataLoadStatus>("loading");
+  const [dataError, setDataError] = useState("");
+  const [dataAttempt, setDataAttempt] = useState(0);
+  const [operationError, setOperationError] = useState(initialOperationError);
+  const [maintenanceError, setMaintenanceError] = useState("");
+  const [pendingApplicationIds, setPendingApplicationIds] = useState<Set<string>>(() => new Set());
+  const [signingOut, setSigningOut] = useState(false);
+  const dataStatusRef = useRef<DataLoadStatus>("loading");
   const maintenanceRef = useRef<MaintenanceJobsState>(emptyMaintenanceState);
   const previousMaintenanceRuns = useRef<Map<string, MaintenanceRun>>(new Map());
 
-  const reloadCompanies = async () => {
-    const loadedCompanies = await loadApiJson<Company[]>("/companies", async () => []);
-    setCompanies(loadedCompanies);
+  const updateDataStatus = (status: DataLoadStatus) => {
+    dataStatusRef.current = status;
+    setDataStatus(status);
   };
 
-  const reloadJobs = async () => {
+  useEffect(() => {
+    if (initialOperationError) setOperationError((current) => current || initialOperationError);
+  }, [initialOperationError]);
+
+  const fetchCompanies = async (): Promise<Company[]> => {
+    const loadedCompanies = await apiJson<unknown>("/companies", {}, "Companies could not be loaded.");
+    if (!isCompanyArray(loadedCompanies)) throw new ApiError("Companies could not be loaded. The server returned an invalid response.");
+    return loadedCompanies;
+  };
+
+  const fetchJobs = async (): Promise<Job[]> => {
     const [loadedJobs, persistedApplications] = await Promise.all([
-      loadApiJson<Job[]>("/jobs", async () => []),
-      loadApiJson<ApplicationOverrides>("/applications", async () => ({})),
+      apiJson<unknown>("/jobs", {}, "Jobs could not be loaded."),
+      apiJson<unknown>("/applications", {}, "Application tracking could not be loaded."),
     ]);
-    setJobs(mergeJobApplications(loadedJobs, { ...persistedApplications, ...applicationOverrides }));
+    if (!isJobArray(loadedJobs) || !isApplicationOverrides(persistedApplications)) throw new ApiError("Jobs could not be loaded. The server returned an invalid response.");
+    return mergeJobApplications(loadedJobs, persistedApplications);
   };
 
   const reloadData = async (scope: { companies?: boolean; jobs?: boolean }) => {
-    if (scope.companies) await reloadCompanies();
-    if (scope.jobs) await reloadJobs();
+    const [loadedCompanies, loadedJobs] = await Promise.all([
+      scope.companies ? fetchCompanies() : Promise.resolve(undefined),
+      scope.jobs ? fetchJobs() : Promise.resolve(undefined),
+    ]);
+    if (loadedCompanies) setCompanies(loadedCompanies);
+    if (loadedJobs) setJobs(loadedJobs);
   };
 
   const refreshMaintenanceJobs = async (): Promise<MaintenanceJobsState> => {
@@ -111,61 +170,87 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
       return emptyMaintenanceState;
     }
     try {
-      const response = await fetch(`${API_BASE}/maintenance/jobs`, { cache: "no-store" });
-      if (!response.ok) return maintenanceRef.current;
-      const next = await response.json() as MaintenanceJobsState;
+      const next = await apiJson<unknown>("/maintenance/jobs", {}, "Maintenance status could not be loaded.");
+      if (!isMaintenanceJobsState(next)) throw new ApiError("Maintenance status could not be loaded. The server returned an invalid response.");
       const activeById = new Map(next.activeRuns.map((run) => [run.id, run]));
       const finished = [...previousMaintenanceRuns.current.values()].filter((run) => !activeById.has(run.id));
       previousMaintenanceRuns.current = activeById;
       maintenanceRef.current = next;
       setMaintenance(next);
+      setMaintenanceError("");
       if (finished.length) {
         const companyChanged = finished.some((run) => ["refresh-missing-company-information", "refresh-company-discovery", "import-data"].includes(run.action));
         const jobsChanged = finished.some((run) => ["refresh-all-job-listings", "reprocess-saved-jobs", "rematch-all-jobs", "import-data"].includes(run.action));
-        if (companyChanged || jobsChanged) void reloadData({ companies: companyChanged, jobs: jobsChanged });
+        if (companyChanged || jobsChanged) {
+          void reloadAfterMutation(
+            { companies: companyChanged, jobs: jobsChanged },
+            "Maintenance finished, but updated dashboard data could not be loaded.",
+          );
+        }
       }
       return next;
-    } catch {
+    } catch (error) {
+      setMaintenanceError(userMessage(error, "Maintenance status could not be loaded."));
       return maintenanceRef.current;
     }
   };
 
-  const handleCompanyDeleted = async (deletedJobIds: string[]) => {
-    const deletedIds = new Set(deletedJobIds);
-    setApplicationOverrides((current) => {
-      const next = Object.fromEntries(Object.entries(current).filter(([jobId]) => !deletedIds.has(jobId)));
-      localStorage.setItem("financial-jobs-radar-applications", JSON.stringify(next));
-      return next;
-    });
-    await reloadData({ companies: true, jobs: true });
+  const reloadAfterMutation = async (scope: { companies?: boolean; jobs?: boolean }, fallbackMessage: string) => {
+    const canRestoreReadyState = dataStatusRef.current === "ready";
+    if (canRestoreReadyState) updateDataStatus("loading");
+    setOperationError("");
+    try {
+      await reloadData(scope);
+      if (canRestoreReadyState) {
+        setDataError("");
+        updateDataStatus("ready");
+      }
+    } catch (error) {
+      const message = userMessage(error, fallbackMessage);
+      setOperationError(message);
+      setDataError(message);
+      updateDataStatus("error");
+    }
+  };
+
+  const handleCompanyDeleted = async (_deletedJobIds: string[]) => {
+    await reloadAfterMutation({ companies: true, jobs: true }, "The company was deleted, but the latest dashboard data could not be loaded.");
   };
 
   useEffect(() => {
+    const controller = new AbortController();
+    let stopped = false;
     const bootstrap = async () => {
-      const browserApplications = applicationOverrides;
-      const browserResume = resume;
-      const [loadedCompanies, loadedJobs, persistedApplications, persistedResume] = await Promise.all([
-        loadApiJson<Company[]>("/companies", async () => []),
-        loadApiJson<Job[]>("/jobs", async () => []),
-        loadApiJson<ApplicationOverrides>("/applications", async () => ({})),
-        loadApiJson<ResumeProfile | null>("/resume", async () => null),
-      ]);
-      const mergedApplications = { ...persistedApplications, ...browserApplications };
-      setCompanies(loadedCompanies);
-      setApplicationOverrides(mergedApplications);
-      setJobs(mergeJobApplications(loadedJobs, mergedApplications));
-      if (Object.keys(browserApplications).length) {
-        void apiRequest("/applications/import-browser-overrides", "POST", { overrides: browserApplications });
+      updateDataStatus("loading");
+      setDataError("");
+      try {
+        const request = { signal: controller.signal };
+        const [loadedCompanies, loadedJobs, persistedApplications, persistedResume] = await Promise.all([
+          apiJson<unknown>("/companies", request, "Companies could not be loaded."),
+          apiJson<unknown>("/jobs", request, "Jobs could not be loaded."),
+          apiJson<unknown>("/applications", request, "Application tracking could not be loaded."),
+          apiJson<unknown>("/resume", request, "The active resume could not be loaded."),
+        ]);
+        if (!isCompanyArray(loadedCompanies) || !isJobArray(loadedJobs) || !isApplicationOverrides(persistedApplications)
+          || (persistedResume !== null && !isResumeProfile(persistedResume))) {
+          throw new ApiError("Dashboard data could not be loaded. The server returned an invalid response.");
+        }
+        if (stopped) return;
+        setCompanies(loadedCompanies);
+        setJobs(mergeJobApplications(loadedJobs, persistedApplications));
+        setResume(persistedResume ? withoutResumeText(persistedResume) : null);
+        updateDataStatus("ready");
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (!stopped) {
+          setDataError(userMessage(error, "Dashboard data could not be loaded."));
+          updateDataStatus("error");
+        }
       }
-      if (persistedResume) {
-        setResume(persistedResume);
-      } else if (browserResume) {
-        void apiRequest("/resume", "PUT", browserResume);
-      }
-      setInitialDataLoaded(true);
     };
     void bootstrap();
-  }, []);
+    return () => { stopped = true; controller.abort(); };
+  }, [dataAttempt]);
 
   useEffect(() => {
     if (!features.utilities) {
@@ -184,11 +269,6 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
     return () => { stopped = true; window.clearTimeout(timer); };
   }, [features.utilities]);
 
-  useEffect(() => {
-    localStorage.setItem("financial-jobs-radar-applications", JSON.stringify(applicationOverrides));
-    setJobs((current) => mergeJobApplications(current, applicationOverrides));
-  }, [applicationOverrides]);
-
   const pageTitle = useMemo(() => {
     if (activeTab === "Job List" && selectedCompanyId) {
       const company = companies.find((item) => item.id === selectedCompanyId);
@@ -196,14 +276,15 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
     }
     return activeTab;
   }, [activeTab, companies, selectedCompanyId]);
+  const visibleDataStatus: DataLoadStatus = dataStatus === "ready" && companies.length === 0 && jobs.length === 0 ? "empty" : dataStatus;
 
   useEffect(() => {
     document.title = `${pageTitle} | Opportunity Radar`;
   }, [pageTitle]);
 
-  const markApplied = (jobId: string) => {
+  const markApplied = async (jobId: string): Promise<boolean> => {
     const job = jobs.find((item) => item.id === jobId);
-    updateJob(jobId, {
+    return updateJob(jobId, {
       applied: true,
       applicationStatus: job?.applicationStatus === "Interested" ? "Applied" : job?.applicationStatus || "Applied",
       dateApplied: job?.dateApplied || new Date().toISOString().slice(0, 10),
@@ -211,28 +292,70 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
     });
   };
 
-  const updateJob = (jobId: string, patch: Partial<Job>) => {
-    setApplicationOverrides((current) => ({
-      ...current,
-      [jobId]: {
-        ...current[jobId],
-        ...patch,
-      },
-    }));
-    void apiRequest(`/applications/${encodeURIComponent(jobId)}`, "PUT", patch);
+  const updateJob = async (jobId: string, patch: Partial<Job>): Promise<boolean> => {
+    setPendingApplicationIds((current) => new Set(current).add(jobId));
+    setOperationError("");
+    try {
+      const result = await apiJson<unknown>(
+        `/applications/${encodeURIComponent(jobId)}`,
+        { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) },
+        "Application tracking could not be updated.",
+      );
+      if (!isApplicationPatchResponse(result)) {
+        throw new ApiError("Application tracking could not be updated. The server returned an invalid response.");
+      }
+      setJobs((current) => current.map((job) => job.id === jobId ? { ...job, ...result.application } : job));
+      return true;
+    } catch (error) {
+      setOperationError(userMessage(error, "Application tracking could not be updated."));
+      return false;
+    } finally {
+      setPendingApplicationIds((current) => {
+        const next = new Set(current);
+        next.delete(jobId);
+        return next;
+      });
+    }
   };
 
-  const updateResume = (profile: ResumeProfile | null) => {
-    setResume(profile);
-    if (profile) void apiRequest("/resume", "PUT", profile).then(reloadJobs);
+  const updateResume = async (profile: ResumeProfile) => {
+    setResume(withoutResumeText(profile));
+    await reloadAfterMutation(
+      { jobs: true },
+      "The resume was uploaded, but updated match data could not be loaded.",
+    );
   };
 
   const rematchJob = async (jobId: string): Promise<Job> => {
-    const response = await fetch(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/match`, { method: "POST" });
-    if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "This job could not be matched.");
-    const result = await response.json() as { job: Job };
-    await reloadJobs();
-    return result.job;
+    const result = await apiJson<unknown>(
+      `/jobs/${encodeURIComponent(jobId)}/match`,
+      { method: "POST" },
+      "This job could not be matched.",
+    );
+    if (!isJobMatchMutationResponse(result) || result.jobId !== jobId) {
+      throw new ApiError("This job could not be matched. The server returned an invalid response.");
+    }
+    const existingJob = jobs.find((job) => job.id === jobId);
+    if (!existingJob) throw new ApiError("This job could not be matched because it is no longer in the current results.");
+    const updatedJob: Job = { ...existingJob, ...result.job };
+    setJobs((current) => current.map((job) => job.id === jobId ? updatedJob : job));
+    return updatedJob;
+  };
+
+  const retryData = () => {
+    setOperationError("");
+    setDataAttempt((value) => value + 1);
+  };
+
+  const signOut = async () => {
+    setSigningOut(true);
+    setOperationError("");
+    try {
+      await onLogout();
+    } catch (error) {
+      setOperationError(userMessage(error, "Opportunity Radar could not sign you out."));
+      setSigningOut(false);
+    }
   };
 
   const navigate = (tab: string) => {
@@ -312,7 +435,7 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
               {maintenance.runningCount} maintenance {maintenance.runningCount === 1 ? "job" : "jobs"} running
             </button>
           ) : null}
-          <div className="mt-5 border-t border-radar-line pt-4"><p className="truncate text-xs text-slate-500" title={sessionEmail}>{sessionEmail}</p><button className="btn mt-3 w-full justify-center" type="button" onClick={() => void onLogout()}><LogOut size={16} />Sign Out</button></div>
+          <div className="mt-5 border-t border-radar-line pt-4"><p className="truncate text-xs text-slate-500" title={sessionEmail}>{sessionEmail}</p><button className="btn mt-3 w-full justify-center" type="button" disabled={signingOut} onClick={() => void signOut()}><LogOut size={16} />{signingOut ? "Signing out..." : "Sign Out"}</button></div>
         </aside>
 
         <main className="min-w-0 flex-1">
@@ -321,11 +444,16 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
             <h2 className="mt-2 text-3xl font-semibold text-white">{pageTitle}</h2>
           </header>
 
+          {operationError ? <div className="mb-5 flex flex-col gap-3 rounded-md border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-200 sm:flex-row sm:items-center sm:justify-between" role="alert"><span>{operationError}</span><button className="btn shrink-0" type="button" onClick={dataStatus === "error" ? retryData : () => setOperationError("")}>{dataStatus === "error" ? "Retry data" : "Dismiss"}</button></div> : null}
+          {maintenanceError && features.utilities ? <div className="mb-5 flex flex-col gap-3 rounded-md border border-amber-800 bg-amber-950/30 px-4 py-3 text-sm text-amber-200 sm:flex-row sm:items-center sm:justify-between" role="alert"><span>{maintenanceError}</span><button className="btn shrink-0" type="button" onClick={() => void refreshMaintenanceJobs()}>Retry status</button></div> : null}
+
           {activeTab === "Dashboard" ? (
             <Dashboard
               companies={companies}
               jobs={jobs}
-              loaded={initialDataLoaded}
+              status={visibleDataStatus}
+              error={dataError}
+              onRetry={retryData}
               onNavigate={navigate}
               onRematch={rematchJob}
             />
@@ -333,8 +461,8 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
           {activeTab === "Companies" ? (
             <Companies
               onViewCompanyJobs={viewCompanyJobs}
-              onCompaniesChanged={() => reloadData({ companies: true })}
-              onCompanyRefreshed={() => reloadData({ companies: true, jobs: true })}
+              onCompaniesChanged={() => reloadAfterMutation({ companies: true }, "The company was saved, but the latest dashboard data could not be loaded.")}
+              onCompanyRefreshed={() => reloadAfterMutation({ companies: true, jobs: true }, "The company was refreshed, but the latest dashboard data could not be loaded.")}
               onCompanyDeleted={handleCompanyDeleted}
               selectedCompanyName={selectedCompanyName}
               refreshEnabled={features.companyRefresh && features.discovery && features.browserJobs}
@@ -343,24 +471,32 @@ function OpportunityApp({ sessionEmail, features, onLogout }: { sessionEmail: st
           {activeTab === "Job List" ? (
             <JobList
               jobs={jobs}
+              dataStatus={visibleDataStatus}
+              dataError={dataError}
+              onRetry={retryData}
               onRematch={rematchJob}
               selectedCompanyId={selectedCompanyId}
               onMarkApplied={markApplied}
               onNotInterested={(jobId) => updateJob(jobId, { notInterested: true })}
               onUpdateNotes={(jobId, notes) => updateJob(jobId, { notes })}
+              pendingApplicationIds={pendingApplicationIds}
               onViewCompany={viewCompanyDetails}
             />
           ) : null}
           {activeTab === "Jobs Applied For" ? (
             <JobsAppliedFor
               jobs={jobs}
+              dataStatus={visibleDataStatus}
+              dataError={dataError}
+              onRetry={retryData}
+              pendingApplicationIds={pendingApplicationIds}
               onUpdateStatus={(jobId, applicationStatus: ApplicationStatus) => updateJob(jobId, { applicationStatus })}
               onUpdateFollowUp={(jobId, followUpDate) => updateJob(jobId, { followUpDate })}
               onUpdateNotes={(jobId, notes) => updateJob(jobId, { notes })}
             />
           ) : null}
           {activeTab === "Resume Match" ? (
-            <ResumeMatch jobs={jobs} resume={resume} onResumeChange={updateResume} maintenance={maintenance} onMaintenanceRefresh={refreshMaintenanceJobs} onJobsReload={reloadJobs} onRematch={rematchJob} utilitiesEnabled={features.utilities} />
+            <ResumeMatch jobs={jobs} resume={resume} onResumeChange={updateResume} maintenance={maintenance} onMaintenanceRefresh={refreshMaintenanceJobs} onRematch={rematchJob} utilitiesEnabled={features.utilities} dataStatus={visibleDataStatus} dataError={dataError} onRetry={retryData} />
           ) : null}
           {activeTab === "Utilities" ? (
             features.utilities
@@ -386,29 +522,7 @@ function tabFromLocation(): Tab {
   return (Object.entries(TAB_PATHS).find(([, path]) => path === relative.replace(/\/$/, "") || (path === "/" && relative === "/"))?.[0] as Tab | undefined) ?? "Dashboard";
 }
 
-async function loadApiJson<T>(endpoint: string, fallback: () => Promise<T>): Promise<T> {
-  try {
-    const response = await fetch(`${API_BASE}${endpoint}`, { cache: "no-store" });
-    if (!response.ok) return fallback();
-    return await response.json() as T;
-  } catch {
-    return fallback();
-  }
-}
-
-async function apiRequest(endpoint: string, method: "POST" | "PUT", body: unknown): Promise<void> {
-  try {
-    await fetch(`${API_BASE}${endpoint}`, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    // Browser storage remains a recovery copy while the API is unavailable.
-  }
-}
-
-function mergeJobApplications(jobs: Job[], overrides: ApplicationOverrides): Job[] {
+function mergeJobApplications(jobs: JobPayload[], overrides: ApplicationOverrides): Job[] {
   return jobs.map((job) => ({
     ...job,
     applied: false,
@@ -420,4 +534,16 @@ function mergeJobApplications(jobs: Job[], overrides: ApplicationOverrides): Job
     matchScore: job.matchScore ?? null,
     ...overrides[job.id],
   }));
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function loginUrlFromPayload(payload: unknown): string {
+  if (!isRecord(payload)) return "";
+  if (typeof payload.loginUrl === "string") return payload.loginUrl;
+  return isRecord(payload.detail) && typeof payload.detail.loginUrl === "string"
+    ? payload.detail.loginUrl
+    : "";
 }

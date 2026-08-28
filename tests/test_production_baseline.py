@@ -20,12 +20,13 @@ import server
 
 
 CONFIG_KEYS = {
-    "APP_ENV", "AUTH_MODE", "APP_BASE_PATH", "APP_PUBLIC_URL", "APP_TRUSTED_ADMIN_USER_ID",
+    "APP_ENV", "DEPLOYMENT_VERSION", "AUTH_MODE", "APP_BASE_PATH", "APP_PUBLIC_URL", "APP_TRUSTED_ADMIN_USER_ID",
     "BLUEASH_API_URL", "BLUEASH_LOGIN_URL", "BLUEASH_SESSION_COOKIE", "BLUEASH_COOKIE_DOMAIN",
     "BLUEASH_APP_SLUG", "APP_ENABLE_BROWSER_JOBS", "APP_ENABLE_COMPANY_REFRESH",
     "APP_ENABLE_UTILITIES", "APP_ENABLE_SCHEDULES", "APP_ENABLE_DISCOVERY",
     "APP_WRITE_FRONTEND_MIRRORS", "APP_DATA_DIR", "APP_IMPORT_DIR", "APP_EXPORT_DIR",
     "APP_OUTPUT_DIR", "APP_BACKUP_DIR", "APP_LOG_DIR", "DATABASE_URL",
+    "APP_MAX_HTTP_WORKERS", "APP_MAX_BROWSER_WORKERS", "APP_MAX_ACTIVE_MAINTENANCE",
 }
 TRUSTED_ID = "17f975f1-e63a-4daa-985a-82d39ed60684"
 
@@ -111,6 +112,24 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("APP_ENABLE_UTILITIES", result.stderr)
 
+    def test_worker_caps_have_safe_defaults_and_reject_invalid_values(self) -> None:
+        result = run_python(
+            {},
+            "import json, config; print(json.dumps([config.APP_MAX_HTTP_WORKERS, "
+            "config.APP_MAX_BROWSER_WORKERS, config.APP_MAX_ACTIVE_MAINTENANCE]))",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [4, 1, 1])
+        for name, value in (
+            ("APP_MAX_HTTP_WORKERS", "0"),
+            ("APP_MAX_BROWSER_WORKERS", "999"),
+            ("APP_MAX_ACTIVE_MAINTENANCE", "2"),
+        ):
+            with self.subTest(name=name):
+                invalid = run_python({name: value}, "import config")
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertIn(name, invalid.stderr)
+
     def test_production_feature_defaults_are_disabled(self) -> None:
         result = run_python(
             {"APP_ENV": "production"},
@@ -121,6 +140,16 @@ class ProductionConfigurationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(any(payload["features"].values()))
         self.assertFalse(payload["mirrors"])
+
+    def test_production_rejects_browser_jobs_without_pinned_egress(self) -> None:
+        values = valid_production_environment()
+        values["APP_ENABLE_BROWSER_JOBS"] = "true"
+
+        result = run_validation(values)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("APP_ENABLE_BROWSER_JOBS", result.stderr)
+        self.assertIn("DNS-pinned", result.stderr)
 
     def test_runtime_paths_are_independently_configurable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

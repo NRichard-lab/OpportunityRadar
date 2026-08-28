@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin
 
+from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from job_platforms import detect_job_platform
 
 
@@ -83,16 +84,18 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
         }
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = launch_playwright_chromium(playwright, headless=True)
         context = browser.new_context(
             user_agent=(
                 "FinancialJobsRadar/1.0 "
                 "(public job board URL discovery; no applications or form submissions)"
-            )
+            ),
+            service_workers="block",
         )
+        install_playwright_url_guard(context)
         page = context.new_page()
         try:
-            page.goto(careers_url, wait_until="domcontentloaded", timeout=30000)
+            safe_page_goto(page, careers_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_load_state("networkidle", timeout=10000)
         except PlaywrightTimeoutError:
             pass
@@ -119,7 +122,7 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
             before_pages = len(context.pages)
             try:
                 candidate_page = context.new_page()
-                candidate_page.goto(careers_url, wait_until="domcontentloaded", timeout=30000)
+                safe_page_goto(candidate_page, careers_url, wait_until="domcontentloaded", timeout=30000)
                 candidate_page.wait_for_load_state("networkidle", timeout=7000)
                 before_pages = len(context.pages)
                 locator = candidate_page.locator("a, button, [role='button'], [role='link']").nth(candidate.index)

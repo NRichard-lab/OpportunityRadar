@@ -12,12 +12,14 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from backend.db import connect, initialize_schema
+from backend.operation_gate import GLOBAL_MUTATION_GATE, MutationGate, MutationLease, OperationConflictError
 from backend.utility_tasks import UtilityCancelled
 
 
 Worker = Callable[[Callable[..., None], threading.Event], dict[str, Any]]
 SummaryFormatter = Callable[[dict[str, Any]], str]
 SuccessCallback = Callable[[dict[str, Any]], Any]
+FinishCallback = Callable[[], Any]
 ACTIVE_STATUSES = {"Queued", "Running", "Cancelling"}
 
 
@@ -32,13 +34,26 @@ def connection_scope(database_path: Path, *, readonly: bool = False):
 
 
 class UtilityRunManager:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        mutation_gate: MutationGate | None = None,
+        initialize: bool = True,
+        reconcile: bool = True,
+    ) -> None:
         self.database_path = Path(database_path)
         self._lock = threading.RLock()
         self._cancel_events: dict[str, threading.Event] = {}
-        with connection_scope(self.database_path) as connection:
-            initialize_schema(connection)
-            self._mark_interrupted_runs(connection)
+        self._threads: dict[str, threading.Thread] = {}
+        self._mutation_gate = mutation_gate or GLOBAL_MUTATION_GATE
+        self._accepting = True
+        if initialize or reconcile:
+            with connection_scope(self.database_path) as connection:
+                if initialize:
+                    initialize_schema(connection)
+                if reconcile:
+                    self._mark_interrupted_runs(connection)
 
     def start(
         self,
@@ -51,11 +66,15 @@ class UtilityRunManager:
         format_summary: SummaryFormatter,
         trigger_type: str = "manual",
         after_success: SuccessCallback | None = None,
+        after_finish: FinishCallback | None = None,
     ) -> dict[str, Any]:
         run_id = f"maintenance-{uuid4()}"
         created_at = timestamp()
         cancel_event = threading.Event()
         with self._lock:
+            if not self._accepting:
+                raise OperationConflictError("The application is shutting down and cannot start new work.")
+            lease = self._mutation_gate.acquire(action, operation_id=run_id)
             try:
                 with connection_scope(self.database_path) as connection:
                     connection.execute(
@@ -66,14 +85,36 @@ class UtilityRunManager:
                         (run_id, action, task_name, trigger_type, progress_verb, progress_unit, created_at, created_at),
                     )
             except sqlite3.IntegrityError as exc:
+                lease.release()
                 raise RuntimeError(f"{task_name} is already running.") from exc
+            except Exception:
+                lease.release()
+                raise
             self._cancel_events[run_id] = cancel_event
-        threading.Thread(
-            target=self._execute,
-            args=(run_id, worker, format_summary, cancel_event, after_success),
-            name=f"maintenance-{action}",
-            daemon=True,
-        ).start()
+            try:
+                thread = threading.Thread(
+                    target=self._execute,
+                    args=(run_id, worker, format_summary, cancel_event, after_success, after_finish, lease),
+                    name=f"maintenance-{action}",
+                    daemon=True,
+                )
+                self._threads[run_id] = thread
+                thread.start()
+            except Exception:
+                self._threads.pop(run_id, None)
+                self._cancel_events.pop(run_id, None)
+                try:
+                    self._update_run(
+                        run_id,
+                        status="Failed",
+                        completed_at=timestamp(),
+                        runtime_seconds=0,
+                        error="The background worker could not be started.",
+                        current_message=f"{task_name} could not be started.",
+                    )
+                finally:
+                    lease.release()
+                raise RuntimeError(f"{task_name} could not be started.") from None
         return self.get(run_id)
 
     def get(self, run_id: str) -> dict[str, Any]:
@@ -138,6 +179,27 @@ class UtilityRunManager:
                 )
         return self.get(run_id)
 
+    def shutdown(self, *, join_timeout: float = 5.0) -> None:
+        """Prevent new work, request cancellation, and briefly await cooperative workers."""
+        self._mutation_gate.stop_accepting()
+        with self._lock:
+            self._accepting = False
+            events = list(self._cancel_events.values())
+            threads = list(self._threads.values())
+        for event in events:
+            event.set()
+        deadline = time.monotonic() + max(0.0, join_timeout)
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+    def start_accepting(self) -> None:
+        with self._lock:
+            self._accepting = True
+        self._mutation_gate.start_accepting()
+
     def _execute(
         self,
         run_id: str,
@@ -145,70 +207,72 @@ class UtilityRunManager:
         format_summary: SummaryFormatter,
         cancel_event: threading.Event,
         after_success: SuccessCallback | None,
+        after_finish: FinishCallback | None,
+        lease: MutationLease,
     ) -> None:
         started_at = timestamp()
         started_clock = time.monotonic()
-        run = self.get(run_id)
-        with self._lock:
-            if cancel_event.is_set():
+        try:
+            run = self.get(run_id)
+            with self._lock:
+                if cancel_event.is_set():
+                    self._update_run(
+                        run_id,
+                        status="Cancelled",
+                        started_at=started_at,
+                        completed_at=timestamp(),
+                        runtime_seconds=0,
+                        current_message=f"{run['taskName']} was cancelled before it started.",
+                    )
+                    return
                 self._update_run(
                     run_id,
-                    status="Cancelled",
+                    status="Running",
                     started_at=started_at,
-                    completed_at=timestamp(),
-                    runtime_seconds=0,
-                    current_message=f"{run['taskName']} was cancelled before it started.",
+                    current_message=f"{run['taskName']} is running.",
                 )
-                self._cancel_events.pop(run_id, None)
-                return
-            self._update_run(
-                run_id,
-                status="Running",
-                started_at=started_at,
-                current_message=f"{run['taskName']} is running.",
-            )
 
-        def progress(current: int, total: int, item: str, details: dict[str, Any] | None = None) -> None:
-            progress_text = (
-                f"{run['progressVerb']} {current} of {total} {run['progressUnit']}"
-                if total else "Running..."
-            )
-            updates: dict[str, Any] = {
-                "progress_current": max(0, current),
-                "progress_total": max(0, total),
-                "current_item": item,
-                "current_message": progress_text,
-            }
-            if details is not None:
-                updates["result_summary_json"] = json.dumps(details, default=str, sort_keys=True)
-            self._update_run(
-                run_id,
-                **updates,
-            )
+            def progress(current: int, total: int, item: str, details: dict[str, Any] | None = None) -> None:
+                progress_text = (
+                    f"{run['progressVerb']} {current} of {total} {run['progressUnit']}"
+                    if total else "Running..."
+                )
+                updates: dict[str, Any] = {
+                    "progress_current": max(0, current),
+                    "progress_total": max(0, total),
+                    "current_item": item,
+                    "current_message": progress_text,
+                }
+                if details is not None:
+                    updates["result_summary_json"] = json.dumps(details, default=str, sort_keys=True)
+                self._update_run(run_id, **updates)
 
-        status = "Completed"
-        summary: dict[str, Any] = {}
-        error = ""
-        message = ""
-        try:
-            summary = worker(progress, cancel_event)
-            if cancel_event.is_set():
-                raise UtilityCancelled("Cancelled by user.")
-            message = format_summary(summary)
-            if after_success is not None:
-                try:
-                    summary["scheduledFollowUp"] = after_success(summary)
-                except Exception as exc:
-                    logging.exception("Post-success maintenance follow-up failed; maintenance results were retained.")
-                    summary["scheduledFollowUp"] = {"status": "Failed", "error": str(exc)}
-        except (UtilityCancelled, InterruptedError):
-            status = "Cancelled"
-            message = f"{run['taskName']} was cancelled. No remaining items were processed."
-        except Exception as exc:
-            status = "Failed"
-            error = str(exc)
-            message = f"{run['taskName']} could not be completed: {exc}"
-        finally:
+            status = "Completed"
+            summary: dict[str, Any] = {}
+            error = ""
+            message = ""
+            try:
+                summary = worker(progress, cancel_event)
+                if cancel_event.is_set():
+                    raise UtilityCancelled("Cancelled by user.")
+                message = format_summary(summary)
+                if after_success is not None:
+                    try:
+                        summary["scheduledFollowUp"] = after_success(summary)
+                    except Exception:
+                        logging.exception("Post-success maintenance follow-up failed; maintenance results were retained.")
+                        summary["scheduledFollowUp"] = {
+                            "status": "Failed",
+                            "error": "The post-run action could not be completed.",
+                        }
+            except (UtilityCancelled, InterruptedError):
+                status = "Cancelled"
+                message = f"{run['taskName']} was cancelled. No remaining items were processed."
+            except Exception as exc:
+                status = "Failed"
+                logging.exception("Maintenance operation %s failed.", run["action"])
+                error = safe_error_summary(exc)
+                message = f"{run['taskName']} could not be completed."
             self._update_run(
                 run_id,
                 status=status,
@@ -218,8 +282,31 @@ class UtilityRunManager:
                 error=error,
                 current_message=message,
             )
-            with self._lock:
-                self._cancel_events.pop(run_id, None)
+        except Exception:
+            logging.exception("Maintenance lifecycle bookkeeping failed for %s.", run_id)
+            try:
+                self._update_run(
+                    run_id,
+                    status="Failed",
+                    completed_at=timestamp(),
+                    runtime_seconds=round(time.monotonic() - started_clock, 2),
+                    error="The maintenance lifecycle could not be completed.",
+                    current_message="The maintenance operation stopped because its state could not be recorded.",
+                )
+            except Exception:
+                logging.exception("Maintenance failure state could not be persisted for %s.", run_id)
+        finally:
+            try:
+                if after_finish is not None:
+                    after_finish()
+            except Exception:
+                logging.exception("Maintenance cleanup failed for %s.", run_id)
+            finally:
+                with self._lock:
+                    self._cancel_events.pop(run_id, None)
+                    self._threads.pop(run_id, None)
+                lease.release()
+
     def _update_run(self, run_id: str, **updates: Any) -> None:
         allowed = {
             "status", "progress_current", "progress_total", "current_item",
@@ -303,3 +390,48 @@ def elapsed_between(start: str, end: str) -> float:
 
 def timestamp() -> str:
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def reconcile_interrupted_runs(database_path: Path) -> int:
+    """Mark stale active rows without creating or migrating persistence."""
+    path = Path(database_path)
+    if not path.is_file():
+        return 0
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=rw",
+            uri=True,
+            timeout=2.0,
+        )
+        connection.row_factory = sqlite3.Row
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_job_runs'"
+        ).fetchone()
+        if table is None:
+            return 0
+        count_row = connection.execute(
+            "SELECT COUNT(*) FROM maintenance_job_runs WHERE status IN ('Queued','Running','Cancelling')"
+        ).fetchone()
+        count = int(count_row[0]) if count_row else 0
+        with connection:
+            UtilityRunManager._mark_interrupted_runs(connection)
+        return count
+    except sqlite3.Error:
+        logging.exception("Could not reconcile interrupted maintenance records during startup.")
+        return 0
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def safe_error_summary(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "The operation timed out."
+    if isinstance(exc, OperationConflictError):
+        return str(exc)[:240]
+    if isinstance(exc, ValueError):
+        message = " ".join(str(exc).split())
+        if message and not any(marker in message for marker in ("\\", "/", ":\\")):
+            return message[:240]
+    return "The operation failed. Review server logs for details."

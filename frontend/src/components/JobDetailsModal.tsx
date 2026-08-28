@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ExternalLink, LoaderCircle, RefreshCw, X } from "lucide-react";
+import { userMessage } from "../api";
 import type { Job } from "../types/Job";
 import { MatchScoreBadge } from "./MatchScoreBadge";
 
@@ -16,7 +17,7 @@ export function JobDetailsModal({ job, onClose, onRematch }: JobDetailsModalProp
     if (!onRematch) return;
     setMatching(true); setMatchError("");
     try { setDisplayJob(await onRematch(displayJob.id)); }
-    catch (error) { setMatchError(error instanceof Error ? error.message : "This job could not be matched."); }
+    catch (error) { setMatchError(userMessage(error, "This job could not be matched.")); }
     finally { setMatching(false); }
   };
   const details = displayJob.matchDetails || {};
@@ -41,7 +42,7 @@ export function JobDetailsModal({ job, onClose, onRematch }: JobDetailsModalProp
           </div>
           {details.summary ? <p className="mt-3 text-sm text-slate-300">{details.summary}</p> : null}
           <KeywordList title="Matched keywords" items={details.matchedKeywords} /><KeywordList title="Missing keywords" items={details.missingKeywords} />
-          {matchError || displayJob.matchError ? <p className="mt-3 text-sm text-red-300" role="alert">{matchError || displayJob.matchError}</p> : null}
+          {matchError || displayJob.matchError ? <p className="mt-3 text-sm text-red-300" role="alert">{matchError || "The last resume match attempt failed. Try matching this job again."}</p> : null}
         </section>
         <section className="mt-5 min-h-0"><h3 className="text-sm font-semibold text-white">Job Description</h3><p className="mt-3 max-h-[42vh] overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-radar-line bg-radar-bg p-4 text-sm leading-6 text-slate-300">{listed(displayJob.description)}</p></section>
         {displayJob.sourceUrl ? <div className="mt-5 flex justify-end"><a className="btn btn-primary" href={displayJob.sourceUrl} target="_blank" rel="noreferrer">Open Job Posting<ExternalLink size={16} /></a></div> : null}

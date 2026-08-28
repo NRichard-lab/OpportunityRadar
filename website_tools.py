@@ -10,6 +10,7 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
+from backend.outbound_security import SSRFProtectedSession
 from config import CAREERS_KEYWORDS, COMMON_FEED_PATHS, MAX_CRAWL_PAGES, POLITE_DELAY_SECONDS, REQUEST_TIMEOUT, USER_AGENT
 from job_platforms import detect_job_platform
 from search_tools import registered_domain
@@ -19,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def make_session() -> requests.Session:
-    session = requests.Session()
+    session = SSRFProtectedSession()
     session.headers.update({"User-Agent": USER_AGENT})
     return session
 

@@ -5,14 +5,15 @@ import { formatMoney, notListed } from "../utils/stats";
 
 interface JobCardProps {
   job: Job;
-  onMarkApplied: (jobId: string) => void;
-  onNotInterested: (jobId: string) => void;
-  onUpdateNotes: (jobId: string, notes: string) => void;
+  onMarkApplied: (jobId: string) => Promise<boolean>;
+  onNotInterested: (jobId: string) => Promise<boolean>;
+  onUpdateNotes: (jobId: string, notes: string) => Promise<boolean>;
+  updating: boolean;
   onViewDetails?: (job: Job) => void;
   onViewCompany?: (companyName: string) => void;
 }
 
-export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, onViewDetails, onViewCompany }: JobCardProps) {
+export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, updating, onViewDetails, onViewCompany }: JobCardProps) {
   return (
     <article className={`card p-4 ${job.notInterested ? "opacity-55" : ""}`}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -40,36 +41,51 @@ export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, on
           ) : null}
         </div>
         <div className="min-w-52 text-sm text-slate-300">
-          <p>Pay: {job.payText || `${formatMoney(job.payMin)} - ${formatMoney(job.payMax)}`}</p>
+          <p>Pay: {formatPay(job)}</p>
           <p>Pay period: {notListed(job.payPeriod)}</p>
           <p>Posted: {notListed(job.postedDate)}</p>
           <p>Status: {job.applied ? job.applicationStatus : "Not applied"}</p>
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <button className="btn" onClick={() => onMarkApplied(job.id)}>
+        <button className="btn" type="button" disabled={updating} onClick={() => void onMarkApplied(job.id)}>
           <CheckCircle2 size={16} />
           {job.applied ? "Applied" : "Mark Applied"}
         </button>
-        <button className="btn" onClick={() => onNotInterested(job.id)}>
+        <button className="btn" type="button" disabled={updating} onClick={() => void onNotInterested(job.id)}>
           <Ban size={16} />
           Not Interested
         </button>
-        <button className="btn" onClick={() => onViewDetails?.(job)}>
+        <button className="btn" type="button" onClick={() => onViewDetails?.(job)}>
           <FileText size={16} />
           View Details
         </button>
-        <a className="btn" href={job.sourceUrl} target="_blank">
+        <a className="btn" href={job.sourceUrl} target="_blank" rel="noreferrer noopener">
           <ExternalLink size={16} />
           Source
         </a>
       </div>
       <textarea
+        key={`${job.id}-${job.notes}`}
         className="field mt-4 min-h-20"
         placeholder="Notes"
-        value={job.notes}
-        onChange={(event) => onUpdateNotes(job.id, event.target.value)}
+        defaultValue={job.notes}
+        disabled={updating}
+        onBlur={(event) => {
+          const input = event.currentTarget;
+          if (input.value === job.notes) return;
+          void onUpdateNotes(job.id, input.value).then((saved) => { if (!saved) input.value = job.notes; });
+        }}
       />
+      {updating ? <p className="mt-2 text-xs text-slate-400" role="status">Saving application changes...</p> : null}
     </article>
   );
+}
+
+function formatPay(job: Job): string {
+  if (job.payText?.trim()) return job.payText;
+  if (job.payMin !== null && job.payMax !== null) return `${formatMoney(job.payMin)} - ${formatMoney(job.payMax)}`;
+  if (job.payMin !== null) return `From ${formatMoney(job.payMin)}`;
+  if (job.payMax !== null) return `Up to ${formatMoney(job.payMax)}`;
+  return "Not listed";
 }

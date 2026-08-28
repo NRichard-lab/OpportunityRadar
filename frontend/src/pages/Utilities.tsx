@@ -2,7 +2,21 @@ import { useEffect, useMemo, useState, type ChangeEvent, type ReactNode } from "
 import { Building2, CalendarClock, DatabaseBackup, Download, History, Mail, RefreshCw, RotateCw, Save, Search, Send, Upload, X, type LucideIcon } from "lucide-react";
 import type { MaintenanceJobState, MaintenanceJobsState, MaintenanceRun } from "../types/Maintenance";
 import type { FeatureFlags } from "../types/FeatureFlags";
-import { API_BASE } from "../api";
+import {
+  isEmailDigestMutationResponse,
+  isEmailHistoryPayload,
+  isEmailSettingsPayload,
+  isEmailStatusPayload,
+  isMaintenanceHistoryResponse,
+  isMessageResponse,
+  isScheduleMutationResponse,
+  isUtilityCancelResponse,
+  isUtilityRunResponse,
+  type EmailDigestPayload,
+  type EmailSettingsPayload,
+  type EmailStatusPayload,
+} from "../runtimeSchemas";
+import { ApiError, apiJson, userMessage } from "../api";
 
 type UtilityKey = "refresh-missing-company-information" | "refresh-company-discovery" | "refresh-all-job-listings" | "reprocess-saved-jobs" | "create-backup" | "export-data" | "import-data";
 interface UtilitiesProps { maintenance: MaintenanceJobsState; onMaintenanceRefresh: () => Promise<MaintenanceJobsState>; features: FeatureFlags; }
@@ -50,17 +64,20 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
     }
     setStarting(true); setError("");
     try {
-      const suffix = pendingAction.key === "import-data" && importFile ? `?filename=${encodeURIComponent(importFile.name)}` : "";
-      const response = await fetch(`${API_BASE}/maintenance/jobs/${pendingAction.key}/run${suffix}`, {
+      const action = pendingAction;
+      const selectedFile = importFile;
+      const suffix = action.key === "import-data" && selectedFile ? `?filename=${encodeURIComponent(selectedFile.name)}` : "";
+      const startedRun = await apiJson<unknown>(`/maintenance/jobs/${action.key}/run${suffix}`, {
         method: "POST",
-        headers: pendingAction.key === "import-data" ? { "Content-Type": "application/octet-stream" } : undefined,
-        body: pendingAction.key === "import-data" && importFile ? await importFile.arrayBuffer() : undefined,
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "Could not start this action.");
+        headers: action.key === "import-data" ? { "Content-Type": "application/octet-stream" } : undefined,
+        body: action.key === "import-data" && selectedFile ? await selectedFile.arrayBuffer() : undefined,
+      }, "Could not start this action.");
+      if (!isUtilityRunResponse(startedRun) || startedRun.action !== action.key || startedRun.job_key !== action.key) {
+        throw new ApiError("Could not start this action. The server returned an invalid response.");
+      }
       setPendingAction(null); setImportFile(null);
       await onMaintenanceRefresh();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not start this action."); }
+    } catch (caught) { setError(userMessage(caught, "Could not start this action.")); }
     finally { setStarting(false); }
   };
 
@@ -69,11 +86,12 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
       throw new Error("Schedules are disabled for this utility in the initial production release.");
     }
     setError("");
-    const response = await fetch(`${API_BASE}/maintenance/jobs/${job.jobKey}/schedule`, {
+    const updatedSchedule = await apiJson<unknown>(`/maintenance/jobs/${job.jobKey}/schedule`, {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled, runTime, timezone }),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || "Could not update this schedule.");
+    }, "Could not update this schedule.");
+    if (!isScheduleMutationResponse(updatedSchedule) || updatedSchedule.jobKey !== job.jobKey) {
+      throw new ApiError("Could not update this schedule. The server returned an invalid response.");
+    }
     await onMaintenanceRefresh();
   };
 
@@ -83,29 +101,31 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
       return;
     }
     try { await saveSchedule(job, !job.schedule.enabled, job.schedule.runTime, job.schedule.timezone); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : "Could not update this schedule."); }
+    catch (caught) { setError(userMessage(caught, "Could not update this schedule.")); }
   };
 
   const openHistory = async (job: MaintenanceJobState) => {
     if (!features.utilities) return;
     setHistoryJob(job); setHistoryRuns([]); setHistoryLoading(true); setError("");
     try {
-      const response = await fetch(`${API_BASE}/maintenance/jobs/${job.jobKey}/history?limit=20`, { cache: "no-store" });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "Could not load run history.");
-      setHistoryRuns(result.runs as MaintenanceRun[]);
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not load run history."); }
+      const result = await apiJson<unknown>(`/maintenance/jobs/${job.jobKey}/history?limit=20`, {}, "Could not load run history.");
+      if (!isMaintenanceHistoryResponse(result) || result.jobKey !== job.jobKey) {
+        throw new ApiError("Could not load run history. The server returned an invalid response.");
+      }
+      setHistoryRuns(result.runs);
+    } catch (caught) { setError(userMessage(caught, "Could not load run history.")); }
     finally { setHistoryLoading(false); }
   };
 
   const cancelRun = async (runId: string) => {
     if (!features.utilities) return;
     try {
-      const response = await fetch(`${API_BASE}/maintenance/runs/${runId}/cancel`, { method: "POST" });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "Could not cancel this action.");
+      const cancelledRun = await apiJson<unknown>(`/maintenance/runs/${runId}/cancel`, { method: "POST" }, "Could not cancel this action.");
+      if (!isUtilityCancelResponse(cancelledRun) || cancelledRun.id !== runId || cancelledRun.run_id !== runId) {
+        throw new ApiError("Could not cancel this action. The server returned an invalid response.");
+      }
       await onMaintenanceRefresh();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not cancel this action."); }
+    } catch (caught) { setError(userMessage(caught, "Could not cancel this action.")); }
   };
 
   return <div className="space-y-8">
@@ -125,26 +145,19 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
     {activeTab === "data" ? <section><h2 className="text-lg font-semibold text-white">Data & Recovery</h2><div className="mt-3 grid gap-4 xl:grid-cols-2">{dataActions.map((action) => { const job = jobsByKey.get(action.key); const enabled = actionEnabled(action.key, features); return job ? <MaintenanceCard key={action.key} action={action} job={job} enabled={enabled} schedulesEnabled={features.schedules && enabled} onRun={() => { if (!enabled) return; setError(""); setImportFile(null); setPendingAction(action); }} onToggle={() => void toggleSchedule(job)} onEditSchedule={() => { if (features.schedules && enabled) setScheduleJob(job); }} onHistory={() => void openHistory(job)} /> : null; })}</div></section> : null}
     {activeTab === "email" ? <EmailTab /> : null}
     {pendingAction ? <ConfirmationModal action={pendingAction} job={jobsByKey.get(pendingAction.key)} file={importFile} error={error} starting={starting} onFileChange={(event) => setImportFile(event.target.files?.[0] || null)} onCancel={() => { setPendingAction(null); setImportFile(null); setError(""); }} onConfirm={startAction} /> : null}
-    {scheduleJob?.schedule ? <ScheduleModal job={scheduleJob} error={error} onCancel={() => { setScheduleJob(null); setError(""); }} onSave={async (enabled, runTime, timezone) => { try { await saveSchedule(scheduleJob, enabled, runTime, timezone); setScheduleJob(null); } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not update this schedule."); } }} /> : null}
+    {scheduleJob?.schedule ? <ScheduleModal job={scheduleJob} error={error} onCancel={() => { setScheduleJob(null); setError(""); }} onSave={async (enabled, runTime, timezone) => { try { await saveSchedule(scheduleJob, enabled, runTime, timezone); setScheduleJob(null); } catch (caught) { setError(userMessage(caught, "Could not update this schedule.")); } }} /> : null}
     {historyJob ? <HistoryModal job={historyJob} runs={historyRuns} loading={historyLoading} error={error} onClose={() => { setHistoryJob(null); setError(""); }} /> : null}
   </div>;
 }
 
-interface EmailSettings {
-  smtpHost: string; smtpPort: number; security: "ssl_tls" | "starttls" | "none"; smtpUsername: string;
-  fromEmail: string; fromName: string; replyToEmail: string; dailyEnabled: boolean; recipientEmail: string;
-  sendAfterRefresh: boolean; sendWhenEmpty: boolean; hasSmtpPassword: boolean; configured: boolean;
-}
-interface EmailDigest { id: string; startedAt: string; completedAt: string; recipient: string; jobCount: number; status: string; error: string; triggerType: string; }
-interface EmailStatus { configured: boolean; dailyEnabled: boolean; recipientEmail: string; lastEmail: EmailDigest | null; scheduledRefreshEnabled: boolean; scheduledRefreshTime: string; scheduledRefreshTimezone: string; }
-const emptyEmailSettings: EmailSettings = { smtpHost: "", smtpPort: 465, security: "ssl_tls", smtpUsername: "", fromEmail: "", fromName: "Opportunity Radar", replyToEmail: "", dailyEnabled: false, recipientEmail: "", sendAfterRefresh: true, sendWhenEmpty: false, hasSmtpPassword: false, configured: false };
+const emptyEmailSettings: EmailSettingsPayload = { smtpHost: "", smtpPort: 465, security: "ssl_tls", smtpUsername: "", fromEmail: "", fromName: "Opportunity Radar", replyToEmail: "", dailyEnabled: false, recipientEmail: "", sendAfterRefresh: true, sendWhenEmpty: false, hasSmtpPassword: false, trackingStartedAt: "", configured: false };
 
 function EmailTab() {
-  const [settings, setSettings] = useState<EmailSettings>(emptyEmailSettings);
+  const [settings, setSettings] = useState<EmailSettingsPayload>(emptyEmailSettings);
   const [password, setPassword] = useState("");
   const [testRecipient, setTestRecipient] = useState("");
-  const [status, setStatus] = useState<EmailStatus | null>(null);
-  const [history, setHistory] = useState<EmailDigest[]>([]);
+  const [status, setStatus] = useState<EmailStatusPayload | null>(null);
+  const [history, setHistory] = useState<EmailDigestPayload[]>([]);
   const [selectedDigest, setSelectedDigest] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -152,41 +165,69 @@ function EmailTab() {
   const [error, setError] = useState("");
 
   const load = async () => {
-    const [settingsResponse, statusResponse, historyResponse] = await Promise.all([
-      fetch(`${API_BASE}/settings/email`, { cache: "no-store" }), fetch(`${API_BASE}/email/status`, { cache: "no-store" }), fetch(`${API_BASE}/email/history?limit=20`, { cache: "no-store" }),
+    const [loadedSettings, loadedStatus, loadedHistory] = await Promise.all([
+      apiJson<unknown>("/settings/email", {}, "Email settings could not be loaded."),
+      apiJson<unknown>("/email/status", {}, "Email status could not be loaded."),
+      apiJson<unknown>("/email/history?limit=20", {}, "Email history could not be loaded."),
     ]);
-    if (!settingsResponse.ok || !statusResponse.ok || !historyResponse.ok) throw new Error("Email settings could not be loaded.");
-    const loadedSettings = await settingsResponse.json() as EmailSettings;
-    setSettings(loadedSettings); setStatus(await statusResponse.json() as EmailStatus); setHistory((await historyResponse.json() as { history: EmailDigest[] }).history);
+    if (!isEmailSettingsPayload(loadedSettings) || !isEmailStatusPayload(loadedStatus)
+      || !isEmailHistoryPayload(loadedHistory)) {
+      throw new ApiError("Email settings could not be loaded. The server returned an invalid response.");
+    }
+    setSettings(loadedSettings); setStatus(loadedStatus); setHistory(loadedHistory.history);
     setTestRecipient((current) => current || loadedSettings.recipientEmail);
+    setError("");
   };
 
-  useEffect(() => { void load().catch((caught) => setError(caught instanceof Error ? caught.message : "Email settings could not be loaded.")).finally(() => setLoading(false)); }, []);
+  const loadVisible = async () => {
+    setLoading(true);
+    try { await load(); }
+    catch (caught) { setError(userMessage(caught, "Email settings could not be loaded.")); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { void loadVisible(); }, []);
 
   const save = async () => {
     setBusy("save"); setError(""); setMessage("");
     try {
-      const response = await fetch(`${API_BASE}/settings/email`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...settings, smtpPassword: password }) });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "Email settings could not be saved.");
-      setSettings(result as EmailSettings); setPassword(""); setMessage("Email settings saved."); await load();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Email settings could not be saved."); }
+      const result = await apiJson<unknown>("/settings/email", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...settings, smtpPassword: password }) }, "Email settings could not be saved.");
+      if (!isEmailSettingsPayload(result)) throw new ApiError("Email settings could not be saved. The server returned an invalid response.");
+      setSettings(result); setPassword(""); setMessage("Email settings saved.");
+      try { await load(); }
+      catch (reloadError) {
+        setStatus(null); setHistory([]);
+        setError(userMessage(reloadError, "Email settings were saved, but current email status could not be reloaded."));
+      }
+    } catch (caught) { setError(userMessage(caught, "Email settings could not be saved.")); }
     finally { setBusy(""); }
   };
 
   const runEmailAction = async (action: "test" | "digest") => {
     setBusy(action); setError(""); setMessage("");
     try {
-      const response = await fetch(`${API_BASE}${action === "test" ? "/settings/email/test" : "/email/send-new-jobs"}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: action === "test" ? JSON.stringify({ recipient: testRecipient }) : undefined });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || "The email could not be sent.");
-      setMessage(action === "test" ? result.message : result.status === "Skipped - No New Jobs" ? "No email was sent because there are no new jobs." : `Daily job email sent with ${result.jobCount} new jobs.`); await load();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "The email could not be sent."); await load().catch(() => undefined); }
+      const result = await apiJson<unknown>(action === "test" ? "/settings/email/test" : "/email/send-new-jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: action === "test" ? JSON.stringify({ recipient: testRecipient }) : undefined }, "The email could not be sent.");
+      if (action === "test") {
+        if (!isMessageResponse(result)) throw new ApiError("The test email response was invalid.");
+        setMessage(result.message || "Test email sent.");
+      } else {
+        if (!isEmailDigestMutationResponse(result)) {
+          throw new ApiError("The daily email response was invalid.");
+        }
+        setMessage(result.status === "Skipped - No New Jobs" ? "No email was sent because there are no new jobs." : `Daily job email sent with ${result.jobCount} new jobs.`);
+      }
+      try { await load(); }
+      catch (reloadError) {
+        setStatus(null); setHistory([]);
+        setError(userMessage(reloadError, "The email was sent, but current email status could not be reloaded."));
+      }
+    } catch (caught) { setError(userMessage(caught, "The email could not be sent.")); }
     finally { setBusy(""); }
   };
 
-  const update = <K extends keyof EmailSettings>(key: K, value: EmailSettings[K]) => setSettings((current) => ({ ...current, [key]: value }));
-  if (loading) return <p className="text-sm text-slate-400">Loading email settings...</p>;
+  const update = <K extends keyof EmailSettingsPayload>(key: K, value: EmailSettingsPayload[K]) => setSettings((current) => ({ ...current, [key]: value }));
+  if (loading) return <p className="text-sm text-slate-400" role="status">Loading email settings...</p>;
+  if (error && !status) return <div className="panel p-6 text-center" role="alert"><p className="text-sm text-red-300">{error}</p><button className="btn mt-4" type="button" onClick={() => void loadVisible()}>Retry</button></div>;
   return <div className="space-y-6">
     {message ? <div className="rounded-md border border-emerald-800 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-200" role="status">{message}</div> : null}
     {error ? <Alert message={error} /> : null}
@@ -195,7 +236,7 @@ function EmailTab() {
       <div className="mt-5 grid gap-4 md:grid-cols-2">
         <EmailField label="SMTP Host"><input className="field mt-1" value={settings.smtpHost} placeholder="SMTP server" onChange={(event) => update("smtpHost", event.target.value)} /></EmailField>
         <EmailField label="SMTP Port"><input className="field mt-1" type="number" min={1} max={65535} value={settings.smtpPort} onChange={(event) => update("smtpPort", Number(event.target.value))} /></EmailField>
-        <EmailField label="Security"><select className="field mt-1" value={settings.security} onChange={(event) => update("security", event.target.value as EmailSettings["security"])}><option value="ssl_tls">SSL/TLS</option><option value="starttls">STARTTLS</option><option value="none">None</option></select></EmailField>
+        <EmailField label="Security"><select className="field mt-1" value={settings.security} onChange={(event) => update("security", event.target.value as EmailSettingsPayload["security"])}><option value="ssl_tls">SSL/TLS</option><option value="starttls">STARTTLS</option><option value="none">None</option></select></EmailField>
         <EmailField label="SMTP Username"><input className="field mt-1" autoComplete="username" value={settings.smtpUsername} onChange={(event) => update("smtpUsername", event.target.value)} /></EmailField>
         <EmailField label="SMTP Password / App Password"><input className="field mt-1" type="password" autoComplete="new-password" value={password} placeholder={settings.hasSmtpPassword ? "Saved - leave blank to keep" : "Enter password"} onChange={(event) => setPassword(event.target.value)} /></EmailField>
         <EmailField label="From Email"><input className="field mt-1" type="email" value={settings.fromEmail} onChange={(event) => update("fromEmail", event.target.value)} /></EmailField>
@@ -222,7 +263,7 @@ function EmailTab() {
       <div className="panel p-5"><h2 className="font-semibold text-white">Email Service</h2><dl className="mt-4 grid grid-cols-2 gap-4"><Stat label="Configured" value={status?.configured ? "Yes" : "No"} /><Stat label="Daily Digest" value={status?.dailyEnabled ? "Enabled" : "Disabled"} /><Stat label="Recipient" value={status?.recipientEmail || "Not Set"} /><Stat label="Last Email" value={status?.lastEmail ? formatTimestamp(status.lastEmail.completedAt || status.lastEmail.startedAt) : "Never"} /><Stat label="Last Result" value={status?.lastEmail?.status || "Never Sent"} /><Stat label="New Jobs Sent" value={String(status?.lastEmail?.jobCount ?? 0)} /><Stat label="Next Digest" value={status?.scheduledRefreshEnabled ? `After the scheduled ${formatClockTime(status.scheduledRefreshTime)} refresh` : "Scheduled refresh is off"} /></dl><button className="btn mt-5" type="button" disabled={Boolean(busy) || !settings.configured} onClick={() => void runEmailAction("digest")}><Send size={16} />{busy === "digest" ? "Sending..." : "Send New Jobs Now"}</button></div>
     </section>
 
-    <section className="panel overflow-hidden"><header className="border-b border-radar-line p-5"><h2 className="font-semibold text-white">Email History</h2></header>{history.length ? <div className="overflow-x-auto"><div className="min-w-[38rem]"><div className="grid grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-xs font-semibold uppercase text-slate-500"><span>Date</span><span>New Jobs</span><span>Result</span><span>Trigger</span></div>{history.map((digest) => <button className="grid w-full grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-left text-sm text-slate-300 last:border-0 hover:bg-radar-bg/50" type="button" key={digest.id} onClick={() => setSelectedDigest(selectedDigest === digest.id ? null : digest.id)}><span>{formatTimestamp(digest.startedAt)}</span><span>{digest.jobCount}</span><span className={digest.status === "Success" ? "text-emerald-300" : digest.status === "Failed" ? "text-red-300" : "text-slate-400"}>{digest.status}</span><span className="capitalize">{digest.triggerType}</span>{selectedDigest === digest.id && digest.error ? <span className="col-span-4 text-red-300">{digest.error}</span> : null}</button>)}</div></div> : <p className="p-5 text-sm text-slate-400">No daily job emails have been attempted yet.</p>}</section>
+    <section className="panel overflow-hidden"><header className="border-b border-radar-line p-5"><h2 className="font-semibold text-white">Email History</h2></header>{history.length ? <div className="overflow-x-auto"><div className="min-w-[38rem]"><div className="grid grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-xs font-semibold uppercase text-slate-500"><span>Date</span><span>New Jobs</span><span>Result</span><span>Trigger</span></div>{history.map((digest) => <button className="grid w-full grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-left text-sm text-slate-300 last:border-0 hover:bg-radar-bg/50" type="button" key={digest.id} onClick={() => setSelectedDigest(selectedDigest === digest.id ? null : digest.id)}><span>{formatTimestamp(digest.startedAt)}</span><span>{digest.jobCount}</span><span className={digest.status === "Success" ? "text-emerald-300" : digest.status === "Failed" ? "text-red-300" : "text-slate-400"}>{digest.status}</span><span className="capitalize">{digest.triggerType}</span>{selectedDigest === digest.id && digest.error ? <span className="col-span-4 text-red-300">This email attempt failed. Check the email configuration and try again.</span> : null}</button>)}</div></div> : <p className="p-5 text-sm text-slate-400">No daily job emails have been attempted yet.</p>}</section>
   </div>;
 }
 
@@ -255,7 +296,7 @@ function ScheduleModal({ job, error, onCancel, onSave }: { job: MaintenanceJobSt
 }
 
 function HistoryModal({ job, runs, loading, error, onClose }: { job: MaintenanceJobState; runs: MaintenanceRun[]; loading: boolean; error: string; onClose: () => void; }) {
-  return <Modal title={`${job.taskName} History`} onClose={onClose}>{loading ? <p className="text-sm text-slate-400">Loading history...</p> : error ? <Alert message={error} /> : runs.length ? <div className="max-h-[60vh] overflow-auto"><div className="grid min-w-[34rem] grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 border-b border-radar-line pb-2 text-xs font-semibold uppercase text-slate-500"><span>Started</span><span>Trigger</span><span>Runtime</span><span>Result</span></div>{runs.map((run) => <div className="min-w-[34rem] border-b border-radar-line py-3 last:border-0" key={run.id}><div className="grid grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 text-sm text-slate-300"><span>{formatTimestamp(run.startedAt || run.createdAt)}</span><span className="capitalize">{run.triggerType}</span><span>{formatDuration(run.runtimeSeconds)}</span><span className={run.status === "Completed" ? "text-emerald-300" : run.status === "Failed" ? "text-red-300" : "text-slate-400"}>{run.status === "Completed" ? "Success" : run.status}</span></div>{run.error ? <p className="mt-2 text-sm text-red-300">{run.error}</p> : null}</div>)}</div> : <p className="text-sm text-slate-400">This utility has not run yet.</p>}</Modal>;
+  return <Modal title={`${job.taskName} History`} onClose={onClose}>{loading ? <p className="text-sm text-slate-400">Loading history...</p> : error ? <Alert message={error} /> : runs.length ? <div className="max-h-[60vh] overflow-auto"><div className="grid min-w-[34rem] grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 border-b border-radar-line pb-2 text-xs font-semibold uppercase text-slate-500"><span>Started</span><span>Trigger</span><span>Runtime</span><span>Result</span></div>{runs.map((run) => <div className="min-w-[34rem] border-b border-radar-line py-3 last:border-0" key={run.id}><div className="grid grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 text-sm text-slate-300"><span>{formatTimestamp(run.startedAt || run.createdAt)}</span><span className="capitalize">{run.triggerType}</span><span>{formatDuration(run.runtimeSeconds)}</span><span className={run.status === "Completed" ? "text-emerald-300" : run.status === "Failed" ? "text-red-300" : "text-slate-400"}>{run.status === "Completed" ? "Success" : run.status}</span></div>{run.error ? <p className="mt-2 text-sm text-red-300">This maintenance run failed. Try the action again or contact an administrator.</p> : null}</div>)}</div> : <p className="text-sm text-slate-400">This utility has not run yet.</p>}</Modal>;
 }
 
 function ConfirmationModal({ action, job, file, error, starting, onFileChange, onCancel, onConfirm }: { action: UtilityPresentation; job?: MaintenanceJobState; file: File | null; error: string; starting: boolean; onFileChange: (event: ChangeEvent<HTMLInputElement>) => void; onCancel: () => void; onConfirm: () => Promise<void>; }) {
@@ -273,7 +314,7 @@ function formatDuration(seconds: number | null): string { if (seconds === null) 
 function actionEnabled(action: UtilityKey, features: FeatureFlags): boolean {
   if (!features.utilities) return false;
   if (action === "refresh-missing-company-information" || action === "refresh-company-discovery") {
-    return features.companyRefresh && features.discovery;
+    return features.companyRefresh && features.discovery && features.browserJobs;
   }
   if (action === "refresh-all-job-listings") return features.browserJobs;
   return true;

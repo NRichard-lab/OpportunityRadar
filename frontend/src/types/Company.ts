@@ -1,4 +1,4 @@
-export type SearchStatus = "Completed" | "Partial" | "Needs Review" | "Failed";
+export type SearchStatus = "Completed" | "Partial" | "Needs Review" | "Failed" | (string & {});
 
 export interface Company {
   id: string;
@@ -20,10 +20,12 @@ export interface Company {
   lastChecked: string;
   notes: string;
   activeJobCount?: number;
+  jobCount?: number;
   appliedCount?: number;
   lastCollectionDate?: string;
-  foundedYear?: number;
-  totalAssets?: number;
+  foundedYear?: number | null;
+  totalAssets?: number | null;
   assetsAsOfDate?: string;
   companyInfoLastChecked?: string;
+  jobBoardReverificationRequired?: boolean;
 }

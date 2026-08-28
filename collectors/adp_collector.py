@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
@@ -31,12 +32,15 @@ class ADPCollector(BaseCollector):
 
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent="FinancialJobsRadar/1.0 public ADP job listing collector"
+            browser = launch_playwright_chromium(playwright, headless=True)
+            context = browser.new_context(
+                user_agent="FinancialJobsRadar/1.0 public ADP job listing collector",
+                service_workers="block",
             )
+            install_playwright_url_guard(context)
+            page = context.new_page()
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                safe_page_goto(page, url, wait_until="domcontentloaded", timeout=45000)
                 self.final_url_after_redirect = page.url
                 try:
                     page.wait_for_load_state("networkidle", timeout=12000)

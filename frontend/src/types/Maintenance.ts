@@ -16,7 +16,11 @@ export interface MaintenanceRun {
   action: string;
   job_key: string;
   triggerType: "manual" | "scheduled";
+  trigger_type: "manual" | "scheduled";
   taskName: string;
+  task_name: string;
+  progressVerb: string;
+  progressUnit: string;
   status: MaintenanceStatus;
   running: boolean;
   current: number;
@@ -27,6 +31,7 @@ export interface MaintenanceRun {
   currentMessage: string;
   message: string;
   summary: Record<string, unknown>;
+  resultSummary: Record<string, unknown>;
   error: string;
   startedAt: string;
   completedAt: string;
@@ -37,12 +42,14 @@ export interface MaintenanceRun {
 
 export interface MaintenanceJobState {
   jobKey: string;
+  job_key: string;
   taskName: string;
   description: string;
   supportsScheduling: boolean;
   schedule: MaintenanceSchedule | null;
   running: boolean;
   activeRunId: string | null;
+  active_run_id: string | null;
   activeRun: MaintenanceRun | null;
   latestRun: MaintenanceRun | null;
   lastRun: MaintenanceRun | null;
@@ -55,10 +62,12 @@ export interface MaintenanceJobsState {
   jobs: MaintenanceJobState[];
   activeRuns: MaintenanceRun[];
   runningCount: number;
+  running_count: number;
 }
 
 export const emptyMaintenanceState: MaintenanceJobsState = {
   jobs: [],
   activeRuns: [],
   runningCount: 0,
+  running_count: 0,
 };

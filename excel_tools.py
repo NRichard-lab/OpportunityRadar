@@ -10,17 +10,14 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
-from config import APP_WRITE_FRONTEND_MIRRORS, DEFAULT_FRONTEND_COMPANIES_JSON, OUTPUT_COLUMNS
+from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
+from config import APP_WRITE_FRONTEND_MIRRORS, DEFAULT_FRONTEND_COMPANIES_JSON, MAX_IMPORT_ROWS, OUTPUT_COLUMNS
 
 
 INPUT_COLUMNS = ["Company Name", "City", "State", "Known Website", "Notes"]
 URL_COLUMNS = {
     "Known Website",
     "Official Website",
-    "Website Discovery Method",
-    "Website Candidate URLs",
-    "Website Verification Notes",
-    "Website Verified",
     "Careers Page URL",
     "Job Board URL",
     "Jobs RSS Feed URL",
@@ -82,19 +79,35 @@ def read_companies(path: Path) -> list[dict[str, Any]]:
 
 
 def read_company_rows(path: Path) -> list[dict[str, Any]]:
-    workbook = load_workbook(path, data_only=True)
-    sheet = workbook.active
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
-        return []
+    workbook = load_workbook(path, data_only=True, read_only=True, keep_links=False)
+    try:
+        sheet = workbook.active
+        maximum_row = min(sheet.max_row or 1, MAX_IMPORT_ROWS + 1)
+        maximum_column = min(sheet.max_column or 1, len(OUTPUT_COLUMNS))
+        rows = sheet.iter_rows(
+            min_row=1,
+            max_row=maximum_row,
+            min_col=1,
+            max_col=maximum_column,
+            values_only=True,
+        )
+        header_row = next(rows, None)
+        if header_row is None:
+            return []
 
-    headers = [str(value).strip() if value is not None else "" for value in rows[0]]
-    records: list[dict[str, Any]] = []
-    for row in rows[1:]:
-        record = {header: row[index] if index < len(row) else "" for index, header in enumerate(headers) if header}
-        if record.get("Company Name"):
-            records.append(normalize_company_row(record))
-    return records
+        headers = [str(value).strip() if value is not None else "" for value in header_row]
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = {
+                header: row[index] if index < len(row) else ""
+                for index, header in enumerate(headers)
+                if header
+            }
+            if record.get("Company Name"):
+                records.append(normalize_company_row(record))
+        return records
+    finally:
+        workbook.close()
 
 
 def write_results(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -105,7 +118,7 @@ def write_results(path: Path, rows: list[dict[str, Any]]) -> None:
     sheet.append(OUTPUT_COLUMNS)
 
     for result in rows:
-        sheet.append([result.get(column, "") for column in OUTPUT_COLUMNS])
+        sheet.append([sanitize_spreadsheet_value(result.get(column, "")) for column in OUTPUT_COLUMNS])
 
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
@@ -116,7 +129,7 @@ def write_results(path: Path, rows: list[dict[str, Any]]) -> None:
     for row in sheet.iter_rows(min_row=2):
         for cell in row:
             header = sheet.cell(row=1, column=cell.column).value
-            if header in URL_COLUMNS and cell.value:
+            if header in URL_COLUMNS and cell.value and is_safe_spreadsheet_hyperlink(str(cell.value)):
                 cell.hyperlink = str(cell.value)
                 cell.style = "Hyperlink"
 
@@ -128,7 +141,7 @@ def write_results(path: Path, rows: list[dict[str, Any]]) -> None:
             max_length = max(max_length, len(value))
         sheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 70)
 
-    workbook.save(path)
+    atomic_save_workbook(path, workbook)
 
 
 def write_master(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -188,8 +201,7 @@ def export_excel_to_json(input_path: Path, output_path: Path) -> int:
             company["id"] = stable_company_id(row_data)
         companies.append(company)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(companies, indent=2), encoding="utf-8")
+    atomic_write_text(output_path, json.dumps(companies, indent=2))
     mirror_companies_json(output_path)
     return len(companies)
 
@@ -201,8 +213,7 @@ def mirror_companies_json(output_path: Path) -> None:
         return
     if output_path.name != "companies.json":
         return
-    DEFAULT_FRONTEND_COMPANIES_JSON.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_FRONTEND_COMPANIES_JSON.write_text(output_path.read_text(encoding="utf-8"), encoding="utf-8")
+    atomic_write_text(DEFAULT_FRONTEND_COMPANIES_JSON, output_path.read_text(encoding="utf-8"))
     logger.info("Mirrored companies JSON to %s", DEFAULT_FRONTEND_COMPANIES_JSON)
 
 
@@ -344,6 +355,19 @@ def normalized_domain(url: str) -> str:
     return host
 
 
+def is_safe_spreadsheet_hyperlink(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+        return bool(
+            parsed.scheme.casefold() in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        return False
+
+
 def slug(value: str) -> str:
     cleaned = []
     last_dash = False
@@ -375,4 +399,4 @@ def create_sample_workbook(path: Path) -> None:
         column_letter = get_column_letter(column_cells[0].column)
         max_length = max(len(str(cell.value or "")) for cell in column_cells)
         sheet.column_dimensions[column_letter].width = max(max_length + 2, 14)
-    workbook.save(path)
+    atomic_save_workbook(path, workbook)

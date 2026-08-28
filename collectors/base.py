@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 import requests
 
+from backend.outbound_security import SSRFProtectedSession
 from job_platforms import detect_job_platform
 
 
@@ -25,16 +26,17 @@ class BaseCollector:
         self.selection_reason = ""
         self.final_url_after_redirect = ""
         self.last_pay_extraction: dict[str, Any] = {}
+        self.session = SSRFProtectedSession()
+        self.session.headers.update({"User-Agent": "FinancialJobsRadar/1.0 public job listing collector"})
 
     def collect(self, company: dict[str, Any]):
         raise NotImplementedError
 
     def get(self, url: str) -> requests.Response:
         time.sleep(max(0, self.delay_seconds))
-        response = requests.get(
+        response = self.session.get(
             url,
             timeout=20,
-            headers={"User-Agent": "FinancialJobsRadar/1.0 public job listing collector"},
             allow_redirects=True,
         )
         response.raise_for_status()
