@@ -27,6 +27,7 @@ CONFIG_KEYS = {
     "APP_WRITE_FRONTEND_MIRRORS", "APP_DATA_DIR", "APP_IMPORT_DIR", "APP_EXPORT_DIR",
     "APP_OUTPUT_DIR", "APP_BACKUP_DIR", "APP_LOG_DIR", "DATABASE_URL",
     "APP_MAX_HTTP_WORKERS", "APP_MAX_BROWSER_WORKERS", "APP_MAX_ACTIVE_MAINTENANCE",
+    "REQUIRE_EXISTING_DATABASE",
 }
 TRUSTED_ID = "17f975f1-e63a-4daa-985a-82d39ed60684"
 
@@ -69,6 +70,30 @@ class ProductionConfigurationTests(unittest.TestCase):
     def test_valid_production_blueash_configuration_succeeds(self) -> None:
         result = run_validation(valid_production_environment())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_production_requires_existing_database_guard(self) -> None:
+        values = valid_production_environment()
+        values["REQUIRE_EXISTING_DATABASE"] = "false"
+
+        result = run_validation(values)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("REQUIRE_EXISTING_DATABASE=true", result.stderr)
+
+    def test_existing_database_guard_defaults_by_environment(self) -> None:
+        production = run_python(
+            {"APP_ENV": "production"},
+            "import config; print(str(config.REQUIRE_EXISTING_DATABASE).lower())",
+        )
+        development = run_python(
+            {"APP_ENV": "development"},
+            "import config; print(str(config.REQUIRE_EXISTING_DATABASE).lower())",
+        )
+
+        self.assertEqual(production.returncode, 0, production.stderr)
+        self.assertEqual(production.stdout.strip(), "true")
+        self.assertEqual(development.returncode, 0, development.stderr)
+        self.assertEqual(development.stdout.strip(), "false")
 
     def test_every_required_blueash_setting_is_explicit(self) -> None:
         required = {

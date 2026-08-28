@@ -1,0 +1,16 @@
+# Reviewed Phase 2 example only. Do not install this file in production yet.
+radar.blueashdigital.tech {
+	encode zstd gzip
+
+	@api path /api /api/*
+	handle @api {
+		reverse_proxy opportunity-radar-backend:8000
+	}
+
+	@private_data path /data /data/*
+	respond @private_data 404
+
+	handle {
+		reverse_proxy opportunity-radar-frontend:8080
+	}
+}

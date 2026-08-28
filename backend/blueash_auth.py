@@ -30,6 +30,7 @@ from config import (
     EXPORT_DIR,
     IMPORT_DIR,
     LOG_DIR,
+    REQUIRE_EXISTING_DATABASE,
     SUPPORTED_APP_ENVS,
     SUPPORTED_AUTH_MODES,
 )
@@ -112,6 +113,11 @@ def validate_auth_configuration() -> None:
     if BLUEASH_COOKIE_DOMAIN and any(character in BLUEASH_COOKIE_DOMAIN for character in "/:@?# "):
         raise BlueAshConfigurationError("BLUEASH_COOKIE_DOMAIN is invalid.")
     if APP_ENV == "production":
+        if not REQUIRE_EXISTING_DATABASE:
+            raise BlueAshConfigurationError(
+                "Production requires REQUIRE_EXISTING_DATABASE=true so a missing persistent "
+                "SQLite mount cannot be replaced by an empty database."
+            )
         if APP_ENABLE_BROWSER_JOBS:
             raise BlueAshConfigurationError(
                 "APP_ENABLE_BROWSER_JOBS cannot be enabled in production in this release; "

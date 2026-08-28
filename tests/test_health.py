@@ -96,6 +96,30 @@ class ReadinessChecksTests(unittest.TestCase):
         self.assertEqual(database["checks"]["read"], NOT_CHECKED)
         self.assertFalse(self.database_path.exists())
 
+    def test_database_disappearance_changes_health_to_unhealthy_without_replacement(self) -> None:
+        self.initialize_database()
+        cache = ReadinessCache(ttl_seconds=60)
+        first = cache.get(
+            database_path=self.database_path,
+            data_dir=self.data_dir,
+            export_dir=self.export_dir,
+            version="database-disappearance-test",
+        )
+        self.assertEqual(first.status_code, 200)
+
+        self.database_path.unlink()
+        cache.clear()
+        second = cache.get(
+            database_path=self.database_path,
+            data_dir=self.data_dir,
+            export_dir=self.export_dir,
+            version="database-disappearance-test",
+        )
+
+        self.assertEqual(second.status_code, 503)
+        self.assertEqual(second.payload["components"]["database"]["checks"]["exists"], UNHEALTHY)
+        self.assertFalse(self.database_path.exists())
+
     def test_incomplete_schema_is_unhealthy_and_not_migrated(self) -> None:
         with closing(sqlite3.connect(self.database_path)) as connection:
             connection.execute(
@@ -347,6 +371,7 @@ class StartupReadinessTests(unittest.TestCase):
                 DEPLOYMENT_VERSION="missing-database-test",
                 APP_ENABLE_SCHEDULES=False,
                 APP_ENABLE_UTILITIES=False,
+                REQUIRE_EXISTING_DATABASE=False,
                 _utility_run_manager=None,
                 _health_readiness_cache=ReadinessCache(ttl_seconds=60),
             ), patch.object(server, "validate_auth_configuration") as validate_auth, patch.object(
@@ -361,6 +386,80 @@ class StartupReadinessTests(unittest.TestCase):
         email_factory.assert_not_called()
         self.assertEqual(response.status_code, 503)
         self.assertEqual(json.loads(response.body)["status"], UNHEALTHY)
+
+    def test_required_existing_database_makes_startup_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            export_dir = root / "exports"
+            data_dir.mkdir()
+            export_dir.mkdir()
+            missing_database = data_dir / "missing.db"
+
+            with patch.multiple(
+                server,
+                DEFAULT_DATABASE=missing_database,
+                DATA_DIR=data_dir,
+                EXPORT_DIR=export_dir,
+                DEPLOYMENT_VERSION="required-database-test",
+                APP_ENABLE_SCHEDULES=False,
+                APP_ENABLE_UTILITIES=False,
+                REQUIRE_EXISTING_DATABASE=True,
+                _utility_run_manager=None,
+                _health_readiness_cache=ReadinessCache(ttl_seconds=60),
+            ), patch.object(server, "validate_auth_configuration"), patch.object(
+                server, "reconcile_interrupted_runs"
+            ) as reconcile:
+                with self.assertRaisesRegex(RuntimeError, "persistent database mount"):
+                    server.start_maintenance_scheduler()
+
+            reconcile.assert_not_called()
+            self.assertFalse(missing_database.exists())
+
+    def test_required_existing_connection_cannot_create_replacement_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "missing-parent" / "missing.db"
+
+            with self.assertRaises(sqlite3.OperationalError):
+                connect(database, require_existing=True)
+
+            self.assertFalse(database.parent.exists())
+            self.assertFalse(database.exists())
+
+    def test_required_missing_database_is_reported_as_persistence_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "missing.db"
+            with patch.multiple(
+                server,
+                DEFAULT_DATABASE=database,
+                REQUIRE_EXISTING_DATABASE=True,
+            ):
+                self.assertEqual(
+                    server.status(),
+                    {
+                        "status": "persistence-unavailable",
+                        "storage": "sqlite",
+                        "message": "Opportunity Radar backend is running.",
+                    },
+                )
+                with self.assertRaises(server.HTTPException) as raised:
+                    server.repository()
+
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertIn("database mount", raised.exception.detail)
+            self.assertFalse(database.exists())
+
+    def test_writable_sqlite_connections_apply_production_safety_pragmas(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "production.db"
+            with closing(connect(database)) as connection:
+                initialize_schema(connection)
+
+            with closing(connect(database, require_existing=True)) as connection:
+                self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+                self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+                self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 2)
 
     def test_existing_unready_database_is_not_initialized_during_startup(self) -> None:
         for contents in (b"", b"not a sqlite database"):
@@ -382,6 +481,7 @@ class StartupReadinessTests(unittest.TestCase):
                     DEPLOYMENT_VERSION="unready-database-test",
                     APP_ENABLE_SCHEDULES=False,
                     APP_ENABLE_UTILITIES=False,
+                    REQUIRE_EXISTING_DATABASE=False,
                     _utility_run_manager=None,
                     _health_readiness_cache=cache,
                 ), patch.object(server, "validate_auth_configuration"), patch.object(

@@ -232,13 +232,31 @@ CREATE TABLE IF NOT EXISTS email_sent_jobs (
 """
 
 
-def connect(database_path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+def connect(
+    database_path: Path,
+    *,
+    readonly: bool = False,
+    require_existing: bool = False,
+) -> sqlite3.Connection:
     database_path = Path(database_path)
-    if readonly:
-        connection = sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True)
+    if readonly or require_existing:
+        mode = "ro" if readonly else "rw"
+        # SQLite URI modes are deliberate here: both fail when the target does
+        # not exist, so a lost production mount cannot be replaced by an empty
+        # database between an application-level existence check and connect().
+        connection = sqlite3.connect(
+            f"{database_path.resolve(strict=False).as_uri()}?mode={mode}",
+            uri=True,
+            timeout=5.0,
+            check_same_thread=True,
+        )
     else:
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(
+            database_path,
+            timeout=5.0,
+            check_same_thread=True,
+        )
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

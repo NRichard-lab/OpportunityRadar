@@ -5,6 +5,9 @@
 .env
 .env.*
 !.env.example
+**/.env
+**/.env.*
+!**/.env.example
 **/.email_secret.key
 secrets/
 secrets.local.*
@@ -40,6 +43,11 @@ applications.json
 *.db-journal
 *.xls
 *.xlsx
+*.csv
+*.tsv
+*.pdf
+*.doc
+*.docx
 
 # Local runtimes and browser state
 .venv/
@@ -54,9 +62,12 @@ frontend/dist/
 
 # Tests, caches, and developer-only artifacts
 tests/
+docs/
 CODE_REVIEW.md
 __pycache__/
 *.py[cod]
+**/__pycache__/
+**/*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

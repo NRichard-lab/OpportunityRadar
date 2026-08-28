@@ -1,0 +1,87 @@
+# Python 3.12 production lock generated from requirements-production.in with:
+# pip-compile==7.5.1 --resolver=backtracking --strip-extras
+# Playwright and Chromium are intentionally excluded from this image.
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.14.2
+    # via starlette
+beautifulsoup4==4.15.0
+    # via -r requirements-production.in
+certifi==2026.7.22
+    # via requests
+charset-normalizer==3.5.1
+    # via requests
+click==8.5.0
+    # via
+    #   ddgs
+    #   uvicorn
+ddgs==9.16.0
+    # via -r requirements-production.in
+et-xmlfile==2.0.0
+    # via openpyxl
+fastapi==0.141.1
+    # via -r requirements-production.in
+feedparser==6.0.14
+    # via -r requirements-production.in
+feedparser-sgmllib==2.1.0
+    # via feedparser
+filelock==3.32.4
+    # via tldextract
+h11==0.16.0
+    # via uvicorn
+idna==3.19
+    # via
+    #   anyio
+    #   requests
+    #   tldextract
+lxml==6.1.2
+    # via
+    #   ddgs
+    #   python-docx
+openpyxl==3.1.5
+    # via -r requirements-production.in
+primp==2.0.0
+    # via ddgs
+pydantic==2.13.4
+    # via fastapi
+pydantic-core==2.46.4
+    # via pydantic
+pypdf==6.16.2
+    # via -r requirements-production.in
+python-docx==1.2.0
+    # via -r requirements-production.in
+requests==2.34.2
+    # via
+    #   -r requirements-production.in
+    #   requests-file
+    #   tldextract
+requests-file==3.0.1
+    # via tldextract
+soupsieve==2.9.2
+    # via beautifulsoup4
+starlette==1.6.0
+    # via fastapi
+tldextract==5.3.2
+    # via -r requirements-production.in
+typing-extensions==4.16.0
+    # via
+    #   anyio
+    #   beautifulsoup4
+    #   fastapi
+    #   pydantic
+    #   pydantic-core
+    #   python-docx
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+tzdata==2026.3
+    # via -r requirements-production.in
+urllib3==2.7.0
+    # via requests
+uvicorn==0.52.4
+    # via -r requirements-production.in

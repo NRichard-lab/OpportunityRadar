@@ -24,8 +24,19 @@ ACTIVE_STATUSES = {"Queued", "Running", "Cancelling"}
 
 
 @contextmanager
-def connection_scope(database_path: Path, *, readonly: bool = False):
-    with closing(connect(database_path, readonly=readonly)) as connection:
+def connection_scope(
+    database_path: Path,
+    *,
+    readonly: bool = False,
+    require_existing: bool = False,
+):
+    with closing(
+        connect(
+            database_path,
+            readonly=readonly,
+            require_existing=require_existing,
+        )
+    ) as connection:
         if readonly:
             yield connection
         else:
@@ -41,15 +52,19 @@ class UtilityRunManager:
         mutation_gate: MutationGate | None = None,
         initialize: bool = True,
         reconcile: bool = True,
+        require_existing: bool = False,
     ) -> None:
         self.database_path = Path(database_path)
+        self.require_existing = require_existing
         self._lock = threading.RLock()
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._mutation_gate = mutation_gate or GLOBAL_MUTATION_GATE
         self._accepting = True
         if initialize or reconcile:
-            with connection_scope(self.database_path) as connection:
+            with connection_scope(
+                self.database_path, require_existing=self.require_existing
+            ) as connection:
                 if initialize:
                     initialize_schema(connection)
                 if reconcile:
@@ -76,7 +91,9 @@ class UtilityRunManager:
                 raise OperationConflictError("The application is shutting down and cannot start new work.")
             lease = self._mutation_gate.acquire(action, operation_id=run_id)
             try:
-                with connection_scope(self.database_path) as connection:
+                with connection_scope(
+                    self.database_path, require_existing=self.require_existing
+                ) as connection:
                     connection.execute(
                         """INSERT INTO maintenance_job_runs (
                         id,job_key,task_name,trigger_type,progress_verb,progress_unit,status,
@@ -118,14 +135,22 @@ class UtilityRunManager:
         return self.get(run_id)
 
     def get(self, run_id: str) -> dict[str, Any]:
-        with connection_scope(self.database_path, readonly=True) as connection:
+        with connection_scope(
+            self.database_path,
+            readonly=True,
+            require_existing=self.require_existing,
+        ) as connection:
             row = connection.execute("SELECT * FROM maintenance_job_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(run_id)
         return run_snapshot(row)
 
     def list_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        with connection_scope(self.database_path, readonly=True) as connection:
+        with connection_scope(
+            self.database_path,
+            readonly=True,
+            require_existing=self.require_existing,
+        ) as connection:
             rows = connection.execute(
                 "SELECT * FROM maintenance_job_runs ORDER BY created_at DESC LIMIT ?",
                 (max(1, limit),),
@@ -133,7 +158,11 @@ class UtilityRunManager:
         return [run_snapshot(row) for row in rows]
 
     def history(self, job_key: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        with connection_scope(self.database_path, readonly=True) as connection:
+        with connection_scope(
+            self.database_path,
+            readonly=True,
+            require_existing=self.require_existing,
+        ) as connection:
             rows = connection.execute(
                 "SELECT * FROM maintenance_job_runs WHERE job_key = ? ORDER BY created_at DESC LIMIT ?",
                 (job_key, min(100, max(1, limit))),
@@ -155,7 +184,9 @@ class UtilityRunManager:
         run_id = f"maintenance-{uuid4()}"
         now = timestamp()
         with self._lock:
-            with connection_scope(self.database_path) as connection:
+            with connection_scope(
+                self.database_path, require_existing=self.require_existing
+            ) as connection:
                 connection.execute(
                     """INSERT INTO maintenance_job_runs (
                     id,job_key,task_name,trigger_type,status,current_message,error,
@@ -320,7 +351,9 @@ class UtilityRunManager:
         parameters = [value for _, value in values]
         parameters.extend([timestamp(), run_id])
         with self._lock:
-            with connection_scope(self.database_path) as connection:
+            with connection_scope(
+                self.database_path, require_existing=self.require_existing
+            ) as connection:
                 cursor = connection.execute(
                     f"UPDATE maintenance_job_runs SET {assignments}, updated_at = ? WHERE id = ?",
                     parameters,

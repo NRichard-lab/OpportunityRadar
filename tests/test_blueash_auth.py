@@ -126,6 +126,7 @@ class BlueAshAuthTests(unittest.TestCase):
             blueash_auth,
             APP_ENV="production",
             AUTH_MODE="blueash",
+            REQUIRE_EXISTING_DATABASE=True,
             APP_ENABLE_BROWSER_JOBS=True,
             APP_PUBLIC_URL="https://blueashdigital.tech/OpportunityRadar",
             BLUEASH_API_URL="https://api.blueashdigital.tech",

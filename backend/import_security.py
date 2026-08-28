@@ -21,6 +21,11 @@ from config import (
 
 MAX_IMPORT_COLUMNS = len(OUTPUT_COLUMNS)
 MAX_IMPORT_CELLS = MAX_IMPORT_COLUMNS * (MAX_IMPORT_ROWS + MAX_IMPORT_WORKSHEETS)
+# Keep JSON validation independent of interpreter-specific decoder recursion
+# behavior. Opportunity Radar imports have a shallow, known schema, so deeply
+# nested documents are malformed for this interface even on Python builds whose
+# C JSON decoder can parse beyond the process recursion limit.
+MAX_IMPORT_JSON_NESTING = 64
 
 
 def validate_import_upload(filename: str, contents: bytes) -> str:
@@ -100,7 +105,9 @@ def enforce_record_limit(company_payloads: object, job_payloads: object) -> tupl
 
 def _validate_json_bytes(contents: bytes) -> None:
     try:
-        payload = json.loads(contents.decode("utf-8-sig"))
+        document = contents.decode("utf-8-sig")
+        _enforce_json_nesting_limit(document)
+        payload = json.loads(document)
     except (UnicodeDecodeError, RecursionError, ValueError) as exc:
         raise ValueError("The JSON import is malformed or could not be read.") from exc
     if isinstance(payload, dict):
@@ -110,6 +117,30 @@ def _validate_json_bytes(contents: bytes) -> None:
             raise ValueError(f"Imports may contain at most {MAX_IMPORT_ROWS} object records.")
     else:
         raise ValueError("The selected JSON file does not contain company or job records.")
+
+
+def _enforce_json_nesting_limit(document: str) -> None:
+    """Reject excessive structural nesting without interpreting string data."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in document:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_IMPORT_JSON_NESTING:
+                raise RecursionError("JSON nesting exceeds the safe import limit.")
+        elif character in "]}" and depth:
+            depth -= 1
 
 
 def _enforce_xlsx_shape_limits(workbook: object) -> None:

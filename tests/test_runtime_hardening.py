@@ -33,7 +33,11 @@ class RuntimeHardeningTests(unittest.TestCase):
 
             def read_companies() -> None:
                 try:
-                    result.append(OpportunityRepository(database).list_companies())
+                    result.append(
+                        OpportunityRepository(
+                            database, require_existing=True
+                        ).list_companies()
+                    )
                 except BaseException as exc:
                     result.append(exc)
                 finally:
@@ -327,9 +331,10 @@ class RuntimeHardeningTests(unittest.TestCase):
         created: list[object] = []
 
         class FakeManager:
-            def __init__(self, _path, *, initialize, reconcile):
+            def __init__(self, _path, *, initialize, reconcile, require_existing):
                 self.initialize = initialize
                 self.reconcile = reconcile
+                self.require_existing = require_existing
                 time.sleep(0.02)
                 created.append(self)
 
@@ -344,6 +349,7 @@ class RuntimeHardeningTests(unittest.TestCase):
             self.assertTrue(all(manager is created[0] for manager in managers))
             self.assertFalse(created[0].initialize)
             self.assertFalse(created[0].reconcile)
+            self.assertEqual(created[0].require_existing, server.REQUIRE_EXISTING_DATABASE)
         finally:
             server._utility_run_manager = previous
 

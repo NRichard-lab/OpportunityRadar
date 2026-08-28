@@ -1,0 +1,120 @@
+name: opportunity-radar-phase2-smoke
+
+services:
+  opportunity-radar-backend:
+    image: "opportunity-radar-backend:phase2-${OPPORTUNITY_RADAR_RELEASE_SHA:-local}"
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+      args:
+        DEPLOYMENT_VERSION: "${OPPORTUNITY_RADAR_RELEASE_SHA:-phase2-local}"
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 768m
+    environment:
+      APP_ENV: development
+      AUTH_MODE: local
+      APP_PUBLIC_URL: "http://127.0.0.1:${OPPORTUNITY_RADAR_FRONTEND_PORT:-18080}"
+      APP_BASE_PATH: ""
+      DATABASE_URL: sqlite:////var/lib/opportunity-radar/database/opportunity_radar.db
+      APP_DATA_DIR: /var/lib/opportunity-radar/data
+      APP_IMPORT_DIR: /var/lib/opportunity-radar/data/imports
+      APP_OUTPUT_DIR: /var/lib/opportunity-radar/exports
+      APP_EXPORT_DIR: /var/lib/opportunity-radar/exports
+      APP_BACKUP_DIR: /var/lib/opportunity-radar/backups
+      APP_LOG_DIR: /var/log/opportunity-radar
+      APP_MAX_HTTP_WORKERS: "4"
+      APP_MAX_BROWSER_WORKERS: "1"
+      APP_MAX_ACTIVE_MAINTENANCE: "1"
+      APP_ENABLE_BROWSER_JOBS: "false"
+      APP_ENABLE_COMPANY_REFRESH: "false"
+      APP_ENABLE_UTILITIES: "false"
+      APP_ENABLE_SCHEDULES: "false"
+      APP_ENABLE_DISCOVERY: "false"
+      APP_WRITE_FRONTEND_MIRRORS: "false"
+      REQUIRE_EXISTING_DATABASE: "true"
+      DEPLOYMENT_VERSION: "${OPPORTUNITY_RADAR_RELEASE_SHA:-phase2-local}"
+    ports:
+      - "127.0.0.1:${OPPORTUNITY_RADAR_BACKEND_PORT:-18000}:8000"
+    volumes:
+      - type: bind
+        source: "${OPPORTUNITY_RADAR_SMOKE_ROOT:?Set OPPORTUNITY_RADAR_SMOKE_ROOT to a disposable synthetic-data directory}/database"
+        target: /var/lib/opportunity-radar/database
+      - type: bind
+        source: "${OPPORTUNITY_RADAR_SMOKE_ROOT:?Set OPPORTUNITY_RADAR_SMOKE_ROOT to a disposable synthetic-data directory}/data"
+        target: /var/lib/opportunity-radar/data
+      - type: bind
+        source: "${OPPORTUNITY_RADAR_SMOKE_ROOT:?Set OPPORTUNITY_RADAR_SMOKE_ROOT to a disposable synthetic-data directory}/exports"
+        target: /var/lib/opportunity-radar/exports
+      - type: bind
+        source: "${OPPORTUNITY_RADAR_SMOKE_ROOT:?Set OPPORTUNITY_RADAR_SMOKE_ROOT to a disposable synthetic-data directory}/backups"
+        target: /var/lib/opportunity-radar/backups
+      - type: bind
+        source: "${OPPORTUNITY_RADAR_SMOKE_ROOT:?Set OPPORTUNITY_RADAR_SMOKE_ROOT to a disposable synthetic-data directory}/logs"
+        target: /var/log/opportunity-radar
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1770,uid=10001,gid=10001
+      - /var/lib/opportunity-radar/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1770,uid=10001,gid=10001
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+    networks:
+      - phase2-smoke
+
+  opportunity-radar-frontend:
+    image: "opportunity-radar-frontend:phase2-${OPPORTUNITY_RADAR_RELEASE_SHA:-local}"
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+      args:
+        VITE_BASE_PATH: /
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGQUIT
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    ports:
+      - "127.0.0.1:${OPPORTUNITY_RADAR_FRONTEND_PORT:-18080}:8080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1770,uid=10001,gid=10001
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    networks:
+      - phase2-smoke
+
+networks:
+  phase2-smoke:
+    driver: bridge

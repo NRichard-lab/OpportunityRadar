@@ -81,6 +81,7 @@ from config import (
     LOG_DIR,
     MAX_IMPORT_UPLOAD_BYTES,
     MAX_RESUME_UPLOAD_BYTES,
+    REQUIRE_EXISTING_DATABASE,
     feature_flags_payload,
 )
 from excel_tools import read_company_rows
@@ -201,7 +202,10 @@ def utility_runs() -> UtilityRunManager:
             # responsibilities. Lazy service construction must stay read-only so
             # a GET cannot block behind an active writer.
             _utility_run_manager = UtilityRunManager(
-                Path(DEFAULT_DATABASE), initialize=False, reconcile=False
+                Path(DEFAULT_DATABASE),
+                initialize=False,
+                reconcile=False,
+                require_existing=REQUIRE_EXISTING_DATABASE,
             )
     return _utility_run_manager
 
@@ -316,9 +320,19 @@ class TestEmailRequest(BaseModel):
 
 @app.get("/api/status")
 def status() -> dict[str, str]:
+    database_exists = Path(DEFAULT_DATABASE).is_file()
+    if database_exists:
+        storage_status = "ready"
+        storage_kind = "sqlite"
+    elif REQUIRE_EXISTING_DATABASE:
+        storage_status = "persistence-unavailable"
+        storage_kind = "sqlite"
+    else:
+        storage_status = "migration-required"
+        storage_kind = "legacy-files"
     return {
-        "status": "ready" if Path(DEFAULT_DATABASE).exists() else "migration-required",
-        "storage": "sqlite" if Path(DEFAULT_DATABASE).exists() else "legacy-files",
+        "status": storage_status,
+        "storage": storage_kind,
         "message": "Opportunity Radar backend is running.",
     }
 
@@ -952,9 +966,16 @@ def start_maintenance_action(action: str, *, trigger_type: str = "manual") -> di
 
 
 def repository() -> OpportunityRepository:
-    if not Path(DEFAULT_DATABASE).exists():
+    if not Path(DEFAULT_DATABASE).is_file():
+        if REQUIRE_EXISTING_DATABASE:
+            raise HTTPException(
+                status_code=503,
+                detail="Required SQLite persistence is unavailable; verify the database mount.",
+            )
         raise HTTPException(status_code=503, detail="SQLite migration has not been applied. Run migrate-to-sqlite --apply.")
-    return OpportunityRepository(Path(DEFAULT_DATABASE))
+    return OpportunityRepository(
+        Path(DEFAULT_DATABASE), require_existing=REQUIRE_EXISTING_DATABASE
+    )
 
 
 def resume_match_service() -> ResumeMatchService:
@@ -1365,6 +1386,12 @@ def start_maintenance_scheduler() -> None:
     )
     if readiness.status_code == 503:
         logging.error("Opportunity Radar persistence is not ready; DB-backed startup services were not started.")
+        if REQUIRE_EXISTING_DATABASE:
+            raise RuntimeError(
+                "REQUIRE_EXISTING_DATABASE=true but the configured SQLite persistence is "
+                "missing or not ready; verify the persistent database mount and restore a "
+                "validated database."
+            )
         return
     reconcile_interrupted_runs(database_path)
     if APP_ENABLE_UTILITIES:

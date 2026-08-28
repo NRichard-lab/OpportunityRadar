@@ -30,15 +30,26 @@ LEFT JOIN resume_fit_results f ON f.resume_id='current' AND f.job_id=j.id"""
 
 
 class OpportunityRepository:
-    def __init__(self, database_path: Path, *, initialize: bool = False) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        initialize: bool = False,
+        require_existing: bool = False,
+    ) -> None:
         self.database_path = Path(database_path)
+        self.require_existing = require_existing
         if initialize:
             with self.connection() as connection:
                 initialize_schema(connection)
 
     @contextmanager
     def connection(self, *, readonly: bool = False) -> Iterator[sqlite3.Connection]:
-        connection = connect(self.database_path, readonly=readonly)
+        connection = connect(
+            self.database_path,
+            readonly=readonly,
+            require_existing=self.require_existing,
+        )
         try:
             with connection:
                 yield connection

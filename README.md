@@ -101,10 +101,12 @@ Writable paths can be configured with `APP_DATA_DIR`, `DATABASE_URL`, `APP_IMPOR
 `APP_EXPORT_DIR`, `APP_BACKUP_DIR`, and `APP_LOG_DIR`. Keep them outside an immutable application
 image in a future hosted deployment.
 
-For a subpath deployment, set the frontend build-time `VITE_BASE_PATH` to the same path as
-`APP_BASE_PATH`, including a trailing slash. For the documented production URL, build with
-`VITE_BASE_PATH=/OpportunityRadar/`; `APP_BASE_PATH` alone does not configure Vite unless it is
-exported into the frontend build process.
+For local or legacy subpath development, set the frontend build-time `VITE_BASE_PATH` to the same
+path as `APP_BASE_PATH`, including a trailing slash. The Phase 2 production architecture uses the
+dedicated `https://radar.blueashdigital.tech/` origin, so its immutable frontend is built with
+`VITE_BASE_PATH=/` and `APP_BASE_PATH` is empty. `APP_BASE_PATH` alone does not configure Vite unless
+it is exported into the frontend build process. See
+[the production container and persistence contract](docs/PRODUCTION_CONTAINERS.md).
 
 The first-release switches default off: `APP_ENABLE_BROWSER_JOBS`,
 `APP_ENABLE_COMPANY_REFRESH`, `APP_ENABLE_UTILITIES`, `APP_ENABLE_SCHEDULES`, and

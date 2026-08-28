@@ -1,6 +1,6 @@
 # Opportunity Radar production runtime contract
 
-Phase 1B supports a deliberately small first-release runtime. It does not authorize deployment by itself; Docker, persistent storage, portal launch/authentication handoff, and release operations remain separate work.
+Phase 2 supports a deliberately small first-release runtime. It does not authorize deployment by itself; portal launch/authentication handoff and release operations remain separate work. Container builds, storage, and backup/restore procedures are defined in [PRODUCTION_CONTAINERS.md](PRODUCTION_CONTAINERS.md).
 
 ## Process and identity boundary
 
@@ -24,9 +24,9 @@ APP_WRITE_FRONTEND_MIRRORS=false
 
 `frontend/public` must never receive production snapshots or runtime data.
 
-Build the frontend with `VITE_BASE_PATH=/OpportunityRadar/` when using the documented production
-launch path. Keep it aligned with `APP_BASE_PATH=/OpportunityRadar`; the Vite setting is consumed at
-build time and determines asset, client-route, and API URLs.
+Build the production frontend with `VITE_BASE_PATH=/` for the dedicated
+`https://radar.blueashdigital.tech/` origin. Keep `APP_BASE_PATH` empty. The Vite setting is consumed
+at build time and determines asset, client-route, and API URLs.
 
 ## Worker limits
 
@@ -40,12 +40,13 @@ API models, scheduled actions, collectors, discovery operations, and CLI entry p
 
 ## Persistent storage
 
-- Put `APP_DATA_DIR`, the SQLite database, imports, exports, backups, and logs on configured private writable paths outside the immutable application image.
+- Use the exact `/srv/opportunity-radar` host and `/var/lib/opportunity-radar` container mapping in the container contract. Put `APP_DATA_DIR`, the SQLite database, imports, exports, backups, and logs on configured private writable mounts outside the immutable application image.
 - SQLite must reside on one host's local SSD-backed persistent volume.
 - NFS, SMB, distributed/shared filesystems, and simultaneous mounts from multiple replicas are unsupported.
 - Do not expose data, import, export, backup, or log directories through the web server.
 - Keep `APP_WRITE_FRONTEND_MIRRORS=false` in production.
 - Set `DEPLOYMENT_VERSION` to the immutable release commit or image version.
+- Set `REQUIRE_EXISTING_DATABASE=true`. Production startup must fail if the database or required mount is missing, corrupt, or not writable; it must never create an empty replacement.
 
 ## Health contract
 

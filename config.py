@@ -56,6 +56,14 @@ APP_ENABLE_SCHEDULES = _read_bool("APP_ENABLE_SCHEDULES")
 APP_ENABLE_DISCOVERY = _read_bool("APP_ENABLE_DISCOVERY")
 APP_WRITE_FRONTEND_MIRRORS = _read_bool("APP_WRITE_FRONTEND_MIRRORS")
 
+# A production process must never turn a missing persistent mount into a new,
+# empty SQLite database.  Production defaults fail closed even if the setting
+# is accidentally omitted; development keeps the existing opt-in behavior so
+# explicit local initialization and migration commands can create a database.
+REQUIRE_EXISTING_DATABASE = _read_bool(
+    "REQUIRE_EXISTING_DATABASE", default=APP_ENV == "production"
+)
+
 # First-release in-process concurrency limits. Every caller is clamped to these
 # values; the global mutation gate still permits only one shared-data operation.
 APP_MAX_HTTP_WORKERS = _read_positive_int("APP_MAX_HTTP_WORKERS", default=4, maximum=32)

@@ -14,6 +14,7 @@ from openpyxl import Workbook
 
 from backend.import_security import (
     MAX_IMPORT_COLUMNS,
+    MAX_IMPORT_JSON_NESTING,
     _validate_xlsx_archive,
     stage_import_upload,
     validate_import_upload,
@@ -118,11 +119,20 @@ class ImportUploadSecurityTests(unittest.TestCase):
                 validate_import_upload("records.json", payload)
 
     def test_deeply_nested_json_is_reported_as_safe_malformed_input(self) -> None:
-        payload = (b"[" * 5_000) + b"{}" + (b"]" * 5_000)
+        payload = (b"[" * (MAX_IMPORT_JSON_NESTING + 1)) + b"{}" + (
+            b"]" * (MAX_IMPORT_JSON_NESTING + 1)
+        )
         with self.assertRaises(ValueError) as raised:
             validate_import_upload("records.json", payload)
         self.assertEqual(str(raised.exception), "The JSON import is malformed or could not be read.")
         self.assertIsInstance(raised.exception.__cause__, RecursionError)
+
+    def test_json_nesting_guard_ignores_brackets_inside_strings(self) -> None:
+        bracket_text = ("[" * (MAX_IMPORT_JSON_NESTING + 1)) + (
+            "]" * (MAX_IMPORT_JSON_NESTING + 1)
+        )
+        payload = json.dumps({"companies": [{"name": bracket_text}], "jobs": []}).encode()
+        self.assertEqual(validate_import_upload("records.json", payload), ".json")
 
     def test_json_decoder_value_error_is_reported_as_safe_malformed_input(self) -> None:
         secret_error = "numeric parser detail from C:/private/import.json"

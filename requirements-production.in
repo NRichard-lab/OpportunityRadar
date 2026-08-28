@@ -1,0 +1,15 @@
+# Runtime dependencies for the browser-disabled backend image.
+#
+# Playwright is intentionally absent. Browser-backed collectors import it lazily,
+# and every browser/discovery feature remains disabled for the first release.
+openpyxl>=3.1.0
+requests>=2.32.3
+beautifulsoup4>=4.12.0
+feedparser>=6.0.0
+tldextract>=5.1.0
+ddgs>=9.0.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+tzdata>=2025.2
+pypdf>=5.0.0
+python-docx>=1.1.0

@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import fields
 import re
-import shutil
-import sqlite3
-from datetime import datetime
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
@@ -14,13 +10,13 @@ from uuid import uuid4
 
 from bs4 import BeautifulSoup
 
+from backend.backup_restore import create_sqlite_backup
 from backend.exports import SnapshotExporter
-from backend.file_security import atomic_write_text
 from backend.import_security import enforce_record_limit, validate_staged_import
 from backend.migration import excel_company_to_api
 from backend.outbound_security import OutboundSecurityError, validate_outbound_url
 from backend.repository import OpportunityRepository, company_api_to_excel, utc_now
-from config import APP_ENABLE_BROWSER_JOBS
+from config import APP_ENABLE_BROWSER_JOBS, DEPLOYMENT_VERSION
 from excel_tools import read_company_rows
 from job_tools import JobRecord, enrich_job_record
 from main import enrich_company
@@ -204,29 +200,27 @@ def create_backup(
 ) -> dict[str, Any]:
     check_cancelled(cancelled)
     exporter.export_all(include_excel=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = Path(backup_root) / f"backup_{stamp}"
-    backup_dir.mkdir(parents=True, exist_ok=False)
-    sources = [
-        repository.database_path, exporter.master_path, exporter.companies_json_path,
-        exporter.jobs_json_path, exporter.applications_json_path,
-        repository.database_path.with_name(".email_secret.key"),
-    ]
-    entries = []
-    for index, source in enumerate(sources, start=1):
-        check_cancelled(cancelled)
-        progress(index, len(sources), source.name)
-        if not source.exists():
-            continue
-        destination = backup_dir / source.name
-        if source == repository.database_path:
-            with sqlite3.connect(source) as source_db, sqlite3.connect(destination) as destination_db:
-                source_db.backup(destination_db)
-        else:
-            shutil.copy2(source, destination)
-        entries.append({"file": source.name, "bytes": destination.stat().st_size, "sha256": sha256_file(destination)})
-    atomic_write_text(backup_dir / "manifest.json", json.dumps({"createdAt": utc_now(), "files": entries}, indent=2))
-    return {"backupDirectory": str(backup_dir), "filesBackedUp": len(entries)}
+    check_cancelled(cancelled)
+    # Snapshot JSON/XLSX exports are not database backups. The authoritative SQLite
+    # state is captured directly with SQLite's online backup API and validated before
+    # its artifact becomes visible.
+    result = create_sqlite_backup(
+        repository.database_path,
+        Path(backup_root),
+        deployment_version=DEPLOYMENT_VERSION,
+        additional_files={
+            source.name: source
+            for source in (
+                exporter.master_path,
+                exporter.companies_json_path,
+                exporter.jobs_json_path,
+                exporter.applications_json_path,
+                repository.database_path.with_name(".email_secret.key"),
+            )
+        },
+    )
+    progress(1, 1, repository.database_path.name)
+    return result
 
 
 def export_data(exporter: SnapshotExporter, progress: ProgressCallback, cancelled: Event) -> dict[str, Any]:
@@ -406,11 +400,3 @@ def discoverable_keys() -> tuple[str, ...]:
 def check_cancelled(cancelled: Event) -> None:
     if cancelled.is_set():
         raise UtilityCancelled("Cancelled by user.")
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
