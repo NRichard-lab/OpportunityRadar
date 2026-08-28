@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1.7
 
+FROM gcc:14-bookworm@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1 AS shim-builder
+
+WORKDIR /shim
+COPY docker/backend/browser-proxy-connect-shim.c ./browser-proxy-connect-shim.c
+RUN mkdir -p /out \
+    && gcc -std=c11 -O2 -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
+        -Wall -Wextra -Werror \
+        -Wl,-z,relro,-z,now,-z,noexecstack,-z,defs \
+        -shared -o /out/opportunity-radar-browser-connect-shim.so \
+        browser-proxy-connect-shim.c -ldl -pthread
+
 # Playwright 1.62.0 image for linux/amd64, pinned to the immutable platform
 # manifest containing Chromium 151.0.7922.34 (revision 1234) and its Linux
 # runtime dependencies.
@@ -25,6 +36,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234 \
     OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE=/ms-playwright/chromium-1234/chrome-linux64/chrome \
     OPPORTUNITY_RADAR_CHROMIUM_WRAPPER=/usr/local/bin/opportunity-radar-chromium-netns \
+    OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM=/usr/local/lib/opportunity-radar-browser-connect-shim.so \
     HOME=/tmp \
     XDG_CACHE_HOME=/tmp/.cache \
     DEPLOYMENT_VERSION="${DEPLOYMENT_VERSION}"
@@ -46,8 +58,10 @@ COPY --chown=${APP_UID}:${APP_GID} *.py ./
 COPY --chown=${APP_UID}:${APP_GID} backend/ ./backend/
 COPY --chown=${APP_UID}:${APP_GID} collectors/ ./collectors/
 COPY docker/backend/chromium-netns-wrapper /usr/local/bin/opportunity-radar-chromium-netns
+COPY --from=shim-builder /out/opportunity-radar-browser-connect-shim.so /usr/local/lib/opportunity-radar-browser-connect-shim.so
 
 RUN chmod 0555 /usr/local/bin/opportunity-radar-chromium-netns \
+    /usr/local/lib/opportunity-radar-browser-connect-shim.so \
     "${OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE}" \
     && test -x "${OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE}" \
     && python -c "import importlib.metadata as m; assert m.version('playwright') == '1.62.0'"

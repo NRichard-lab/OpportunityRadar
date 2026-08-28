@@ -14,6 +14,11 @@ class ContainerArtifactTests(unittest.TestCase):
         dockerfile = (ROOT / "docker" / "backend" / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn(
+            "FROM gcc:14-bookworm@sha256:"
+            "a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1 AS shim-builder",
+            dockerfile,
+        )
+        self.assertIn(
             "FROM mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:"
             "51d31fdfacb0cff99a1a724152e34ae408d2bd4e7da310ff157450f49261cc59",
             dockerfile,
@@ -26,8 +31,26 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234", dockerfile)
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_VERSION=151.0.7922.34", dockerfile)
         self.assertIn("opportunity-radar-chromium-netns", dockerfile)
+        self.assertIn("COPY docker/backend/browser-proxy-connect-shim.c", dockerfile)
+        self.assertIn("COPY --from=shim-builder", dockerfile)
+        self.assertIn(
+            "OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM=/usr/local/lib/"
+            "opportunity-radar-browser-connect-shim.so",
+            dockerfile,
+        )
+        self.assertIn("-Wl,-z,relro,-z,now,-z,noexecstack,-z,defs", dockerfile)
+        self.assertIn("/usr/local/lib/opportunity-radar-browser-connect-shim.so", dockerfile)
         wrapper = (ROOT / "docker" / "backend" / "chromium-netns-wrapper").read_text(encoding="utf-8")
         self.assertIn("--user --map-current-user --keep-caps", wrapper)
+        shim = (ROOT / "docker" / "backend" / "browser-proxy-connect-shim.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '#define RADAR_SHIM_VERSION "network_namespace_dns_pinned_proxy_v1"',
+            shim,
+        )
+        self.assertIn("opportunity_radar_browser_connect_shim_version", shim)
+        self.assertIn("address->sa_family == AF_INET || address->sa_family == AF_INET6", shim)
 
     def test_production_python_lock_is_exact_and_browser_pinned(self) -> None:
         lock = (ROOT / "requirements-production.txt").read_text(encoding="utf-8")
@@ -90,12 +113,53 @@ class ContainerArtifactTests(unittest.TestCase):
             and not rule.get("includes", {}).get("caps")
         ]
         self.assertEqual(unconditional_namespace_allows, [])
-        unshare_values = {
-            rule["args"][0]["value"]
+        exact_unshare_arguments = {
+            (rule["args"][0]["index"], rule["args"][0]["op"], rule["args"][0]["value"])
             for rule in profile["syscalls"]
             if rule.get("names") == ["unshare"] and rule.get("args")
         }
-        self.assertEqual(unshare_values, {268435456, 1073741824, 1342177280})
+        self.assertEqual(
+            exact_unshare_arguments,
+            {
+                (0, "SCMP_CMP_EQ", 268435456),
+                (0, "SCMP_CMP_EQ", 1073741824),
+                (0, "SCMP_CMP_EQ", 1342177280),
+            },
+        )
+        exact_clone_arguments = {
+            (rule["args"][0]["index"], rule["args"][0]["op"], rule["args"][0]["value"])
+            for rule in profile["syscalls"]
+            if rule.get("names") == ["clone"]
+            and rule.get("args")
+            and rule["args"][0].get("op") == "SCMP_CMP_EQ"
+        }
+        self.assertEqual(
+            exact_clone_arguments,
+            {
+                (0, "SCMP_CMP_EQ", 268435473),
+                (0, "SCMP_CMP_EQ", 536870929),
+                (0, "SCMP_CMP_EQ", 1879048209),
+            },
+        )
+        unconditional_chroot = [
+            rule
+            for rule in profile["syscalls"]
+            if rule.get("names") == ["chroot"]
+            and rule.get("action") == "SCMP_ACT_ALLOW"
+            and not rule.get("args")
+            and not rule.get("includes")
+        ]
+        self.assertEqual(len(unconditional_chroot), 1)
+
+    def test_browser_boundary_probe_tests_private_https_and_direct_connect_denial(self) -> None:
+        runner = (ROOT / "backend" / "browser_netns_runner.py").read_text(encoding="utf-8")
+        outbound = (ROOT / "backend" / "outbound_security.py").read_text(encoding="utf-8")
+
+        self.assertIn("CONNECT 127.0.0.1:443", runner)
+        self.assertIn("CONNECT 127.0.0.1:443", outbound)
+        self.assertNotIn("CONNECT 127.0.0.1:80", runner)
+        self.assertNotIn("CONNECT 127.0.0.1:80", outbound)
+        self.assertIn("direct_blocked = exc.errno == errno.EACCES", runner)
 
     def test_production_environment_is_safe_template_only(self) -> None:
         template = (ROOT / "deploy" / "opportunity-radar.env.example").read_text(encoding="utf-8")

@@ -82,6 +82,7 @@ class BrowserRuntimeBoundary:
     chromium_version: str
     chromium_executable: str
     wrapper_executable: str
+    connect_shim: str
     unshare_executable: str
     unix_socket: str
     proxy_port: int
@@ -806,16 +807,18 @@ def validate_browser_runtime_boundary() -> BrowserRuntimeBoundary:
         raise BrowserEgressConfigurationError("The unshare executable required for network isolation is unavailable.")
 
     wrapper = _validated_browser_wrapper(unshare)
+    connect_shim = _validated_browser_connect_shim()
     with _browser_boundary_lock:
         directory, unix_socket = _ensure_browser_boundary_files()
         _ensure_browser_proxy_process(directory, unix_socket)
-        _probe_browser_network_namespace(wrapper, unix_socket, chromium_executable)
+        _probe_browser_network_namespace(wrapper, unix_socket, chromium_executable, connect_shim)
     return BrowserRuntimeBoundary(
         playwright_version=playwright_version,
         chromium_revision=revision,
         chromium_version=chromium_version,
         chromium_executable=chromium_executable,
         wrapper_executable=str(wrapper),
+        connect_shim=str(connect_shim),
         unshare_executable=unshare,
         unix_socket=str(unix_socket),
         proxy_port=BROWSER_PROXY_PORT,
@@ -915,6 +918,45 @@ def _validated_browser_wrapper(unshare: str) -> Path:
     return wrapper
 
 
+def _validated_browser_connect_shim() -> Path:
+    configured = os.environ.get("OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM", "").strip()
+    if not configured:
+        raise BrowserEgressConfigurationError("The immutable browser connect shim is not configured.")
+    shim = Path(configured)
+    try:
+        metadata = shim.stat()
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("The browser connect shim is unavailable.") from exc
+    if (
+        not shim.is_file()
+        or not os.access(shim, os.R_OK)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o222
+    ):
+        raise BrowserEgressConfigurationError("Browser connect shim ownership or permissions are unsafe.")
+    version_script = (
+        "import ctypes,sys; "
+        "library=ctypes.CDLL(sys.argv[1]); "
+        "function=library.opportunity_radar_browser_connect_shim_version; "
+        "function.restype=ctypes.c_char_p; "
+        "print(function().decode('ascii'))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", version_script, str(shim)],
+            env=_sanitized_process_environment(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BrowserEgressConfigurationError("The browser connect shim could not be verified.") from exc
+    if result.stdout.strip() != BROWSER_EGRESS_MODE:
+        raise BrowserEgressConfigurationError("The browser connect shim version is not approved.")
+    return shim
+
+
 def _ensure_browser_boundary_files() -> tuple[Path, Path]:
     global _browser_boundary_directory
     if _browser_boundary_directory is None:
@@ -995,7 +1037,7 @@ def _require_browser_proxy_ready(runtime: BrowserRuntimeBoundary) -> None:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(2.0)
                 probe.connect(str(unix_socket))
-                probe.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+                probe.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
                 response = probe.recv(256)
         except OSError as exc:
             raise BrowserEgressConfigurationError("Browser egress proxy health check failed.") from exc
@@ -1003,10 +1045,16 @@ def _require_browser_proxy_ready(runtime: BrowserRuntimeBoundary) -> None:
             raise BrowserEgressConfigurationError("Browser egress proxy did not enforce private-address denial.")
 
 
-def _probe_browser_network_namespace(wrapper: Path, unix_socket: Path, chromium_executable: str) -> None:
+def _probe_browser_network_namespace(
+    wrapper: Path,
+    unix_socket: Path,
+    chromium_executable: str,
+    connect_shim: Path,
+) -> None:
     environment = _browser_boundary_environment(
         unix_socket=str(unix_socket),
         real_executable=chromium_executable,
+        connect_shim=str(connect_shim),
     )
     try:
         result = subprocess.run(
@@ -1029,6 +1077,7 @@ def _browser_child_environment(runtime: BrowserRuntimeBoundary) -> dict[str, str
     return _browser_boundary_environment(
         unix_socket=runtime.unix_socket,
         real_executable=runtime.chromium_executable,
+        connect_shim=runtime.connect_shim,
     )
 
 
@@ -1036,10 +1085,12 @@ def _browser_boundary_environment(
     *,
     unix_socket: str,
     real_executable: str,
+    connect_shim: str,
 ) -> dict[str, str]:
     environment = _sanitized_process_environment()
     environment.update({
         "OPPORTUNITY_RADAR_BROWSER_PARENT_NETNS": _browser_parent_netns_inode(),
+        "OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM": connect_shim,
         "OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET": unix_socket,
         "OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE": real_executable,
     })
