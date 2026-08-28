@@ -14,11 +14,6 @@ class ContainerArtifactTests(unittest.TestCase):
         dockerfile = (ROOT / "docker" / "backend" / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn(
-            "FROM gcc:14-bookworm@sha256:"
-            "a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1 AS shim-builder",
-            dockerfile,
-        )
-        self.assertIn(
             "FROM mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:"
             "51d31fdfacb0cff99a1a724152e34ae408d2bd4e7da310ff157450f49261cc59",
             dockerfile,
@@ -31,26 +26,8 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234", dockerfile)
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_VERSION=151.0.7922.34", dockerfile)
         self.assertIn("opportunity-radar-chromium-netns", dockerfile)
-        self.assertIn("COPY docker/backend/browser-proxy-connect-shim.c", dockerfile)
-        self.assertIn("COPY --from=shim-builder", dockerfile)
-        self.assertIn(
-            "OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM=/usr/local/lib/"
-            "opportunity-radar-browser-connect-shim.so",
-            dockerfile,
-        )
-        self.assertIn("-Wl,-z,relro,-z,now,-z,noexecstack,-z,defs", dockerfile)
-        self.assertIn("/usr/local/lib/opportunity-radar-browser-connect-shim.so", dockerfile)
         wrapper = (ROOT / "docker" / "backend" / "chromium-netns-wrapper").read_text(encoding="utf-8")
         self.assertIn("--user --map-current-user --keep-caps", wrapper)
-        shim = (ROOT / "docker" / "backend" / "browser-proxy-connect-shim.c").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            '#define RADAR_SHIM_VERSION "network_namespace_dns_pinned_proxy_v1"',
-            shim,
-        )
-        self.assertIn("opportunity_radar_browser_connect_shim_version", shim)
-        self.assertIn("address->sa_family == AF_INET || address->sa_family == AF_INET6", shim)
 
     def test_production_python_lock_is_exact_and_browser_pinned(self) -> None:
         lock = (ROOT / "requirements-production.txt").read_text(encoding="utf-8")
@@ -159,7 +136,11 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("CONNECT 127.0.0.1:443", outbound)
         self.assertNotIn("CONNECT 127.0.0.1:80", runner)
         self.assertNotIn("CONNECT 127.0.0.1:80", outbound)
-        self.assertIn("direct_blocked = exc.errno == errno.EACCES", runner)
+        self.assertIn("errno.ENETUNREACH", runner)
+        self.assertIn("Browser namespace allowed direct Internet egress", runner)
+        self.assertIn('listener.bind(("127.0.0.1", self._port))', runner)
+        self.assertIn("MAX_RELAY_CONNECTIONS = 32", runner)
+        self.assertIn("EXCLUDE 127.0.0.1", outbound)
 
     def test_production_environment_is_safe_template_only(self) -> None:
         template = (ROOT / "deploy" / "opportunity-radar.env.example").read_text(encoding="utf-8")

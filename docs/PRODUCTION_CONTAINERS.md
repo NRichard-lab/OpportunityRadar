@@ -149,6 +149,15 @@ non-root UID/GID 10001 remain in force. Do not use `seccomp=unconfined`, `SYS_AD
 veth interface, or a default route in the child namespace. The profile SHA-256 for this release is
 recorded with the release artifacts and must be revalidated after edits.
 
+When browser jobs are enabled, Chromium runs in that route-less child network namespace. Its only
+usable endpoint is a bounded loopback TCP relay, which forwards over an owner-only Unix socket to
+the parent DNS-pinning proxy. Chromium's resolver rules deny ordinary in-process resolution while
+excluding only the numeric loopback proxy address. The parent proxy independently resolves every
+requested host, rejects any non-public result, and connects to the validated numeric address; TLS
+remains end to end through a port-443-only CONNECT tunnel. A process-wide lease and the single
+Uvicorn worker enforce one browser instance. This boundary provides browser egress isolation; it
+does not claim a separate browser UID, PID namespace, or mount namespace from the backend.
+
 The production Compose file publishes no host ports. Future Caddy must join `blueash-edge` and use
 the reviewed `deploy/Caddyfile.example` only after a separate production change approval.
 

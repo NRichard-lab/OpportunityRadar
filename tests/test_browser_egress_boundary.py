@@ -147,7 +147,6 @@ class ProtectedBrowserLaunchTests(unittest.TestCase):
             chromium_version="151.0.7922.34",
             chromium_executable="/ms-playwright/chromium-1234/chrome-linux64/chrome",
             wrapper_executable="/usr/local/bin/opportunity-radar-chromium-netns",
-            connect_shim="/usr/local/lib/opportunity-radar-browser-connect-shim.so",
             unshare_executable="/usr/bin/unshare",
             unix_socket="/tmp/radar-browser-test/egress.sock",
             proxy_port=BROWSER_PROXY_PORT,
@@ -177,12 +176,11 @@ class ProtectedBrowserLaunchTests(unittest.TestCase):
         self.assertTrue(options["chromium_sandbox"])
         self.assertIn(f"--proxy-server=http://127.0.0.1:{BROWSER_PROXY_PORT}", options["args"])
         self.assertIn("--proxy-bypass-list=<-loopback>", options["args"])
-        self.assertIn("--host-resolver-rules=MAP * ~NOTFOUND", options["args"])
-        self.assertNotIn("proxy", options)
-        self.assertEqual(
-            options["env"]["OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM"],
-            self.runtime.connect_shim,
+        self.assertIn(
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+            options["args"],
         )
+        self.assertNotIn("proxy", options)
         for secret_name in ("BLUEASH_AUTH_CLIENT_SECRET", "OPPORTUNITY_RADAR_SECRET_KEY", "DATABASE_URL"):
             self.assertNotIn(secret_name, options["env"])
         browser.close()

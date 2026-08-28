@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import signal
@@ -7,10 +8,12 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
 BROWSER_PROXY_PORT = 17654
+MAX_RELAY_CONNECTIONS = 32
 _SIOCGIFFLAGS = 0x8913
 _SIOCSIFFLAGS = 0x8914
 _IFF_UP = 0x1
@@ -21,14 +24,86 @@ class NetworkNamespaceBoundaryError(RuntimeError):
     """The browser network namespace could not be established safely."""
 
 
+class _UnixProxyRelay:
+    def __init__(self, socket_path: str, port: int) -> None:
+        self._socket_path = socket_path
+        self._port = port
+        self._stop = threading.Event()
+        self._listener: socket.socket | None = None
+        self._connections = threading.BoundedSemaphore(MAX_RELAY_CONNECTIONS)
+        self._threads: set[threading.Thread] = set()
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", self._port))
+        listener.listen(MAX_RELAY_CONNECTIONS)
+        listener.settimeout(0.5)
+        self._listener = listener
+        worker = threading.Thread(target=self._accept, daemon=True)
+        worker.start()
+        with self._lock:
+            self._threads.add(worker)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+        with self._lock:
+            workers = tuple(self._threads)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=1.0)
+
+    def _accept(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    client, _ = self._listener.accept()  # type: ignore[union-attr]
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                    raise
+                if not self._connections.acquire(blocking=False):
+                    client.close()
+                    continue
+                worker = threading.Thread(target=self._relay, args=(client,), daemon=True)
+                worker.start()
+                with self._lock:
+                    self._threads.add(worker)
+        finally:
+            with self._lock:
+                self._threads.discard(threading.current_thread())
+
+    def _relay(self, client: socket.socket) -> None:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            upstream.settimeout(10.0)
+            upstream.connect(self._socket_path)
+            _copy_bidirectionally(client, upstream)
+        finally:
+            client.close()
+            upstream.close()
+            self._connections.release()
+            with self._lock:
+                self._threads.discard(threading.current_thread())
+
+
 def _inner(browser_args: list[str]) -> int:
     real_executable = _required_environment("OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE")
-    connect_shim = _required_environment("OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM")
-    _required_environment("OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET")
+    unix_socket = _required_environment("OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET")
     parent_netns = _required_environment("OPPORTUNITY_RADAR_BROWSER_PARENT_NETNS")
     _bring_loopback_up()
     _require_isolated_namespace(parent_netns)
     _require_loopback_only_routes()
+    relay = _UnixProxyRelay(unix_socket, BROWSER_PROXY_PORT)
+    relay.start()
     watchdog_read, watchdog_write = os.pipe()
     os.set_inheritable(watchdog_write, False)
     watchdog = subprocess.Popen(
@@ -43,17 +118,16 @@ def _inner(browser_args: list[str]) -> int:
     )
     os.close(watchdog_read)
     try:
-        browser_environment = dict(os.environ)
-        browser_environment["LD_PRELOAD"] = connect_shim
         child = subprocess.Popen(
             [real_executable, *browser_args],
             close_fds=False,
-            env=browser_environment,
+            env=dict(os.environ),
             start_new_session=True,
         )
     except BaseException:
         os.close(watchdog_write)
         watchdog.wait(timeout=2.0)
+        relay.stop()
         raise
     try:
         os.write(watchdog_write, f"{child.pid}\n".encode("ascii"))
@@ -65,6 +139,7 @@ def _inner(browser_args: list[str]) -> int:
         child.wait(timeout=2.0)
         os.close(watchdog_write)
         watchdog.wait(timeout=2.0)
+        relay.stop()
         raise NetworkNamespaceBoundaryError("Chromium process-group watchdog failed closed.") from exc
 
     def forward(signum: int, _frame: object) -> None:
@@ -85,50 +160,36 @@ def _inner(browser_args: list[str]) -> int:
         except subprocess.TimeoutExpired:
             watchdog.kill()
             watchdog.wait(timeout=2.0)
+        relay.stop()
 
 
 def _probe() -> int:
-    _required_environment("OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET")
-    connect_shim = _required_environment("OPPORTUNITY_RADAR_BROWSER_CONNECT_SHIM")
+    unix_socket = _required_environment("OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET")
     parent_netns = _required_environment("OPPORTUNITY_RADAR_BROWSER_PARENT_NETNS")
     _bring_loopback_up()
     _require_isolated_namespace(parent_netns)
     _require_loopback_only_routes()
-    probe_environment = dict(os.environ)
-    probe_environment["LD_PRELOAD"] = connect_shim
-    probe_script = f"""
-import errno
-import socket
-
-proxy = socket.create_connection(("127.0.0.1", {BROWSER_PROXY_PORT}), timeout=2.0)
-proxy.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\\r\\nHost: 127.0.0.1:443\\r\\n\\r\\n")
-response = proxy.recv(256)
-proxy.close()
-
-direct = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-direct.settimeout(1.0)
-try:
-    direct.connect(("1.1.1.1", 443))
-except OSError as exc:
-    direct_blocked = exc.errno == errno.EACCES
-else:
-    direct_blocked = False
-finally:
-    direct.close()
-
-raise SystemExit(0 if response.startswith(b"HTTP/1.1 403 ") and direct_blocked else 1)
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", probe_script],
-        env=probe_environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5.0,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise NetworkNamespaceBoundaryError("Browser connect shim or private-address denial failed closed.")
+    relay = _UnixProxyRelay(unix_socket, BROWSER_PROXY_PORT)
+    relay.start()
+    try:
+        with socket.create_connection(("127.0.0.1", BROWSER_PROXY_PORT), timeout=2.0) as proxy:
+            proxy.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            response = proxy.recv(256)
+        if not response.startswith(b"HTTP/1.1 403 "):
+            raise NetworkNamespaceBoundaryError("Private destination was not denied by the outer proxy.")
+        direct = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        direct.settimeout(1.0)
+        try:
+            direct.connect(("1.1.1.1", 443))
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.ENETUNREACH, errno.EHOSTUNREACH}:
+                raise NetworkNamespaceBoundaryError("Direct browser egress failed with an unexpected result.") from exc
+        else:
+            raise NetworkNamespaceBoundaryError("Browser namespace allowed direct Internet egress.")
+        finally:
+            direct.close()
+    finally:
+        relay.stop()
     return 0
 
 
@@ -178,6 +239,31 @@ def _require_loopback_only_routes() -> None:
                 raise NetworkNamespaceBoundaryError("Browser namespace contains a malformed IPv6 route.") from exc
             if not flags & _RTF_REJECT:
                 raise NetworkNamespaceBoundaryError("Browser namespace contains a usable IPv6 default route.")
+
+
+def _copy_bidirectionally(left: socket.socket, right: socket.socket) -> None:
+    stop = threading.Event()
+
+    def copy(source: socket.socket, target: socket.socket) -> None:
+        try:
+            while not stop.is_set():
+                payload = source.recv(64 * 1024)
+                if not payload:
+                    break
+                target.sendall(payload)
+        except OSError:
+            pass
+        finally:
+            stop.set()
+            try:
+                target.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    reverse = threading.Thread(target=copy, args=(right, left), daemon=True)
+    reverse.start()
+    copy(left, right)
+    reverse.join(timeout=1.0)
 
 
 def _watch_process_group(descriptor: int) -> int:
