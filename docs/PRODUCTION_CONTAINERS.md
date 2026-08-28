@@ -1,9 +1,8 @@
 # Opportunity Radar production containers and persistence
 
-This is the Phase 2 deployment contract for Opportunity Radar. It defines build artifacts,
-persistent storage, backup/restore, and local validation. It is not authorization to deploy.
-Portal authentication handoff is intentionally deferred to Phase 3, so the production environment
-template fails closed with the not-yet-supported `AUTH_MODE=portal_handoff` value.
+This document defines Opportunity Radar build artifacts, persistent storage, backup/restore, and
+local validation. It is not authorization to deploy. The production environment uses the reviewed
+`AUTH_MODE=portal_handoff` contract documented in `BLUEASH_AUTH_INTEGRATION.md`.
 
 ## Architecture
 
@@ -22,7 +21,7 @@ is built for the root path at `https://radar.blueashdigital.tech/`.
 The backend image uses Python 3.12 on Debian Bookworm, runs as UID/GID 10001, and starts exactly:
 
 ```text
-uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1 --no-access-log
 ```
 
 The frontend build stage uses Node 22 and `npm ci`; its runtime uses unprivileged Nginx as UID/GID
@@ -105,8 +104,8 @@ Do not use mutable production tags such as `latest`. The backend image label and
 
 Copy `deploy/opportunity-radar.env.example` to a root-readable protected file outside the checkout,
 replace every placeholder, and set mode 0600. Do not commit or bake that file into an image.
-`AUTH_MODE=portal_handoff` is a Phase 3 placeholder and is deliberately unsupported today; do not
-start production until Phase 3 implements and validates the handoff.
+Register the Radar client and apply the matching Portal migration before starting Radar. Keep both
+handoff secrets outside Git and validate the exact production origins and callback before rollout.
 
 Before first startup, place an already migrated and validated database at:
 
@@ -127,7 +126,7 @@ storage, or failed database write probes terminate startup. If the database late
 health becomes unhealthy and runtime connections use SQLite `mode=rw`, which cannot create a new
 file.
 
-After Phase 3 and a reviewed release authorization, the intended operator sequence is:
+After a reviewed release authorization, the intended operator sequence is:
 
 ```sh
 export OPPORTUNITY_RADAR_RELEASE_SHA=<full-release-commit-sha>

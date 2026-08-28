@@ -14,10 +14,11 @@ interface DashboardProps {
   error: string;
   onRetry: () => void;
   onNavigate: (tab: string) => void;
-  onRematch: (jobId: string) => Promise<Job>;
+  onRematch?: (jobId: string) => Promise<Job>;
+  canAdminister: boolean;
 }
 
-export function Dashboard({ companies, jobs, status, error, onRetry, onNavigate, onRematch }: DashboardProps) {
+export function Dashboard({ companies, jobs, status, error, onRetry, onNavigate, onRematch, canAdminister }: DashboardProps) {
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   if (status === "loading") return <div className="panel p-8 text-center text-slate-400" role="status">Loading dashboard data...</div>;
   if (status === "error") return <div className="panel p-8 text-center" role="alert"><h3 className="text-lg font-semibold text-white">Dashboard data is unavailable</h3><p className="mt-2 text-sm text-red-300">{error || "Dashboard data could not be loaded."}</p><button className="btn mt-5" type="button" onClick={onRetry}>Retry</button></div>;
@@ -27,10 +28,10 @@ export function Dashboard({ companies, jobs, status, error, onRetry, onNavigate,
   const applications = jobs.filter((job) => job.applied).length;
 
   return <div className="space-y-6">
-    <section className="grid gap-4 sm:grid-cols-3" aria-label="Opportunity summary">
+    <section className={`grid gap-4 ${canAdminister ? "sm:grid-cols-3" : "sm:grid-cols-2"}`} aria-label="Opportunity summary">
       <StatCard label="Companies" value={companies.length} onClick={() => onNavigate("Companies")} />
       <StatCard label="Current Jobs" value={currentJobs.length} onClick={() => onNavigate("Job List")} />
-      <StatCard label="Applications" value={applications} onClick={() => onNavigate("Jobs Applied For")} />
+      {canAdminister ? <StatCard label="Applications" value={applications} onClick={() => onNavigate("Jobs Applied For")} /> : null}
     </section>
 
     <section className="panel overflow-hidden">

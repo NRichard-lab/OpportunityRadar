@@ -21,8 +21,11 @@ import server
 
 CONFIG_KEYS = {
     "APP_ENV", "DEPLOYMENT_VERSION", "AUTH_MODE", "APP_BASE_PATH", "APP_PUBLIC_URL", "APP_TRUSTED_ADMIN_USER_ID",
-    "BLUEASH_API_URL", "BLUEASH_LOGIN_URL", "BLUEASH_SESSION_COOKIE", "BLUEASH_COOKIE_DOMAIN",
-    "BLUEASH_APP_SLUG", "APP_ENABLE_BROWSER_JOBS", "APP_ENABLE_COMPANY_REFRESH",
+    "BLUEASH_PORTAL_PUBLIC_URL", "BLUEASH_PORTAL_API_URL", "BLUEASH_AUTH_CLIENT_ID",
+    "BLUEASH_AUTH_CLIENT_SECRET", "OPPORTUNITY_RADAR_SECRET_KEY", "RADAR_SESSION_COOKIE_NAME",
+    "RADAR_SESSION_IDLE_SECONDS", "RADAR_SESSION_ABSOLUTE_MAX_SECONDS",
+    "RADAR_INTROSPECTION_CACHE_SECONDS", "RADAR_HANDOFF_STATE_TTL_SECONDS",
+    "APP_ENABLE_BROWSER_JOBS", "APP_ENABLE_COMPANY_REFRESH",
     "APP_ENABLE_UTILITIES", "APP_ENABLE_SCHEDULES", "APP_ENABLE_DISCOVERY",
     "APP_WRITE_FRONTEND_MIRRORS", "APP_DATA_DIR", "APP_IMPORT_DIR", "APP_EXPORT_DIR",
     "APP_OUTPUT_DIR", "APP_BACKUP_DIR", "APP_LOG_DIR", "DATABASE_URL",
@@ -34,7 +37,7 @@ TRUSTED_ID = "17f975f1-e63a-4daa-985a-82d39ed60684"
 
 class ProductionConfigurationTests(unittest.TestCase):
     def test_missing_and_unknown_environment_fail_closed(self) -> None:
-        for values in ({}, {"APP_ENV": "prodution", "AUTH_MODE": "blueash"}):
+        for values in ({}, {"APP_ENV": "prodution", "AUTH_MODE": "portal_handoff"}):
             with self.subTest(values=values):
                 result = run_validation(values)
                 self.assertNotEqual(result.returncode, 0)
@@ -67,7 +70,7 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("loopback", invalid.stderr)
 
-    def test_valid_production_blueash_configuration_succeeds(self) -> None:
+    def test_valid_production_portal_handoff_configuration_succeeds(self) -> None:
         result = run_validation(valid_production_environment())
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -95,10 +98,11 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertEqual(development.returncode, 0, development.stderr)
         self.assertEqual(development.stdout.strip(), "false")
 
-    def test_every_required_blueash_setting_is_explicit(self) -> None:
+    def test_every_required_portal_handoff_setting_is_explicit(self) -> None:
         required = {
-            "APP_PUBLIC_URL", "BLUEASH_API_URL", "BLUEASH_LOGIN_URL",
-            "BLUEASH_SESSION_COOKIE", "BLUEASH_APP_SLUG",
+            "APP_PUBLIC_URL", "BLUEASH_PORTAL_PUBLIC_URL", "BLUEASH_PORTAL_API_URL",
+            "BLUEASH_AUTH_CLIENT_ID", "BLUEASH_AUTH_CLIENT_SECRET",
+            "OPPORTUNITY_RADAR_SECRET_KEY",
         }
         for name in required:
             values = valid_production_environment()
@@ -110,9 +114,9 @@ class ProductionConfigurationTests(unittest.TestCase):
 
     def test_production_urls_trusted_id_and_public_mirrors_are_validated(self) -> None:
         cases = [
-            ("APP_PUBLIC_URL", "http://radar.example.com"),
-            ("BLUEASH_API_URL", "http://api.example.com"),
-            ("BLUEASH_LOGIN_URL", "http://portal.example.com/login"),
+            ("APP_PUBLIC_URL", "https://radar.example.com"),
+            ("BLUEASH_PORTAL_API_URL", "https://api.example.com"),
+            ("BLUEASH_PORTAL_PUBLIC_URL", "https://portal.example.com"),
             ("APP_TRUSTED_ADMIN_USER_ID", "not-a-uuid"),
             ("APP_WRITE_FRONTEND_MIRRORS", "true"),
         ]
@@ -259,18 +263,20 @@ class RoutePolicyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [True, True])
 
-    def test_session_rejects_an_authenticated_untrusted_user(self) -> None:
+    def test_session_accepts_assigned_identity_without_granting_admin(self) -> None:
         identity = BlueAshIdentity(
             id="bceda542-92f0-46b6-9bc8-38a67c3ba272", username="other-admin",
             email="other@example.com", display_name="Other", role="ADMINISTRATOR", permissions=(),
         )
-        request = SimpleNamespace(cookies={"blueash_session": "opaque"})
+        request = SimpleNamespace(cookies={"__Host-opportunity_radar_session": "opaque"})
         with patch.object(server, "APP_ENV", "production"), patch.object(
-            server.BlueAshAuthClient, "authenticate", return_value=identity
+            server._portal_auth_client, "authenticate", return_value=identity
+        ), patch.object(
+            server, "RADAR_SESSION_COOKIE_NAME", "__Host-opportunity_radar_session"
         ), patch.object(server, "is_trusted_initial_administrator", return_value=False):
-            with self.assertRaises(HTTPException) as caught:
-                server.auth_session_endpoint(request)
-        self.assertEqual(caught.exception.status_code, 403)
+            response = server.auth_session_endpoint(request)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(json.loads(response.body)["canAdminister"])
 
     def test_admin_dependency_denies_ordinary_user_and_accepts_admin(self) -> None:
         user = BlueAshIdentity(
@@ -340,14 +346,21 @@ class PublicMirrorTests(unittest.TestCase):
 
 def valid_production_environment() -> dict[str, str]:
     return {
-        "APP_ENV": "production", "AUTH_MODE": "blueash",
-        "APP_PUBLIC_URL": "https://blueashdigital.tech/OpportunityRadar",
-        "BLUEASH_API_URL": "https://api.blueashdigital.tech",
-        "BLUEASH_LOGIN_URL": "https://blueashdigital.tech/",
-        "BLUEASH_SESSION_COOKIE": "blueash_session",
-        "BLUEASH_APP_SLUG": "opportunity-radar",
+        "APP_ENV": "production", "AUTH_MODE": "portal_handoff",
+        "APP_PUBLIC_URL": "https://radar.blueashdigital.tech",
+        "BLUEASH_PORTAL_PUBLIC_URL": "https://blueashdigital.tech",
+        "BLUEASH_PORTAL_API_URL": "https://api.blueashdigital.tech",
+        "BLUEASH_AUTH_CLIENT_ID": "opportunity-radar",
+        "BLUEASH_AUTH_CLIENT_SECRET": "production-client-secret-with-more-than-32-characters",
+        "OPPORTUNITY_RADAR_SECRET_KEY": "production-radar-secret-with-more-than-32-characters",
+        "RADAR_SESSION_COOKIE_NAME": "__Host-opportunity_radar_session",
+        "RADAR_SESSION_IDLE_SECONDS": "1800",
+        "RADAR_SESSION_ABSOLUTE_MAX_SECONDS": "28800",
+        "RADAR_INTROSPECTION_CACHE_SECONDS": "0",
+        "RADAR_HANDOFF_STATE_TTL_SECONDS": "300",
         "APP_TRUSTED_ADMIN_USER_ID": TRUSTED_ID,
         "APP_WRITE_FRONTEND_MIRRORS": "false",
+        "REQUIRE_EXISTING_DATABASE": "true",
     }
 
 

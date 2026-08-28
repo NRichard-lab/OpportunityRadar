@@ -10,9 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, SecretStr
@@ -23,14 +24,24 @@ from backend.import_security import stage_import_upload
 from backend.blueash_auth import (
     BlueAshAuthenticationError,
     BlueAshAuthorizationError,
-    BlueAshAuthClient,
     BlueAshConfigurationError,
     BlueAshIdentity,
     BlueAshUnavailableError,
-    blueash_auth_enabled,
+    PortalHandoffClient,
+    auth_start_url,
+    build_authorize_url,
+    clear_handoff_cookie,
+    clear_session_cookie,
+    consume_handoff_cookie,
+    create_handoff_attempt,
+    handoff_cookie_name,
     is_administrator,
     is_trusted_initial_administrator,
-    login_url,
+    portal_handoff_enabled,
+    portal_root_url,
+    safe_return_path,
+    set_handoff_cookie,
+    set_session_cookie,
     validate_auth_configuration,
 )
 from backend.email_service import EmailConfigurationError, EmailDeliveryError, EmailService
@@ -63,9 +74,8 @@ from config import (
     APP_MAX_HTTP_WORKERS,
     APP_PUBLIC_ORIGIN,
     APP_WRITE_FRONTEND_MIRRORS,
+    AUTH_MODE,
     BACKUP_DIR,
-    BLUEASH_COOKIE_DOMAIN,
-    BLUEASH_SESSION_COOKIE,
     DATA_DIR,
     DEFAULT_APPLICATIONS_JSON,
     DEFAULT_DATABASE,
@@ -81,6 +91,7 @@ from config import (
     LOG_DIR,
     MAX_IMPORT_UPLOAD_BYTES,
     MAX_RESUME_UPLOAD_BYTES,
+    RADAR_SESSION_COOKIE_NAME,
     REQUIRE_EXISTING_DATABASE,
     feature_flags_payload,
 )
@@ -100,6 +111,14 @@ _utility_run_manager: UtilityRunManager | None = None
 _maintenance_scheduler: MaintenanceScheduler | None = None
 _service_initialization_lock = RLock()
 _health_readiness_cache = ReadinessCache()
+_portal_auth_client = PortalHandoffClient()
+_PUBLIC_API_PATHS = frozenset({
+    "/api/health",
+    "/api/auth/start",
+    "/api/auth/callback",
+    "/api/auth/session",
+    "/api/auth/logout",
+})
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(filter(None, [APP_PUBLIC_ORIGIN, "http://127.0.0.1:5173", "http://localhost:5173"])),
@@ -223,31 +242,42 @@ def scheduler() -> MaintenanceScheduler:
 @app.middleware("http")
 async def production_security(request: Request, call_next: Callable[..., Any]) -> Response:
     path = request.url.path
-    if path.startswith("/api") and not path.startswith("/api/auth/") and path != "/api/health":
+    if path.startswith("/api") and path not in _PUBLIC_API_PATHS:
         try:
             identity = await run_in_threadpool(
-                BlueAshAuthClient().authenticate,
-                request.cookies.get(BLUEASH_SESSION_COOKIE, ""),
+                _portal_auth_client.authenticate,
+                request.cookies.get(RADAR_SESSION_COOKIE_NAME, ""),
             )
         except BlueAshAuthenticationError as exc:
-            return JSONResponse({"detail": str(exc), "loginUrl": login_url()}, status_code=401)
+            response = JSONResponse(
+                {"detail": {"message": str(exc), "loginUrl": auth_start_url()}},
+                status_code=401,
+            )
+            clear_session_cookie(response)
+            return _apply_security_headers(response)
         except BlueAshAuthorizationError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=403)
+            return _apply_security_headers(JSONResponse({"detail": str(exc)}, status_code=403))
         except BlueAshUnavailableError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=503)
+            return _apply_security_headers(JSONResponse({"detail": str(exc)}, status_code=503))
         except BlueAshConfigurationError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=503)
-        if APP_ENV == "production" and not is_trusted_initial_administrator(identity):
-            return JSONResponse({"detail": "Opportunity Radar is restricted to the trusted administrator."}, status_code=403)
+            return _apply_security_headers(JSONResponse({"detail": str(exc)}, status_code=503))
         request.state.identity = identity
         request.state.user = identity.as_dict()
-    if blueash_auth_enabled() and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+    if portal_handoff_enabled() and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin", "").rstrip("/")
-        if origin and origin != APP_PUBLIC_ORIGIN:
-            return JSONResponse({"detail": "Request origin is not allowed."}, status_code=403)
+        if origin != APP_PUBLIC_ORIGIN:
+            return _apply_security_headers(
+                JSONResponse({"detail": "Request origin is not allowed."}, status_code=403)
+            )
     response = await call_next(request)
+    return _apply_security_headers(response)
+
+
+def _apply_security_headers(response: Response) -> Response:
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
+    # Authorization codes arrive on a GET callback. Never allow that URL to be
+    # propagated as a Referer during the immediate cleanup redirect.
+    response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Frame-Options"] = "DENY"
     if APP_ENV == "production":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -352,39 +382,193 @@ def health_endpoint() -> JSONResponse:
     )
 
 
+@app.get("/api/auth/start")
+def auth_start_endpoint(
+    return_to: str = Query(default="", alias="returnTo", max_length=2_048),
+) -> Response:
+    destination = safe_return_path(return_to)
+    if AUTH_MODE == "local":
+        return RedirectResponse(destination, status_code=303, headers={"Cache-Control": "no-store"})
+    try:
+        _portal_auth_client.probe()
+        attempt, cookie_value = create_handoff_attempt(destination)
+    except (BlueAshUnavailableError, BlueAshConfigurationError):
+        return HTMLResponse(
+            """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Opportunity Radar — Authentication unavailable</title>
+<style>body{margin:0;background:#07111f;color:#e8eef7;font:16px/1.5 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:34rem;padding:2rem;text-align:center}h1{font-size:1.6rem}a{color:#8bc5ff}</style></head>
+<body><main><h1>Authentication is temporarily unavailable</h1><p>Opportunity Radar could not reach Blue Ash authentication. Please try again shortly.</p><p><a href="/">Try again</a></p></main></body></html>""",
+            status_code=503,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+    response = RedirectResponse(
+        build_authorize_url(attempt),
+        status_code=303,
+        headers={"Cache-Control": "no-store"},
+    )
+    set_handoff_cookie(response, cookie_value)
+    return response
+
+
+@app.get("/api/auth/callback")
+def auth_callback_endpoint(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+) -> Response:
+    destination = safe_return_path("")
+    query = request.query_params
+    invalid_query_shape = (
+        len(query.getlist("state")) != 1
+        or len(state) > 512
+        or len(code) > 4_096
+        or len(error) > 64
+        or len(query.getlist("code")) > 1
+        or len(query.getlist("error")) > 1
+        or (bool(code) == bool(error))
+    )
+    if invalid_query_shape:
+        response = RedirectResponse(
+            _auth_state_location(destination, "failed"),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+        clear_handoff_cookie(response)
+        return response
+    try:
+        attempt = consume_handoff_cookie(
+            request.cookies.get(handoff_cookie_name(), ""),
+            state,
+        )
+        destination = attempt.return_path
+    except BlueAshAuthenticationError:
+        response = RedirectResponse(
+            _auth_state_location(destination, "failed"),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+        clear_handoff_cookie(response)
+        return response
+
+    if error:
+        auth_state = {
+            "access_denied": "denied",
+            "temporarily_unavailable": "unavailable",
+        }.get(error, "failed")
+        response = RedirectResponse(
+            _auth_state_location(destination, auth_state),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+        clear_handoff_cookie(response)
+        return response
+    if not code:
+        response = RedirectResponse(
+            _auth_state_location(destination, "failed"),
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+        clear_handoff_cookie(response)
+        return response
+
+    access_token = ""
+    try:
+        exchange = _portal_auth_client.exchange(code, attempt.code_verifier)
+        access_token = exchange.access_token
+        # An exchange is not sufficient by itself. This verifies assignment,
+        # application binding, role shape, and both Portal expiry bounds.
+        _portal_auth_client.introspect(access_token)
+    except BlueAshAuthorizationError:
+        auth_state = "denied"
+    except BlueAshUnavailableError:
+        auth_state = "unavailable"
+    except (BlueAshAuthenticationError, BlueAshConfigurationError):
+        auth_state = "failed"
+    else:
+        response = RedirectResponse(
+            destination,
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+        set_session_cookie(response, exchange.access_token, max_age=exchange.expires_in)
+        clear_handoff_cookie(response)
+        return response
+
+    if access_token:
+        try:
+            _portal_auth_client.revoke(access_token)
+        except (BlueAshAuthorizationError, BlueAshUnavailableError, BlueAshConfigurationError):
+            logging.warning("A rejected Portal handoff token could not be revoked immediately.")
+    response = RedirectResponse(
+        _auth_state_location(destination, auth_state),
+        status_code=303,
+        headers={"Cache-Control": "no-store"},
+    )
+    clear_handoff_cookie(response)
+    return response
+
+
 @app.get("/api/auth/session")
 def auth_session_endpoint(
     request: Request,
-    return_to: str = Query(default="", alias="returnTo"),
-) -> dict[str, Any]:
+    return_to: str = Query(default="", alias="returnTo", max_length=2_048),
+) -> Response:
     try:
-        identity = BlueAshAuthClient().authenticate(request.cookies.get(BLUEASH_SESSION_COOKIE, ""))
-        if APP_ENV == "production" and not is_trusted_initial_administrator(identity):
-            raise HTTPException(status_code=403, detail="Opportunity Radar is restricted to the trusted administrator.")
-        return {**identity.as_dict(), "features": feature_flags_payload()}
+        identity = _portal_auth_client.authenticate(request.cookies.get(RADAR_SESSION_COOKIE_NAME, ""))
+        return JSONResponse(
+            {
+                **identity.as_dict(),
+                "canAdminister": (
+                    is_trusted_initial_administrator(identity)
+                    if APP_ENV == "production"
+                    else is_administrator(identity)
+                ),
+                "features": feature_flags_payload(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
     except BlueAshAuthenticationError as exc:
-        raise HTTPException(status_code=401, detail={"message": str(exc), "loginUrl": login_url(return_to)}) from None
+        response = JSONResponse(
+            {"detail": {"message": str(exc), "loginUrl": auth_start_url(return_to)}},
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+        )
+        clear_session_cookie(response)
+        return response
     except BlueAshAuthorizationError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from None
+        return JSONResponse({"detail": str(exc)}, status_code=403, headers={"Cache-Control": "no-store"})
     except BlueAshUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from None
+        return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Cache-Control": "no-store"})
     except BlueAshConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from None
+        return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/auth/logout")
-def auth_logout_endpoint(request: Request, response: Response) -> dict[str, str]:
+def auth_logout_endpoint(request: Request) -> Response:
     try:
-        BlueAshAuthClient().logout(request.cookies.get(BLUEASH_SESSION_COOKIE, ""))
-    except BlueAshUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from None
-    except BlueAshConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from None
-    response.delete_cookie(
-        BLUEASH_SESSION_COOKIE, path="/", domain=BLUEASH_COOKIE_DOMAIN or None,
-        secure=APP_ENV == "production", httponly=True, samesite="lax",
+        _portal_auth_client.revoke(request.cookies.get(RADAR_SESSION_COOKIE_NAME, ""))
+    except (BlueAshAuthorizationError, BlueAshUnavailableError, BlueAshConfigurationError):
+        # Logout remains local and deterministic even if Portal revocation is
+        # unavailable. The raw app token is always removed from this browser.
+        logging.warning("Portal token revocation was unavailable during Radar logout.")
+    redirect_url = portal_root_url() if AUTH_MODE == "portal_handoff" else safe_return_path("")
+    response = JSONResponse(
+        {"message": "Signed out of Opportunity Radar.", "redirectUrl": redirect_url},
+        headers={"Cache-Control": "no-store"},
     )
-    return {"message": "Signed out of Blue Ash.", "redirectUrl": login_url()}
+    clear_session_cookie(response)
+    clear_handoff_cookie(response)
+    return response
+
+
+def _auth_state_location(return_path: str, auth_state: str) -> str:
+    safe_path = safe_return_path(return_path)
+    parsed = urlsplit(safe_path)
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != "auth"]
+    query.append(("auth", auth_state))
+    return urlunsplit(("", "", parsed.path, urlencode(query), parsed.fragment))
 
 
 @app.get("/api/companies")

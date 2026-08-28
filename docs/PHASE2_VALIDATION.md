@@ -107,8 +107,8 @@ evidence for a later Chromium/browser-enabled image.
 
 ## Deferred production work
 
-The production environment template deliberately sets unsupported `AUTH_MODE=portal_handoff`, so
-an accidental pre-Phase-3 start fails closed. Production still requires the Phase 3 portal handoff,
-real secrets in an external mode-0600 environment file, a reviewed migrated database placed with
-UID/GID 10001 ownership, host directory preparation, release image publication, edge/Caddy/DNS
-change approval, and an operator decision for scheduled/offsite backups and monitoring.
+This Phase 2 checkpoint predated the Portal handoff implementation. The current production template
+now supports `AUTH_MODE=portal_handoff`; see `BLUEASH_AUTH_INTEGRATION.md` for the current contract.
+Production still requires real secrets in an external mode-0600 environment file, a reviewed
+migrated database placed with UID/GID 10001 ownership, host directory preparation, release image
+publication, edge/Caddy/DNS change approval, and an operator decision for backups and monitoring.

@@ -7,7 +7,7 @@ from urllib.parse import unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 SUPPORTED_APP_ENVS = frozenset({"development", "production"})
-SUPPORTED_AUTH_MODES = frozenset({"local", "blueash"})
+SUPPORTED_AUTH_MODES = frozenset({"local", "portal_handoff"})
 
 
 def _read_bool(name: str, *, default: bool = False) -> bool:
@@ -35,17 +35,46 @@ def _read_positive_int(name: str, *, default: int, maximum: int = 256) -> int:
     return value
 
 
+def _read_nonnegative_int(name: str, *, default: int, maximum: int = 256) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a non-negative integer.") from exc
+    if value < 0 or value > maximum:
+        raise RuntimeError(f"{name} must be between 0 and {maximum}.")
+    return value
+
+
 APP_ENV = os.environ.get("APP_ENV", "").strip().lower()
 APP_BASE_PATH = "/" + os.environ.get("APP_BASE_PATH", "").strip().strip("/") if os.environ.get("APP_BASE_PATH", "").strip().strip("/") else ""
 APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "").strip().rstrip("/")
 _public_url = urlparse(APP_PUBLIC_URL)
 APP_PUBLIC_ORIGIN = f"{_public_url.scheme}://{_public_url.netloc}" if _public_url.scheme and _public_url.netloc else ""
 AUTH_MODE = os.environ.get("AUTH_MODE", "").strip().lower()
-BLUEASH_API_URL = os.environ.get("BLUEASH_API_URL", "").strip().rstrip("/")
-BLUEASH_LOGIN_URL = os.environ.get("BLUEASH_LOGIN_URL", "").strip()
-BLUEASH_SESSION_COOKIE = os.environ.get("BLUEASH_SESSION_COOKIE", "").strip()
-BLUEASH_COOKIE_DOMAIN = os.environ.get("BLUEASH_COOKIE_DOMAIN", "").strip()
-BLUEASH_APP_SLUG = os.environ.get("BLUEASH_APP_SLUG", "").strip()
+BLUEASH_PORTAL_PUBLIC_URL = os.environ.get("BLUEASH_PORTAL_PUBLIC_URL", "").strip().rstrip("/")
+BLUEASH_PORTAL_API_URL = os.environ.get("BLUEASH_PORTAL_API_URL", "").strip().rstrip("/")
+BLUEASH_AUTH_CLIENT_ID = os.environ.get("BLUEASH_AUTH_CLIENT_ID", "").strip()
+BLUEASH_AUTH_CLIENT_SECRET = os.environ.get("BLUEASH_AUTH_CLIENT_SECRET", "").strip()
+OPPORTUNITY_RADAR_SECRET_KEY = os.environ.get("OPPORTUNITY_RADAR_SECRET_KEY", "").strip()
+RADAR_SESSION_COOKIE_NAME = os.environ.get(
+    "RADAR_SESSION_COOKIE_NAME",
+    "__Host-opportunity_radar_session" if APP_ENV == "production" else "opportunity_radar_session",
+).strip()
+RADAR_SESSION_IDLE_SECONDS = _read_positive_int(
+    "RADAR_SESSION_IDLE_SECONDS", default=30 * 60, maximum=30 * 60
+)
+RADAR_SESSION_ABSOLUTE_MAX_SECONDS = _read_positive_int(
+    "RADAR_SESSION_ABSOLUTE_MAX_SECONDS", default=8 * 60 * 60, maximum=24 * 60 * 60
+)
+RADAR_INTROSPECTION_CACHE_SECONDS = _read_nonnegative_int(
+    "RADAR_INTROSPECTION_CACHE_SECONDS", default=0, maximum=30
+)
+RADAR_HANDOFF_STATE_TTL_SECONDS = _read_positive_int(
+    "RADAR_HANDOFF_STATE_TTL_SECONDS", default=5 * 60, maximum=10 * 60
+)
 APP_TRUSTED_ADMIN_USER_ID = os.environ.get("APP_TRUSTED_ADMIN_USER_ID", "").strip()
 
 # Phase 1A production safety switches. Unsafe features require an explicit opt-in.

@@ -1,0 +1,323 @@
+name: opportunity-radar-phase3
+
+x-portal-environment: &portal-environment
+  APP_ENV: production
+  APP_NAME: Blue Ash Digital Portal Phase 3 Synthetic Integration
+  APP_DOMAIN: blueashdigital.tech
+  FRONTEND_ORIGIN: https://blueashdigital.tech
+  CORS_ORIGINS: https://blueashdigital.tech
+  DATABASE_URL: postgresql+psycopg://portal_phase3:phase3-postgres-only@portal-postgres:5432/portal_phase3
+  SECRET_KEY: ${PHASE3_PORTAL_SECRET_KEY:?Set an ephemeral PHASE3_PORTAL_SECRET_KEY}
+  SESSION_SECRET: ${PHASE3_PORTAL_SESSION_SECRET:?Set an ephemeral PHASE3_PORTAL_SESSION_SECRET}
+  EMAIL_ENCRYPTION_KEY: ${PHASE3_EMAIL_ENCRYPTION_KEY:?Set an ephemeral PHASE3_EMAIL_ENCRYPTION_KEY}
+  SESSION_COOKIE_NAME: __Host-blueash_portal_session
+  PRE_AUTH_COOKIE_NAME: __Host-blueash_pre_auth
+  SESSION_MAX_AGE_SECONDS: "28800"
+  OPPORTUNITY_RADAR_CLIENT_ID: opportunity-radar
+  OPPORTUNITY_RADAR_CLIENT_SECRET: ${BLUEASH_AUTH_CLIENT_SECRET:?Set an ephemeral BLUEASH_AUTH_CLIENT_SECRET}
+  OPPORTUNITY_RADAR_PUBLIC_ORIGIN: https://radar.blueashdigital.tech
+  OPPORTUNITY_RADAR_CALLBACK_URI: https://radar.blueashdigital.tech/api/auth/callback
+  APPLICATION_AUTH_CODE_TTL_SECONDS: "60"
+  APPLICATION_SESSION_IDLE_SECONDS: "1800"
+  APPLICATION_SESSION_ABSOLUTE_MAX_SECONDS: "28800"
+  PHASE3_ALLOW_DISPOSABLE_DATABASE: "1"
+  PHASE3_SYNTHETIC_TEST_MODE: "1"
+  PHASE3_SYNTHETIC_PASSWORD: ${PHASE3_SYNTHETIC_PASSWORD:?Set an explicit synthetic password}
+  PHASE3_SYNTHETIC_MFA_CODE: ${PHASE3_SYNTHETIC_MFA_CODE:?Set a synthetic six-digit code}
+  APP_TRUSTED_ADMIN_USER_ID: 11111111-1111-4111-8111-111111111111
+
+x-radar-environment: &radar-environment
+  APP_ENV: production
+  AUTH_MODE: portal_handoff
+  APP_PUBLIC_URL: https://radar.blueashdigital.tech
+  APP_BASE_PATH: ""
+  BLUEASH_PORTAL_PUBLIC_URL: https://blueashdigital.tech
+  BLUEASH_PORTAL_API_URL: https://api.blueashdigital.tech
+  BLUEASH_AUTH_CLIENT_ID: opportunity-radar
+  BLUEASH_AUTH_CLIENT_SECRET: ${BLUEASH_AUTH_CLIENT_SECRET:?Set an ephemeral BLUEASH_AUTH_CLIENT_SECRET}
+  OPPORTUNITY_RADAR_SECRET_KEY: ${PHASE3_RADAR_SECRET_KEY:?Set an ephemeral PHASE3_RADAR_SECRET_KEY}
+  RADAR_SESSION_COOKIE_NAME: __Host-opportunity_radar_session
+  RADAR_SESSION_IDLE_SECONDS: "1800"
+  RADAR_SESSION_ABSOLUTE_MAX_SECONDS: "28800"
+  RADAR_INTROSPECTION_CACHE_SECONDS: "0"
+  RADAR_HANDOFF_STATE_TTL_SECONDS: "300"
+  APP_TRUSTED_ADMIN_USER_ID: 11111111-1111-4111-8111-111111111111
+  DATABASE_URL: sqlite:////var/lib/opportunity-radar/database/opportunity_radar.db
+  APP_DATA_DIR: /var/lib/opportunity-radar/data
+  APP_IMPORT_DIR: /var/lib/opportunity-radar/data/imports
+  APP_OUTPUT_DIR: /var/lib/opportunity-radar/exports
+  APP_EXPORT_DIR: /var/lib/opportunity-radar/exports
+  APP_BACKUP_DIR: /var/lib/opportunity-radar/backups
+  APP_LOG_DIR: /var/log/opportunity-radar
+  APP_MAX_HTTP_WORKERS: "4"
+  APP_MAX_BROWSER_WORKERS: "1"
+  APP_MAX_ACTIVE_MAINTENANCE: "1"
+  APP_ENABLE_BROWSER_JOBS: "false"
+  APP_ENABLE_COMPANY_REFRESH: "false"
+  APP_ENABLE_UTILITIES: "false"
+  APP_ENABLE_SCHEDULES: "false"
+  APP_ENABLE_DISCOVERY: "false"
+  APP_WRITE_FRONTEND_MIRRORS: "false"
+  REQUIRE_EXISTING_DATABASE: "true"
+  DEPLOYMENT_VERSION: phase3-local
+  REQUESTS_CA_BUNDLE: /phase3-ca/root.crt
+  SSL_CERT_FILE: /phase3-ca/root.crt
+  PHASE3_SYNTHETIC_TEST_MODE: "1"
+
+services:
+  portal-postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_DB: portal_phase3
+      POSTGRES_USER: portal_phase3
+      POSTGRES_PASSWORD: phase3-postgres-only
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,nodev,size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal_phase3 -d portal_phase3"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    networks:
+      - phase3-private
+
+  portal-tool:
+    profiles: ["tools"]
+    image: blueash-portal-backend:phase3-local
+    build:
+      context: ${BLUEASH_PORTAL_REPO:?Set BLUEASH_PORTAL_REPO to the Portal worktree}/backend
+      args:
+        DEPLOYMENT_VERSION: phase3-local
+    restart: "no"
+    environment: *portal-environment
+    depends_on:
+      portal-postgres:
+        condition: service_healthy
+    networks:
+      - phase3-private
+
+  portal-backend:
+    image: blueash-portal-backend:phase3-local
+    build:
+      context: ${BLUEASH_PORTAL_REPO:?Set BLUEASH_PORTAL_REPO to the Portal worktree}/backend
+      args:
+        DEPLOYMENT_VERSION: phase3-local
+    restart: "no"
+    environment: *portal-environment
+    command: ["uvicorn", "phase3_app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    depends_on:
+      portal-postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${BLUEASH_PORTAL_REPO:?Set BLUEASH_PORTAL_REPO to the Portal worktree}/backend/tests/integration/phase3_app.py
+        target: /app/phase3_app.py
+        read_only: true
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 3s
+      timeout: 4s
+      retries: 30
+      start_period: 5s
+    networks:
+      - phase3-private
+
+  portal-frontend:
+    image: blueash-portal-frontend:phase3-local
+    build:
+      context: ${BLUEASH_PORTAL_REPO:?Set BLUEASH_PORTAL_REPO to the Portal worktree}/frontend
+      args:
+        DEPLOYMENT_VERSION: phase3-local
+        VITE_API_BASE_URL: https://api.blueashdigital.tech
+    restart: "no"
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 3s
+      timeout: 4s
+      retries: 20
+      start_period: 3s
+    networks:
+      - phase3-private
+
+  opportunity-radar-backend:
+    image: opportunity-radar-backend:phase3-local
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+      args:
+        DEPLOYMENT_VERSION: phase3-local
+    user: "10001:10001"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 768m
+    environment: *radar-environment
+    command: ["uvicorn", "phase3_radar_app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+    depends_on:
+      ca-export:
+        condition: service_completed_successfully
+    volumes:
+      - type: bind
+        source: ${PHASE3_ROOT:?Set PHASE3_ROOT to a disposable synthetic-data directory}/database
+        target: /var/lib/opportunity-radar/database
+      - type: bind
+        source: ${PHASE3_ROOT:?Set PHASE3_ROOT to a disposable synthetic-data directory}/data
+        target: /var/lib/opportunity-radar/data
+      - type: bind
+        source: ${PHASE3_ROOT:?Set PHASE3_ROOT to a disposable synthetic-data directory}/exports
+        target: /var/lib/opportunity-radar/exports
+      - type: bind
+        source: ${PHASE3_ROOT:?Set PHASE3_ROOT to a disposable synthetic-data directory}/backups
+        target: /var/lib/opportunity-radar/backups
+      - type: bind
+        source: ${PHASE3_ROOT:?Set PHASE3_ROOT to a disposable synthetic-data directory}/logs
+        target: /var/log/opportunity-radar
+      - type: bind
+        source: ./tests/integration/phase3_radar_app.py
+        target: /app/phase3_radar_app.py
+        read_only: true
+      - type: volume
+        source: phase3-ca-data
+        target: /phase3-ca
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1770,uid=10001,gid=10001
+      - /var/lib/opportunity-radar/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1770,uid=10001,gid=10001
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 3s
+      timeout: 4s
+      retries: 30
+      start_period: 8s
+    networks:
+      - phase3-private
+
+  opportunity-radar-frontend:
+    image: opportunity-radar-frontend:phase3-local
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+      args:
+        VITE_BASE_PATH: /
+    user: "10001:10001"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 128m
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1770,uid=10001,gid=10001
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 3s
+      timeout: 4s
+      retries: 20
+      start_period: 3s
+    networks:
+      - phase3-private
+
+  edge:
+    image: caddy:2-alpine
+    restart: "no"
+    volumes:
+      - type: bind
+        source: ./tests/integration/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - phase3-caddy-data:/data
+      - phase3-caddy-config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /data/caddy/pki/authorities/local/root.crt"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    networks:
+      phase3-private:
+        aliases:
+          - blueashdigital.tech
+          - api.blueashdigital.tech
+          - radar.blueashdigital.tech
+
+  ca-export:
+    image: caddy:2-alpine
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cp /caddy-source/caddy/pki/authorities/local/root.crt /phase3-ca/root.crt
+        chmod 0444 /phase3-ca/root.crt
+    volumes:
+      - type: volume
+        source: phase3-caddy-data
+        target: /caddy-source
+        read_only: true
+      - type: volume
+        source: phase3-ca-data
+        target: /phase3-ca
+    depends_on:
+      edge:
+        condition: service_healthy
+    networks:
+      - phase3-private
+
+  browser:
+    image: opportunity-radar-phase3-browser:local
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.browser
+    init: true
+    restart: "no"
+    command: ["python", "/phase3/phase3_browser_server.py"]
+    environment:
+      PHASE3_SYNTHETIC_TEST_MODE: "1"
+    volumes:
+      - type: bind
+        source: ./tests/integration/phase3_browser_server.py
+        target: /phase3/phase3_browser_server.py
+        read_only: true
+    ports:
+      - "127.0.0.1:${PHASE3_BROWSER_CDP_PORT:?Set an ephemeral PHASE3_BROWSER_CDP_PORT}:9222"
+    shm_size: 1gb
+    depends_on:
+      edge:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9222/json/version', timeout=3).read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks:
+      - phase3-private
+      - phase3-control
+
+volumes:
+  phase3-caddy-data:
+  phase3-caddy-config:
+  phase3-ca-data:
+
+networks:
+  phase3-private:
+    internal: true
+  phase3-control:
+    driver: bridge

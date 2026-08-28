@@ -2,9 +2,8 @@
 
 Opportunity Radar tracks companies, discovered job openings, resume/job fit, and applications.
 
-The Phase 1A source baseline retains the existing Blue Ash shared-cookie integration as a
-transitional contract. It is not a production deployment or the final authentication handoff.
-See [docs/BLUEASH_AUTH_INTEGRATION.md](docs/BLUEASH_AUTH_INTEGRATION.md).
+Production authentication uses a one-time Blue Ash Portal authorization-code handoff and an
+app-scoped Radar token. See [docs/BLUEASH_AUTH_INTEGRATION.md](docs/BLUEASH_AUTH_INTEGRATION.md).
 
 The app is organized around one permanent company workbook and separate generated snapshots:
 

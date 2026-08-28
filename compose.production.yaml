@@ -21,7 +21,17 @@ services:
         required: true
     environment:
       APP_ENV: production
+      AUTH_MODE: portal_handoff
       APP_BASE_PATH: ""
+      APP_PUBLIC_URL: https://radar.blueashdigital.tech
+      BLUEASH_PORTAL_PUBLIC_URL: https://blueashdigital.tech
+      BLUEASH_PORTAL_API_URL: https://api.blueashdigital.tech
+      BLUEASH_AUTH_CLIENT_ID: opportunity-radar
+      RADAR_SESSION_COOKIE_NAME: __Host-opportunity_radar_session
+      RADAR_SESSION_IDLE_SECONDS: "1800"
+      RADAR_SESSION_ABSOLUTE_MAX_SECONDS: "28800"
+      RADAR_INTROSPECTION_CACHE_SECONDS: "0"
+      RADAR_HANDOFF_STATE_TTL_SECONDS: "300"
       DATABASE_URL: sqlite:////var/lib/opportunity-radar/database/opportunity_radar.db
       APP_DATA_DIR: /var/lib/opportunity-radar/data
       APP_IMPORT_DIR: /var/lib/opportunity-radar/data/imports

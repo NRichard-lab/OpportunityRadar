@@ -16,6 +16,7 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("USER ${APP_UID}:${APP_GID}", dockerfile)
         self.assertIn('ARG APP_UID=10001', dockerfile)
         self.assertIn('"--workers", "1"', dockerfile)
+        self.assertIn('"--no-access-log"', dockerfile)
         self.assertNotIn("requirements.txt /tmp", dockerfile)
         self.assertNotIn("playwright install", dockerfile.lower())
 
@@ -67,6 +68,13 @@ class ContainerArtifactTests(unittest.TestCase):
             "AUTH_MODE": "portal_handoff",
             "APP_PUBLIC_URL": "https://radar.blueashdigital.tech",
             "APP_BASE_PATH": "",
+            "BLUEASH_PORTAL_PUBLIC_URL": "https://blueashdigital.tech",
+            "BLUEASH_PORTAL_API_URL": "https://api.blueashdigital.tech",
+            "BLUEASH_AUTH_CLIENT_ID": "opportunity-radar",
+            "RADAR_SESSION_COOKIE_NAME": "__Host-opportunity_radar_session",
+            "RADAR_SESSION_IDLE_SECONDS": "1800",
+            "RADAR_SESSION_ABSOLUTE_MAX_SECONDS": "28800",
+            "RADAR_INTROSPECTION_CACHE_SECONDS": "0",
             "REQUIRE_EXISTING_DATABASE": "true",
             "APP_ENABLE_BROWSER_JOBS": "false",
             "APP_ENABLE_COMPANY_REFRESH": "false",
@@ -85,6 +93,7 @@ class ContainerArtifactTests(unittest.TestCase):
         for key, value in expected.items():
             self.assertEqual(values.get(key), value)
         self.assertEqual(values["OPPORTUNITY_RADAR_SECRET_KEY"], "<set securely>")
+        self.assertEqual(values["BLUEASH_AUTH_CLIENT_SECRET"], "<set securely>")
 
     def test_docker_context_excludes_private_runtime_categories(self) -> None:
         ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
@@ -111,6 +120,25 @@ class ContainerArtifactTests(unittest.TestCase):
         }
 
         self.assertTrue(required_patterns.issubset(set(ignored)))
+
+    def test_auth_sources_do_not_forward_parent_cookie_or_enable_callback_access_logs(self) -> None:
+        auth_source = (ROOT / "backend" / "blueash_auth.py").read_text(encoding="utf-8")
+        server_source = (ROOT / "server.py").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "docker" / "backend" / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertNotIn("blueash_session", auth_source + server_source)
+        self.assertNotIn('headers={"Cookie"', auth_source)
+        self.assertIn('auth=(BLUEASH_AUTH_CLIENT_ID, BLUEASH_AUTH_CLIENT_SECRET)', auth_source)
+        self.assertIn('"--no-access-log"', dockerfile)
+        self.assertIn('response.headers["Referrer-Policy"] = "no-referrer"', server_source)
+
+    def test_frontend_callback_state_rechecks_an_existing_session_without_idle_polling(self) -> None:
+        app_source = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertNotIn("window.setInterval", app_source)
+        self.assertIn("if (response.status === 401) {\n          if (callbackAuthState) return;", app_source)
+        self.assertIn("removeCallbackAuthState();\n            setCallbackAuthState(null);", app_source)
+        self.assertIn("parsed.origin === window.location.origin", app_source)
 
 
 if __name__ == "__main__":

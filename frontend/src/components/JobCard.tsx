@@ -11,9 +11,10 @@ interface JobCardProps {
   updating: boolean;
   onViewDetails?: (job: Job) => void;
   onViewCompany?: (companyName: string) => void;
+  canAdminister: boolean;
 }
 
-export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, updating, onViewDetails, onViewCompany }: JobCardProps) {
+export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, updating, onViewDetails, onViewCompany, canAdminister }: JobCardProps) {
   return (
     <article className={`card p-4 ${job.notInterested ? "opacity-55" : ""}`}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -48,14 +49,14 @@ export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, up
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        <button className="btn" type="button" disabled={updating} onClick={() => void onMarkApplied(job.id)}>
+        {canAdminister ? <button className="btn" type="button" disabled={updating} onClick={() => void onMarkApplied(job.id)}>
           <CheckCircle2 size={16} />
           {job.applied ? "Applied" : "Mark Applied"}
-        </button>
-        <button className="btn" type="button" disabled={updating} onClick={() => void onNotInterested(job.id)}>
+        </button> : null}
+        {canAdminister ? <button className="btn" type="button" disabled={updating} onClick={() => void onNotInterested(job.id)}>
           <Ban size={16} />
           Not Interested
-        </button>
+        </button> : null}
         <button className="btn" type="button" onClick={() => onViewDetails?.(job)}>
           <FileText size={16} />
           View Details
@@ -65,7 +66,7 @@ export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, up
           Source
         </a>
       </div>
-      <textarea
+      {canAdminister ? <textarea
         key={`${job.id}-${job.notes}`}
         className="field mt-4 min-h-20"
         placeholder="Notes"
@@ -76,7 +77,7 @@ export function JobCard({ job, onMarkApplied, onNotInterested, onUpdateNotes, up
           if (input.value === job.notes) return;
           void onUpdateNotes(job.id, input.value).then((saved) => { if (!saved) input.value = job.notes; });
         }}
-      />
+      /> : null}
       {updating ? <p className="mt-2 text-xs text-slate-400" role="status">Saving application changes...</p> : null}
     </article>
   );

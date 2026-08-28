@@ -1,0 +1,26 @@
+{
+	auto_https disable_redirects
+}
+
+blueashdigital.tech {
+	tls internal
+	reverse_proxy portal-frontend:80
+}
+
+api.blueashdigital.tech {
+	tls internal
+	reverse_proxy portal-backend:8000
+}
+
+radar.blueashdigital.tech {
+	tls internal
+
+	@radar_api path /api /api/*
+	handle @radar_api {
+		reverse_proxy opportunity-radar-backend:8000
+	}
+
+	handle {
+		reverse_proxy opportunity-radar-frontend:8080
+	}
+}

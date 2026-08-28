@@ -18,9 +18,10 @@ interface JobListProps {
   pendingApplicationIds: Set<string>;
   selectedCompanyId?: string;
   onViewCompany?: (companyName: string) => void;
+  canAdminister: boolean;
 }
 
-export function JobList({ jobs, dataStatus, dataError, onRetry, onRematch, onMarkApplied, onNotInterested, onUpdateNotes, pendingApplicationIds, selectedCompanyId, onViewCompany }: JobListProps) {
+export function JobList({ jobs, dataStatus, dataError, onRetry, onRematch, onMarkApplied, onNotInterested, onUpdateNotes, pendingApplicationIds, selectedCompanyId, onViewCompany, canAdminister }: JobListProps) {
   const [query, setQuery] = useState("");
   const [workType, setWorkType] = useState<WorkType | "All work types">("All work types");
   const [companyFilter, setCompanyFilter] = useState("All companies");
@@ -178,6 +179,7 @@ export function JobList({ jobs, dataStatus, dataError, onRetry, onRematch, onMar
             updating={pendingApplicationIds.has(job.id)}
             onViewDetails={setDetailsJob}
             onViewCompany={onViewCompany}
+            canAdminister={canAdminister}
           />
         ))}
         {!jobs.length ? <div className="card p-8 text-center text-slate-400">No jobs are stored yet.</div> : null}
@@ -208,7 +210,7 @@ export function JobList({ jobs, dataStatus, dataError, onRetry, onRematch, onMar
           </button>
         </div>
       ) : null}
-      <JobDetailsModal job={detailsJob} onClose={() => setDetailsJob(null)} onRematch={onRematch} />
+      <JobDetailsModal job={detailsJob} onClose={() => setDetailsJob(null)} onRematch={canAdminister ? onRematch : undefined} />
     </div>
   );
 }

@@ -20,6 +20,7 @@ interface CompaniesProps {
   onCompanyDeleted: (deletedJobIds: string[]) => Promise<void>;
   selectedCompanyName?: string;
   refreshEnabled: boolean;
+  canAdminister: boolean;
 }
 
 const initialPage: CompanyPage = {
@@ -51,7 +52,7 @@ const emptyCompany: CompanyFormData = {
   notes: "",
 };
 
-export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefreshed, onCompanyDeleted, selectedCompanyName, refreshEnabled }: CompaniesProps) {
+export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefreshed, onCompanyDeleted, selectedCompanyName, refreshEnabled, canAdminister }: CompaniesProps) {
   const [result, setResult] = useState<CompanyPage>(initialPage);
   const [query, setQuery] = useState("");
   const [state, setState] = useState("");
@@ -220,9 +221,9 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
     <div className="space-y-5">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-slate-400">{pageLoaded && !pageError ? rangeLabel(result) : loading ? "Loading companies..." : "Company data unavailable"}</p>
-        <button className="btn btn-primary" onClick={() => { setError(""); setEditingCompany(null); }}>
+        {canAdminister ? <button className="btn btn-primary" onClick={() => { setError(""); setEditingCompany(null); }}>
           <Plus size={17} /> Add Company
-        </button>
+        </button> : <span className="text-xs text-slate-500">Read-only access</span>}
       </div>
       {notice ? <div className="rounded-md border border-emerald-800 bg-emerald-950/50 px-4 py-3 text-sm text-emerald-300" role="status">{notice}</div> : null}
       <Filters
@@ -237,7 +238,7 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
       {pageError ? <div className="flex flex-col gap-3 rounded-md border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300 sm:flex-row sm:items-center sm:justify-between" role="alert"><span>{pageError}</span><button className="btn shrink-0" type="button" onClick={() => setRefreshToken((current) => current + 1)}>Retry</button></div> : null}
       {!pageLoaded && loading ? <div className="card p-8 text-center text-slate-400" role="status">Loading companies...</div> : null}
       <div className={`space-y-3 ${loading ? "opacity-60" : ""}`} aria-busy={loading} hidden={Boolean(pageError) || !pageLoaded}>
-        {result.items.map((company) => <CompanyCard key={company.id} company={company} appliedCount={company.appliedCount || 0} jobCount={company.activeJobCount || 0} onViewJobs={onViewCompanyJobs} onRefresh={(selected) => void refreshCompany(selected)} refreshEnabled={refreshEnabled} isRefreshing={refreshingCompanyIds.has(company.id)} refreshResult={refreshResults[company.id]} onEdit={(selected) => { setError(""); setEditingCompany(selected); }} onDelete={(selected) => { setError(""); setDeletingCompany(selected); }} forceOpen={sameCompany(company.name, selectedCompanyName)} />)}
+        {result.items.map((company) => <CompanyCard key={company.id} company={company} appliedCount={company.appliedCount || 0} jobCount={company.activeJobCount || 0} onViewJobs={onViewCompanyJobs} onRefresh={(selected) => void refreshCompany(selected)} refreshEnabled={refreshEnabled} isRefreshing={refreshingCompanyIds.has(company.id)} refreshResult={refreshResults[company.id]} onEdit={(selected) => { setError(""); setEditingCompany(selected); }} onDelete={(selected) => { setError(""); setDeletingCompany(selected); }} forceOpen={sameCompany(company.name, selectedCompanyName)} canAdminister={canAdminister} />)}
         {!loading && !pageError && !result.items.length ? <Empty message="No companies match the current filters." /> : null}
       </div>
       {pageLoaded && !pageError ? <Pagination result={result} page={page} setPage={setPage} /> : null}

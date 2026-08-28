@@ -14,6 +14,7 @@ interface CompanyCardProps {
   isRefreshing?: boolean;
   refreshResult?: CompanyRefreshResult;
   forceOpen?: boolean;
+  canAdminister: boolean;
 }
 
 export interface CompanyRefreshResult {
@@ -45,7 +46,7 @@ export function isCompanyRefreshResult(value: unknown): value is CompanyRefreshR
     && result.errors.every((item) => typeof item === "string");
 }
 
-export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdit, onDelete, onRefresh, refreshEnabled, isRefreshing, refreshResult, forceOpen }: CompanyCardProps) {
+export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdit, onDelete, onRefresh, refreshEnabled, isRefreshing, refreshResult, forceOpen, canAdminister }: CompanyCardProps) {
   return (
     <details className="card p-4" open={forceOpen || undefined}>
       <summary className="cursor-pointer list-none">
@@ -64,7 +65,7 @@ export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdi
             <span className="badge border-radar-line text-slate-200">{company.searchStatus}</span>
             <span className="badge border-radar-line text-slate-200">{company.confidence}% confidence</span>
             <span className="badge border-radar-line text-slate-200">{appliedCount} applied</span>
-            <button className="btn px-3 py-2" type="button" title={refreshEnabled ? `Refresh ${company.name}` : "Company refresh is disabled for the initial production release."} aria-label={refreshEnabled ? `Refresh ${company.name}` : `Refresh unavailable for ${company.name}`} disabled={!refreshEnabled || isRefreshing} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onRefresh(company); }}>
+            {canAdminister ? <><button className="btn px-3 py-2" type="button" title={refreshEnabled ? `Refresh ${company.name}` : "Company refresh is disabled for the initial production release."} aria-label={refreshEnabled ? `Refresh ${company.name}` : `Refresh unavailable for ${company.name}`} disabled={!refreshEnabled || isRefreshing} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onRefresh(company); }}>
               <RefreshCw className={isRefreshing ? "animate-spin" : ""} size={16} />
               {isRefreshing ? "Refreshing..." : refreshEnabled ? "Refresh" : "Refresh unavailable"}
             </button>
@@ -73,7 +74,7 @@ export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdi
             </button>
             <button className="icon-btn border-red-900 text-red-400 hover:border-red-500 hover:text-red-300" type="button" title={`Delete ${company.name}`} aria-label={`Delete ${company.name}`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onDelete(company); }}>
               <Trash2 size={16} />
-            </button>
+            </button></> : null}
           </div>
         </div>
         {refreshResult ? <RefreshResult result={refreshResult} /> : null}

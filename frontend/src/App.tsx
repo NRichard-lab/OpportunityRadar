@@ -29,6 +29,7 @@ import { Utilities } from "./pages/Utilities";
 import { ApiError, API_BASE, APP_BASE, AUTH_REQUIRED_EVENT, apiJson, appPath, userMessage } from "./api";
 
 type Tab = "Dashboard" | "Companies" | "Job List" | "Jobs Applied For" | "Resume Match" | "Utilities";
+type CallbackAuthState = "denied" | "unavailable" | "failed";
 
 const tabs: { name: Tab; icon: typeof Gauge }[] = [
   { name: "Dashboard", icon: Gauge },
@@ -42,6 +43,8 @@ const tabs: { name: Tab; icon: typeof Gauge }[] = [
 function App() {
   const [session, setSession] = useState<SessionPayload | null>(null);
   const [authError, setAuthError] = useState("");
+  const [callbackAuthState, setCallbackAuthState] = useState<CallbackAuthState | null>(() => callbackAuthStateFromLocation());
+  const [authCheckComplete, setAuthCheckComplete] = useState(false);
   const [authAttempt, setAuthAttempt] = useState(0);
   const [legacyStorageWarning, setLegacyStorageWarning] = useState("");
   useEffect(() => {
@@ -66,6 +69,7 @@ function App() {
     let activeRequest: AbortController | null = null;
     let requestNumber = 0;
     const check = async () => {
+      setAuthCheckComplete(false);
       const currentRequest = ++requestNumber;
       activeRequest?.abort();
       const controller = new AbortController();
@@ -76,7 +80,8 @@ function App() {
         const payload: unknown = await response.json().catch(() => ({}));
         if (stopped || currentRequest !== requestNumber) return;
         if (response.status === 401) {
-          window.location.assign(loginUrlFromPayload(payload) || "https://blueashdigital.tech/");
+          if (callbackAuthState) return;
+          window.location.replace(safeLoginUrlFromPayload(payload, returnTo));
           return;
         }
         if (response.status === 403) throw new ApiError("Your account does not have access to Opportunity Radar.", 403);
@@ -84,6 +89,10 @@ function App() {
         const nextSession = normalizeSessionPayload(payload);
         if (!nextSession) throw new ApiError("Authentication returned an invalid response.");
         if (!stopped) {
+          if (callbackAuthState) {
+            removeCallbackAuthState();
+            setCallbackAuthState(null);
+          }
           setSession(nextSession);
           setAuthError("");
         }
@@ -93,25 +102,26 @@ function App() {
         }
       } finally {
         if (activeRequest === controller) activeRequest = null;
+        if (!stopped && currentRequest === requestNumber) setAuthCheckComplete(true);
       }
     };
     void check();
-    const timer = window.setInterval(() => void check(), 60_000);
-    const onVisibility = () => { if (document.visibilityState === "visible") void check(); };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => { stopped = true; requestNumber += 1; activeRequest?.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibility); };
-  }, [authAttempt]);
-  if (authError) return <div className="grid min-h-screen place-items-center px-4 text-center text-red-300"><div className="panel max-w-lg p-6"><h1 className="text-xl font-semibold text-white">Opportunity Radar is unavailable</h1><p className="mt-2">{authError}</p>{legacyStorageWarning ? <p className="mt-3 text-sm text-amber-200">{legacyStorageWarning}</p> : null}<button className="btn mt-5" type="button" onClick={() => { setAuthError(""); setSession(null); setAuthAttempt((value) => value + 1); }}>Retry authentication</button></div></div>;
+    return () => { stopped = true; requestNumber += 1; activeRequest?.abort(); };
+  }, [authAttempt, callbackAuthState]);
+  const visibleAuthError = callbackAuthState
+    ? authCheckComplete ? callbackAuthMessage(callbackAuthState) : ""
+    : authError;
+  if (visibleAuthError) return <div className="grid min-h-screen place-items-center px-4 text-center text-red-300"><div className="panel max-w-lg p-6"><h1 className="text-xl font-semibold text-white">{callbackAuthState === "denied" ? "Opportunity Radar access denied" : "Opportunity Radar is unavailable"}</h1><p className="mt-2">{visibleAuthError}</p>{legacyStorageWarning ? <p className="mt-3 text-sm text-amber-200">{legacyStorageWarning}</p> : null}<button className="btn mt-5" type="button" onClick={() => { removeCallbackAuthState(); setCallbackAuthState(null); setAuthCheckComplete(false); setAuthError(""); setSession(null); setAuthAttempt((value) => value + 1); }}>Retry authentication</button></div></div>;
   if (session === null) return <div className="grid min-h-screen place-items-center px-4 text-center text-slate-400"><div><p>Loading Opportunity Radar...</p>{legacyStorageWarning ? <p className="mt-3 max-w-lg text-sm text-amber-200">{legacyStorageWarning}</p> : null}</div></div>;
-  return <OpportunityApp key={session.id} sessionEmail={session.email} features={session.features} initialOperationError={legacyStorageWarning} onLogout={async () => {
+  return <OpportunityApp key={session.id} sessionEmail={session.email} canAdminister={session.canAdminister} features={session.features} initialOperationError={legacyStorageWarning} onLogout={async () => {
     const result = await apiJson<unknown>("/auth/logout", { method: "POST" }, "Opportunity Radar could not sign you out.");
     if (!isLogoutResponse(result)) throw new ApiError("Opportunity Radar could not sign you out. The server returned an invalid response.");
-    window.location.assign(result.redirectUrl);
+    window.location.assign(safeExitUrl(result.redirectUrl));
   }} />;
 }
 
-function OpportunityApp({ sessionEmail, features, initialOperationError, onLogout }: { sessionEmail: string; features: FeatureFlags; initialOperationError: string; onLogout: () => Promise<void> }) {
-  const [activeTab, setActiveTab] = useState<Tab>(() => tabFromLocation());
+function OpportunityApp({ sessionEmail, canAdminister, features, initialOperationError, onLogout }: { sessionEmail: string; canAdminister: boolean; features: FeatureFlags; initialOperationError: string; onLogout: () => Promise<void> }) {
+  const [activeTab, setActiveTab] = useState<Tab>(() => accessibleTabFromLocation(canAdminister));
   const [companies, setCompanies] = useState<Company[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [resume, setResume] = useState<ResumeProfile | null>(null);
@@ -128,6 +138,10 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
   const dataStatusRef = useRef<DataLoadStatus>("loading");
   const maintenanceRef = useRef<MaintenanceJobsState>(emptyMaintenanceState);
   const previousMaintenanceRuns = useRef<Map<string, MaintenanceRun>>(new Map());
+  const visibleTabs = useMemo(
+    () => canAdminister ? tabs : tabs.filter((tab) => ["Dashboard", "Companies", "Job List"].includes(tab.name)),
+    [canAdminister],
+  );
 
   const updateDataStatus = (status: DataLoadStatus) => {
     dataStatusRef.current = status;
@@ -147,7 +161,9 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
   const fetchJobs = async (): Promise<Job[]> => {
     const [loadedJobs, persistedApplications] = await Promise.all([
       apiJson<unknown>("/jobs", {}, "Jobs could not be loaded."),
-      apiJson<unknown>("/applications", {}, "Application tracking could not be loaded."),
+      canAdminister
+        ? apiJson<unknown>("/applications", {}, "Application tracking could not be loaded.")
+        : Promise.resolve({}),
     ]);
     if (!isJobArray(loadedJobs) || !isApplicationOverrides(persistedApplications)) throw new ApiError("Jobs could not be loaded. The server returned an invalid response.");
     return mergeJobApplications(loadedJobs, persistedApplications);
@@ -228,8 +244,12 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
         const [loadedCompanies, loadedJobs, persistedApplications, persistedResume] = await Promise.all([
           apiJson<unknown>("/companies", request, "Companies could not be loaded."),
           apiJson<unknown>("/jobs", request, "Jobs could not be loaded."),
-          apiJson<unknown>("/applications", request, "Application tracking could not be loaded."),
-          apiJson<unknown>("/resume", request, "The active resume could not be loaded."),
+          canAdminister
+            ? apiJson<unknown>("/applications", request, "Application tracking could not be loaded.")
+            : Promise.resolve({}),
+          canAdminister
+            ? apiJson<unknown>("/resume", request, "The active resume could not be loaded.")
+            : Promise.resolve(null),
         ]);
         if (!isCompanyArray(loadedCompanies) || !isJobArray(loadedJobs) || !isApplicationOverrides(persistedApplications)
           || (persistedResume !== null && !isResumeProfile(persistedResume))) {
@@ -250,7 +270,7 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
     };
     void bootstrap();
     return () => { stopped = true; controller.abort(); };
-  }, [dataAttempt]);
+  }, [canAdminister, dataAttempt]);
 
   useEffect(() => {
     if (!features.utilities) {
@@ -359,6 +379,7 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
   };
 
   const navigate = (tab: string) => {
+    if (!canAdminister && !["Dashboard", "Companies", "Job List"].includes(tab)) return;
     if (tab === "Utilities" && !features.utilities) return;
     setSelectedCompanyId(undefined);
     setSelectedCompanyName(undefined);
@@ -384,11 +405,11 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
     const onPopState = () => {
       setSelectedCompanyId(undefined);
       setSelectedCompanyName(undefined);
-      setActiveTab(tabFromLocation());
+      setActiveTab(accessibleTabFromLocation(canAdminister));
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+  }, [canAdminister]);
 
   return (
     <div className="min-h-screen">
@@ -403,7 +424,7 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
             </div>
           </div>
           <nav className="mt-6 space-y-2">
-            {tabs.map((tab) => {
+            {visibleTabs.map((tab) => {
               const Icon = tab.icon;
               const selected = activeTab === tab.name;
               const disabled = tab.name === "Utilities" && !features.utilities;
@@ -455,7 +476,8 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
               error={dataError}
               onRetry={retryData}
               onNavigate={navigate}
-              onRematch={rematchJob}
+              onRematch={canAdminister ? rematchJob : undefined}
+              canAdminister={canAdminister}
             />
           ) : null}
           {activeTab === "Companies" ? (
@@ -465,7 +487,8 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
               onCompanyRefreshed={() => reloadAfterMutation({ companies: true, jobs: true }, "The company was refreshed, but the latest dashboard data could not be loaded.")}
               onCompanyDeleted={handleCompanyDeleted}
               selectedCompanyName={selectedCompanyName}
-              refreshEnabled={features.companyRefresh && features.discovery && features.browserJobs}
+              refreshEnabled={canAdminister && features.companyRefresh && features.discovery && features.browserJobs}
+              canAdminister={canAdminister}
             />
           ) : null}
           {activeTab === "Job List" ? (
@@ -481,6 +504,7 @@ function OpportunityApp({ sessionEmail, features, initialOperationError, onLogou
               onUpdateNotes={(jobId, notes) => updateJob(jobId, { notes })}
               pendingApplicationIds={pendingApplicationIds}
               onViewCompany={viewCompanyDetails}
+              canAdminister={canAdminister}
             />
           ) : null}
           {activeTab === "Jobs Applied For" ? (
@@ -522,6 +546,13 @@ function tabFromLocation(): Tab {
   return (Object.entries(TAB_PATHS).find(([, path]) => path === relative.replace(/\/$/, "") || (path === "/" && relative === "/"))?.[0] as Tab | undefined) ?? "Dashboard";
 }
 
+function accessibleTabFromLocation(canAdminister: boolean): Tab {
+  const requested = tabFromLocation();
+  return canAdminister || ["Dashboard", "Companies", "Job List"].includes(requested)
+    ? requested
+    : "Dashboard";
+}
+
 function mergeJobApplications(jobs: JobPayload[], overrides: ApplicationOverrides): Job[] {
   return jobs.map((job) => ({
     ...job,
@@ -540,10 +571,50 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
-function loginUrlFromPayload(payload: unknown): string {
-  if (!isRecord(payload)) return "";
-  if (typeof payload.loginUrl === "string") return payload.loginUrl;
-  return isRecord(payload.detail) && typeof payload.detail.loginUrl === "string"
-    ? payload.detail.loginUrl
-    : "";
+function safeLoginUrlFromPayload(payload: unknown, returnTo: string): string {
+  const fallback = `${API_BASE}/auth/start?returnTo=${encodeURIComponent(returnTo)}`;
+  if (!isRecord(payload)) return fallback;
+  const raw = typeof payload.loginUrl === "string"
+    ? payload.loginUrl
+    : isRecord(payload.detail) && typeof payload.detail.loginUrl === "string"
+      ? payload.detail.loginUrl
+      : "";
+  if (!raw) return fallback;
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    const expectedPath = `${APP_BASE}/api/auth/start` || "/api/auth/start";
+    return parsed.origin === window.location.origin && parsed.pathname === expectedPath && !parsed.hash
+      ? `${parsed.pathname}${parsed.search}`
+      : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function callbackAuthStateFromLocation(): CallbackAuthState | null {
+  const value = new URLSearchParams(window.location.search).get("auth");
+  return value === "denied" || value === "unavailable" || value === "failed" ? value : null;
+}
+
+function callbackAuthMessage(state: CallbackAuthState): string {
+  if (state === "denied") return "Your Blue Ash account is not assigned to Opportunity Radar.";
+  if (state === "unavailable") return "Blue Ash authentication is temporarily unavailable. Please try again.";
+  return "The authentication handoff could not be completed. Please try again.";
+}
+
+function removeCallbackAuthState(): void {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("auth");
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function safeExitUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === "https://blueashdigital.tech" && parsed.pathname === "/" && !parsed.search && !parsed.hash
+      ? parsed.toString()
+      : "/";
+  } catch {
+    return "/";
+  }
 }

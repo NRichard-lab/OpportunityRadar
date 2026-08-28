@@ -18,6 +18,7 @@ export interface SessionPayload {
   role: string;
   permissions: string[];
   developmentBypass: boolean;
+  canAdminister: boolean;
   features: FeatureFlags;
 }
 
@@ -283,7 +284,8 @@ function isSessionIdentity(value: unknown): value is Omit<SessionPayload, "featu
     && (value.email as string).trim().length > 0
     && (value.role as string).trim().length > 0
     && isStringArray(value.permissions)
-    && typeof value.developmentBypass === "boolean";
+    && typeof value.developmentBypass === "boolean"
+    && typeof value.canAdminister === "boolean";
 }
 
 export function isSessionPayload(value: unknown): value is SessionPayload {
@@ -301,6 +303,7 @@ export function normalizeSessionPayload(value: unknown): SessionPayload | null {
     role: value.role,
     permissions: [...value.permissions],
     developmentBypass: value.developmentBypass,
+    canAdminister: value.canAdminister,
     features: normalizeRuntimeFeatureFlags(value.features),
   };
 }
