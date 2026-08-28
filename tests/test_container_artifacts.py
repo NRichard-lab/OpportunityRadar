@@ -26,6 +26,8 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234", dockerfile)
         self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_VERSION=151.0.7922.34", dockerfile)
         self.assertIn("opportunity-radar-chromium-netns", dockerfile)
+        wrapper = (ROOT / "docker" / "backend" / "chromium-netns-wrapper").read_text(encoding="utf-8")
+        self.assertIn("--user --map-current-user --keep-caps", wrapper)
 
     def test_production_python_lock_is_exact_and_browser_pinned(self) -> None:
         lock = (ROOT / "requirements-production.txt").read_text(encoding="utf-8")

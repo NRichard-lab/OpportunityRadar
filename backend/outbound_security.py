@@ -904,6 +904,7 @@ def _validated_browser_wrapper(unshare: str) -> Path:
         str(Path(unshare)),
         "--user",
         "--map-current-user",
+        "--keep-caps",
         "--net",
         "--fork",
         "--kill-child=SIGKILL",

@@ -2,7 +2,7 @@
 set -eu
 
 exec /usr/bin/unshare \
-  --user --map-current-user \
+  --user --map-current-user --keep-caps \
   --net \
   --fork --kill-child=SIGKILL \
   -- /usr/bin/python -m backend.browser_netns_runner -- "$@"
