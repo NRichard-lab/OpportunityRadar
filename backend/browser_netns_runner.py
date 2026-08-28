@@ -16,6 +16,7 @@ MAX_RELAY_CONNECTIONS = 32
 _SIOCGIFFLAGS = 0x8913
 _SIOCSIFFLAGS = 0x8914
 _IFF_UP = 0x1
+_RTF_REJECT = 0x0200
 
 
 class NetworkNamespaceBoundaryError(RuntimeError):
@@ -217,8 +218,15 @@ def _require_loopback_only_routes() -> None:
             continue
         if fields[-1] != "lo":
             raise NetworkNamespaceBoundaryError("Browser namespace contains a non-loopback IPv6 route.")
-        if len(fields) > 1 and fields[0] == "0" * 32 and fields[1] == "00":
-            raise NetworkNamespaceBoundaryError("Browser namespace contains an IPv6 default route.")
+        if len(fields) > 8 and fields[0] == "0" * 32 and fields[1] == "00":
+            # Linux installs an unreachable/reject ::/0 sentinel on loopback
+            # even in a fresh network namespace. It is not an egress route.
+            try:
+                flags = int(fields[8], 16)
+            except ValueError as exc:
+                raise NetworkNamespaceBoundaryError("Browser namespace contains a malformed IPv6 route.") from exc
+            if not flags & _RTF_REJECT:
+                raise NetworkNamespaceBoundaryError("Browser namespace contains a usable IPv6 default route.")
 
 
 def _copy_bidirectionally(left: socket.socket, right: socket.socket) -> None:
