@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlparse
 BASE_DIR = Path(__file__).resolve().parent
 SUPPORTED_APP_ENVS = frozenset({"development", "production"})
 SUPPORTED_AUTH_MODES = frozenset({"local", "portal_handoff"})
+PRODUCTION_BROWSER_EGRESS_MODE = "network_namespace_dns_pinned_proxy_v1"
 
 
 def _read_bool(name: str, *, default: bool = False) -> bool:
@@ -84,6 +85,7 @@ APP_ENABLE_UTILITIES = _read_bool("APP_ENABLE_UTILITIES")
 APP_ENABLE_SCHEDULES = _read_bool("APP_ENABLE_SCHEDULES")
 APP_ENABLE_DISCOVERY = _read_bool("APP_ENABLE_DISCOVERY")
 APP_WRITE_FRONTEND_MIRRORS = _read_bool("APP_WRITE_FRONTEND_MIRRORS")
+APP_BROWSER_EGRESS_MODE = os.environ.get("APP_BROWSER_EGRESS_MODE", "disabled").strip().lower()
 
 # A production process must never turn a missing persistent mount into a new,
 # empty SQLite database.  Production defaults fail closed even if the setting

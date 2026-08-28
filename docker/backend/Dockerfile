@@ -1,18 +1,30 @@
 # syntax=docker/dockerfile:1.7
 
-# The digest pins the Debian-based Python 3.12 runtime used for this release.
-FROM python:3.12-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579
+# Playwright 1.62.0 image for linux/amd64, pinned to the immutable platform
+# manifest containing Chromium 151.0.7922.34 (revision 1234) and its Linux
+# runtime dependencies.
+FROM mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:51d31fdfacb0cff99a1a724152e34ae408d2bd4e7da310ff157450f49261cc59
 
 ARG APP_UID=10001
 ARG APP_GID=10001
 ARG DEPLOYMENT_VERSION=development
 
 LABEL org.opencontainers.image.title="Opportunity Radar backend" \
-      org.opencontainers.image.revision="${DEPLOYMENT_VERSION}"
+      org.opencontainers.image.revision="${DEPLOYMENT_VERSION}" \
+      org.opencontainers.image.playwright.version="1.62.0" \
+      org.opencontainers.image.chromium.version="151.0.7922.34" \
+      org.opencontainers.image.chromium.revision="1234" \
+      tech.blueash.browser-egress="network_namespace_dns_pinned_proxy_v1"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    OPPORTUNITY_RADAR_PLAYWRIGHT_VERSION=1.62.0 \
+    OPPORTUNITY_RADAR_CHROMIUM_VERSION=151.0.7922.34 \
+    OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234 \
+    OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE=/ms-playwright/chromium-1234/chrome-linux64/chrome \
+    OPPORTUNITY_RADAR_CHROMIUM_WRAPPER=/usr/local/bin/opportunity-radar-chromium-netns \
     HOME=/tmp \
     XDG_CACHE_HOME=/tmp/.cache \
     DEPLOYMENT_VERSION="${DEPLOYMENT_VERSION}"
@@ -33,6 +45,12 @@ RUN python -m pip install --no-cache-dir --no-deps --only-binary=:all: \
 COPY --chown=${APP_UID}:${APP_GID} *.py ./
 COPY --chown=${APP_UID}:${APP_GID} backend/ ./backend/
 COPY --chown=${APP_UID}:${APP_GID} collectors/ ./collectors/
+COPY docker/backend/chromium-netns-wrapper /usr/local/bin/opportunity-radar-chromium-netns
+
+RUN chmod 0555 /usr/local/bin/opportunity-radar-chromium-netns \
+    "${OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE}" \
+    && test -x "${OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE}" \
+    && python -c "import importlib.metadata as m; assert m.version('playwright') == '1.62.0'"
 
 USER ${APP_UID}:${APP_GID}
 

@@ -1,6 +1,7 @@
 # Python 3.12 production lock generated from requirements-production.in with:
 # pip-compile==7.5.1 --resolver=backtracking --strip-extras
-# Playwright and Chromium are intentionally excluded from this image.
+# Playwright is paired with Chromium 151.0.7922.34 (revision 1234) in the
+# digest-pinned production base image.
 annotated-doc==0.0.5
     # via fastapi
 annotated-types==0.8.0
@@ -29,6 +30,8 @@ feedparser-sgmllib==2.1.0
     # via feedparser
 filelock==3.32.4
     # via tldextract
+greenlet==3.5.5
+    # via playwright
 h11==0.16.0
     # via uvicorn
 idna==3.19
@@ -42,6 +45,8 @@ lxml==6.1.2
     #   python-docx
 openpyxl==3.1.5
     # via -r requirements-production.in
+playwright==1.62.0
+    # via -r requirements-production.in
 primp==2.0.0
     # via ddgs
 pydantic==2.13.4
@@ -50,6 +55,8 @@ pydantic-core==2.46.4
     # via pydantic
 pypdf==6.16.2
     # via -r requirements-production.in
+pyee==13.0.1
+    # via playwright
 python-docx==1.2.0
     # via -r requirements-production.in
 requests==2.34.2

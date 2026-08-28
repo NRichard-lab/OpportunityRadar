@@ -28,9 +28,11 @@ The frontend build stage uses Node 22 and `npm ci`; its runtime uses unprivilege
 10001. Both base images are digest-pinned. Python packages are version-locked in
 `requirements-production.txt`, and frontend packages are locked by `frontend/package-lock.json`.
 
-Playwright and Chromium are intentionally absent. Browser imports are lazy, no startup path needs
-them, and all browser/discovery features are disabled. A later browser-capable image must not be
-created until independent outbound egress enforcement exists.
+The backend image pins Playwright 1.62.0 and Chromium 151.0.7922.34 revision 1234 through an
+immutable linux/amd64 MCR image manifest. The application remains non-root and keeps one Uvicorn
+worker. Chromium is launched through the reviewed namespace wrapper and DNS-pinning proxy described
+in [PRODUCTION_RUNTIME.md](PRODUCTION_RUNTIME.md). Browser jobs still default to disabled and fail
+closed unless runtime preflight proves that boundary.
 
 ## Storage contract
 
@@ -84,13 +86,15 @@ these categories, and each Dockerfile copies only the source it needs.
 
 ## Build immutable images
 
-Set the full release commit and build both images from the repository root:
+Set the full backend release commit and build the backend image from the repository root. The
+frontend can remain on its separately recorded release when a backend-only change is deployed:
 
 ```sh
-OPPORTUNITY_RADAR_RELEASE_SHA="$(git rev-parse HEAD)"
+OPPORTUNITY_RADAR_BACKEND_RELEASE_SHA="$(git rev-parse HEAD)"
 docker build --pull --file docker/backend/Dockerfile \
-  --build-arg "DEPLOYMENT_VERSION=${OPPORTUNITY_RADAR_RELEASE_SHA}" \
-  --tag "blueash/opportunity-radar-backend:${OPPORTUNITY_RADAR_RELEASE_SHA}" .
+  --build-arg "DEPLOYMENT_VERSION=${OPPORTUNITY_RADAR_BACKEND_RELEASE_SHA}" \
+  --tag "blueash/opportunity-radar-backend:${OPPORTUNITY_RADAR_BACKEND_RELEASE_SHA}" .
+OPPORTUNITY_RADAR_RELEASE_SHA="<recorded frontend release>"
 docker build --pull --file docker/frontend/Dockerfile \
   --build-arg VITE_BASE_PATH=/ \
   --tag "blueash/opportunity-radar-frontend:${OPPORTUNITY_RADAR_RELEASE_SHA}" .
@@ -137,6 +141,13 @@ docker compose -f compose.production.yaml config --quiet
 docker compose -f compose.production.yaml up -d
 docker compose -f compose.production.yaml ps
 ```
+
+The backend uses `docker/backend/seccomp_profile.json`, derived from the Playwright 1.62.0 profile
+and narrowed so unprivileged `unshare` is accepted only for the user/network namespace transitions
+used by the browser launcher. AppArmor, `cap_drop: ALL`, `no-new-privileges`, read-only rootfs, and
+non-root UID/GID 10001 remain in force. Do not use `seccomp=unconfined`, `SYS_ADMIN`, `ipc: host`, a
+veth interface, or a default route in the child namespace. The profile SHA-256 for this release is
+recorded with the release artifacts and must be revalidated after edits.
 
 The production Compose file publishes no host ports. Future Caddy must join `blueash-edge` and use
 the reviewed `deploy/Caddyfile.example` only after a separate production change approval.
@@ -250,9 +261,9 @@ After checks, stop the synthetic stack with `docker compose -f compose.smoke.yam
 discard only the generated disposable directory according to the test record; never point the smoke
 file at the user's real runtime data.
 
-## Initial-release restrictions
+## Runtime restrictions
 
-Keep all six feature switches false: browser jobs, company refresh, Utilities, schedules, discovery,
-and frontend mirrors. Keep one Uvicorn worker and one backend replica. Do not enable Playwright,
-change the storage to PostgreSQL, use network filesystems, expose private directories, or deploy the
-Caddy example during Phase 2.
+Keep frontend mirrors disabled, one Uvicorn worker, one backend replica, browser workers at one,
+HTTP workers at four, and active maintenance at one. Do not change the storage to PostgreSQL, use
+network filesystems, expose private directories, or weaken the browser namespace/proxy boundary.
+Feature enablement does not create or run a schedule or collection automatically.

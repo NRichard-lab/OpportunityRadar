@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import atexit
+import functools
 import ipaddress
+import importlib.metadata
+import json
+import os
+import platform
 import re
 import socket
+import stat
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlsplit
 
@@ -16,6 +28,11 @@ from requests.utils import select_proxy
 
 DEFAULT_MAX_REDIRECTS = 5
 DEFAULT_ALLOWED_PORTS = frozenset({80, 443})
+BROWSER_EGRESS_MODE = "network_namespace_dns_pinned_proxy_v1"
+BROWSER_PLAYWRIGHT_VERSION = "1.62.0"
+BROWSER_CHROMIUM_REVISION = "1234"
+BROWSER_CHROMIUM_VERSION = "151.0.7922.34"
+BROWSER_PROXY_PORT = 17654
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _CROSS_ORIGIN_SECRET_HEADERS = {
     "authorization",
@@ -45,6 +62,10 @@ class OutboundRedirectLimitExceeded(OutboundSecurityError):
     """An outbound request exceeded the configured redirect limit."""
 
 
+class BrowserEgressConfigurationError(OutboundSecurityError):
+    """The independently enforced browser egress boundary is unavailable."""
+
+
 @dataclass(frozen=True)
 class ValidatedOutboundDestination:
     url: str
@@ -52,6 +73,18 @@ class ValidatedOutboundDestination:
     hostname: str
     port: int
     addresses: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BrowserRuntimeBoundary:
+    playwright_version: str
+    chromium_revision: str
+    chromium_version: str
+    chromium_executable: str
+    wrapper_executable: str
+    unshare_executable: str
+    unix_socket: str
+    proxy_port: int
 
 
 def validate_outbound_url(
@@ -600,14 +633,454 @@ def install_playwright_url_guard(
     return guard
 
 
+_browser_launch_lease = threading.Lock()
+_browser_boundary_lock = threading.Lock()
+_browser_proxy_process: subprocess.Popen[bytes] | None = None
+_browser_boundary_directory: Path | None = None
+_PROTECTED_BROWSER_ARGUMENTS = (
+    f"--proxy-server=http://127.0.0.1:{BROWSER_PROXY_PORT}",
+    "--proxy-bypass-list=<-loopback>",
+    "--host-resolver-rules=MAP * ~NOTFOUND",
+    "--disable-quic",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-domain-reliability",
+    "--disable-sync",
+    "--metrics-recording-only",
+)
+_FORBIDDEN_BROWSER_ARGUMENT_PREFIXES = (
+    "--proxy-server",
+    "--proxy-bypass-list",
+    "--proxy-auto-detect",
+    "--proxy-pac-url",
+    "--no-proxy-server",
+    "--host-resolver-rules",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--enable-quic",
+    "--force-webrtc-ip-handling-policy",
+    "--remote-debugging-address",
+    "--remote-debugging-port",
+)
+
+
 def launch_playwright_chromium(playwright: Any, **kwargs: Any) -> Any:
-    """Launch Chromium without inheriting or auto-detecting a host proxy."""
+    """Launch Chromium with production isolation or the fail-safe local policy."""
+
+    mode = os.environ.get("APP_BROWSER_EGRESS_MODE", "").strip()
+    environment = os.environ.get("APP_ENV", "development").strip().lower()
+    if mode == BROWSER_EGRESS_MODE:
+        return _launch_protected_playwright_chromium(playwright, kwargs)
+    if environment == "production":
+        raise BrowserEgressConfigurationError(
+            "Production browser launch requires the network-namespace DNS-pinned proxy boundary."
+        )
 
     launch_options = dict(kwargs)
     arguments = [str(value) for value in launch_options.pop("args", ())]
     if "--no-proxy-server" not in arguments:
         arguments.append("--no-proxy-server")
     return playwright.chromium.launch(args=arguments, **launch_options)
+
+
+def _launch_protected_playwright_chromium(playwright: Any, supplied: Mapping[str, Any]) -> Any:
+    launch_options = dict(supplied)
+    for option in ("proxy", "executable_path", "chromium_sandbox", "env"):
+        if option in launch_options:
+            raise BrowserEgressConfigurationError(
+                f"Browser launch option {option} is controlled by the production egress boundary."
+            )
+    arguments = [str(value) for value in launch_options.pop("args", ())]
+    for argument in arguments:
+        lowered = argument.lower()
+        if any(lowered == prefix or lowered.startswith(f"{prefix}=") for prefix in _FORBIDDEN_BROWSER_ARGUMENT_PREFIXES):
+            raise BrowserEgressConfigurationError(
+                "Browser launch arguments cannot override proxy, namespace, sandbox, or debugging controls."
+            )
+
+    runtime = validate_browser_runtime_boundary()
+    _require_browser_proxy_ready(runtime)
+    if not _browser_launch_lease.acquire(blocking=False):
+        raise BrowserEgressConfigurationError("Only one Chromium process may run at a time.")
+    try:
+        launch_options.update({
+            "args": [*arguments, *_PROTECTED_BROWSER_ARGUMENTS],
+            "chromium_sandbox": True,
+            "env": _browser_child_environment(runtime),
+            "executable_path": runtime.wrapper_executable,
+        })
+        browser = playwright.chromium.launch(**launch_options)
+    except BaseException:
+        _browser_launch_lease.release()
+        raise
+    return _LeasedBrowser(browser, _browser_launch_lease)
+
+
+class _LeasedBrowser:
+    def __init__(self, browser: Any, lease: threading.Lock) -> None:
+        self._browser = browser
+        self._lease = lease
+        self._release_lock = threading.Lock()
+        self._released = False
+        on = getattr(browser, "on", None)
+        if callable(on):
+            on("disconnected", self._on_disconnected)
+
+    def _on_disconnected(self, *_args: Any) -> None:
+        self._release()
+
+    def _release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            self._lease.release()
+
+    def close(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._browser.close(*args, **kwargs)
+        finally:
+            self._release()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._browser, name)
+
+
+@functools.lru_cache(maxsize=1)
+def validate_browser_runtime_boundary() -> BrowserRuntimeBoundary:
+    """Fail closed unless the exact browser runtime and netns proxy are ready."""
+
+    if os.environ.get("APP_BROWSER_EGRESS_MODE", "").strip() != BROWSER_EGRESS_MODE:
+        raise BrowserEgressConfigurationError(
+            f"APP_BROWSER_EGRESS_MODE must be exactly {BROWSER_EGRESS_MODE}."
+        )
+    if platform.system() != "Linux" or not hasattr(os, "geteuid"):
+        raise BrowserEgressConfigurationError("The protected browser boundary requires Linux.")
+    if os.geteuid() == 0:
+        raise BrowserEgressConfigurationError("The protected browser runtime must run as a non-root user.")
+    try:
+        playwright_version = importlib.metadata.version("playwright")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise BrowserEgressConfigurationError("The pinned Playwright runtime is not installed.") from exc
+    if playwright_version != BROWSER_PLAYWRIGHT_VERSION:
+        raise BrowserEgressConfigurationError(
+            f"Playwright must be pinned to {BROWSER_PLAYWRIGHT_VERSION}."
+        )
+    revision, browser_version = _installed_playwright_browser_metadata()
+    if revision != BROWSER_CHROMIUM_REVISION or browser_version != BROWSER_CHROMIUM_VERSION:
+        raise BrowserEgressConfigurationError("Playwright Chromium metadata does not match the approved runtime.")
+
+    chromium_executable = _playwright_chromium_executable()
+    configured_chromium = os.environ.get("OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE", "").strip()
+    if configured_chromium and Path(configured_chromium).resolve() != Path(chromium_executable).resolve():
+        raise BrowserEgressConfigurationError("Configured Chromium executable does not match Playwright.")
+    try:
+        chromium_metadata = Path(chromium_executable).stat()
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("The approved Chromium executable is unavailable.") from exc
+    if (
+        not Path(chromium_executable).is_file()
+        or not os.access(chromium_executable, os.X_OK)
+        or chromium_metadata.st_uid != 0
+        or stat.S_IMODE(chromium_metadata.st_mode) & 0o022
+    ):
+        raise BrowserEgressConfigurationError("The approved Chromium executable is missing or not executable.")
+    if f"chromium-{BROWSER_CHROMIUM_REVISION}" not in Path(chromium_executable).as_posix():
+        raise BrowserEgressConfigurationError("Chromium executable does not belong to the approved revision.")
+    chromium_version = _chromium_binary_version(chromium_executable)
+    if chromium_version != BROWSER_CHROMIUM_VERSION:
+        raise BrowserEgressConfigurationError("Chromium binary version does not match the approved runtime.")
+
+    unshare = "/usr/bin/unshare"
+    try:
+        unshare_metadata = Path(unshare).stat()
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("The unshare executable required for network isolation is unavailable.") from exc
+    if (
+        not Path(unshare).is_file()
+        or not os.access(unshare, os.X_OK)
+        or unshare_metadata.st_uid != 0
+        or stat.S_IMODE(unshare_metadata.st_mode) & 0o022
+    ):
+        raise BrowserEgressConfigurationError("The unshare executable required for network isolation is unavailable.")
+
+    wrapper = _validated_browser_wrapper(unshare)
+    with _browser_boundary_lock:
+        directory, unix_socket = _ensure_browser_boundary_files()
+        _ensure_browser_proxy_process(directory, unix_socket)
+        _probe_browser_network_namespace(wrapper, unix_socket, chromium_executable)
+    return BrowserRuntimeBoundary(
+        playwright_version=playwright_version,
+        chromium_revision=revision,
+        chromium_version=chromium_version,
+        chromium_executable=chromium_executable,
+        wrapper_executable=str(wrapper),
+        unshare_executable=unshare,
+        unix_socket=str(unix_socket),
+        proxy_port=BROWSER_PROXY_PORT,
+    )
+
+
+def _installed_playwright_browser_metadata() -> tuple[str, str]:
+    try:
+        import playwright
+
+        manifest = Path(playwright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        entry = next(item for item in document["browsers"] if item.get("name") == "chromium")
+        return str(entry["revision"]), str(entry["browserVersion"])
+    except (ImportError, OSError, KeyError, StopIteration, TypeError, ValueError) as exc:
+        raise BrowserEgressConfigurationError("Playwright Chromium metadata could not be verified.") from exc
+
+
+def _playwright_chromium_executable() -> str:
+    script = (
+        "from playwright.sync_api import sync_playwright; "
+        "p=sync_playwright().start(); "
+        "print(p.chromium.executable_path); "
+        "p.stop()"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=_sanitized_process_environment(include_playwright_path=True),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BrowserEgressConfigurationError("Playwright could not locate its Chromium executable.") from exc
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise BrowserEgressConfigurationError("Playwright returned an ambiguous Chromium executable path.")
+    return lines[0]
+
+
+def _chromium_binary_version(executable: str) -> str:
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            env=_sanitized_process_environment(),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BrowserEgressConfigurationError("Chromium binary version could not be verified.") from exc
+    match = re.search(
+        r"(?:Chromium|Google Chrome for Testing|Chrome)\s+([0-9]+(?:\.[0-9]+){3})",
+        result.stdout,
+    )
+    if match is None:
+        raise BrowserEgressConfigurationError("Chromium returned an unrecognized version string.")
+    return match.group(1)
+
+
+def _validated_browser_wrapper(unshare: str) -> Path:
+    configured = os.environ.get("OPPORTUNITY_RADAR_CHROMIUM_WRAPPER", "").strip()
+    if not configured:
+        raise BrowserEgressConfigurationError("The immutable Chromium namespace wrapper is not configured.")
+    wrapper = Path(configured)
+    try:
+        metadata = wrapper.stat()
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("The Chromium namespace wrapper is unavailable.") from exc
+    if (
+        not wrapper.is_file()
+        or not os.access(wrapper, os.X_OK)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o222
+    ):
+        raise BrowserEgressConfigurationError("Chromium namespace wrapper ownership or permissions are unsafe.")
+    try:
+        wrapper_text = wrapper.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("Chromium namespace wrapper could not be verified.") from exc
+    required_fragments = (
+        str(Path(unshare)),
+        "--user",
+        "--map-current-user",
+        "--net",
+        "--fork",
+        "--kill-child=SIGKILL",
+        "backend.browser_netns_runner",
+    )
+    if any(fragment not in wrapper_text for fragment in required_fragments):
+        raise BrowserEgressConfigurationError("Chromium namespace wrapper is missing an isolation control.")
+    return wrapper
+
+
+def _ensure_browser_boundary_files() -> tuple[Path, Path]:
+    global _browser_boundary_directory
+    if _browser_boundary_directory is None:
+        _browser_boundary_directory = Path(tempfile.mkdtemp(prefix="radar-browser-egress-"))
+    directory = _browser_boundary_directory
+    metadata = directory.stat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise BrowserEgressConfigurationError("Browser boundary directory ownership or permissions are unsafe.")
+    unix_socket = directory / "egress.sock"
+    return directory, unix_socket
+
+
+def _ensure_browser_proxy_process(directory: Path, unix_socket: Path) -> None:
+    global _browser_proxy_process
+    if unix_socket.parent != directory:
+        raise BrowserEgressConfigurationError("Browser proxy socket escaped its protected runtime directory.")
+    if _browser_proxy_process is not None and _browser_proxy_process.poll() is None:
+        _require_owner_only_unix_socket(unix_socket)
+        return
+    command = [
+        sys.executable,
+        "-m",
+        "backend.browser_egress_proxy",
+        "--socket",
+        str(unix_socket),
+        "--parent-pid",
+        str(os.getpid()),
+    ]
+    try:
+        _browser_proxy_process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=_sanitized_process_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("Browser egress proxy process could not start.") from exc
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _browser_proxy_process.poll() is not None:
+            break
+        try:
+            _require_owner_only_unix_socket(unix_socket)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as readiness:
+                readiness.settimeout(0.2)
+                readiness.connect(str(unix_socket))
+            return
+        except BrowserEgressConfigurationError:
+            time.sleep(0.05)
+        except OSError:
+            time.sleep(0.05)
+    _stop_browser_proxy_process()
+    raise BrowserEgressConfigurationError("Browser egress proxy did not create its protected Unix socket.")
+
+
+def _require_owner_only_unix_socket(unix_socket: Path) -> None:
+    try:
+        metadata = unix_socket.lstat()
+    except FileNotFoundError as exc:
+        raise BrowserEgressConfigurationError("Browser egress proxy socket is unavailable.") from exc
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise BrowserEgressConfigurationError("Browser egress proxy socket ownership or permissions are unsafe.")
+
+
+def _require_browser_proxy_ready(runtime: BrowserRuntimeBoundary) -> None:
+    unix_socket = Path(runtime.unix_socket)
+    with _browser_boundary_lock:
+        _ensure_browser_proxy_process(unix_socket.parent, unix_socket)
+        _require_owner_only_unix_socket(unix_socket)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(2.0)
+                probe.connect(str(unix_socket))
+                probe.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+                response = probe.recv(256)
+        except OSError as exc:
+            raise BrowserEgressConfigurationError("Browser egress proxy health check failed.") from exc
+        if not response.startswith(b"HTTP/1.1 403 "):
+            raise BrowserEgressConfigurationError("Browser egress proxy did not enforce private-address denial.")
+
+
+def _probe_browser_network_namespace(wrapper: Path, unix_socket: Path, chromium_executable: str) -> None:
+    environment = _browser_boundary_environment(
+        unix_socket=str(unix_socket),
+        real_executable=chromium_executable,
+    )
+    try:
+        result = subprocess.run(
+            [str(wrapper), "--probe"],
+            env=environment,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BrowserEgressConfigurationError("Browser network-namespace probe could not run.") from exc
+    if result.returncode != 0:
+        raise BrowserEgressConfigurationError("Browser network-namespace isolation probe failed closed.")
+
+
+def _browser_child_environment(runtime: BrowserRuntimeBoundary) -> dict[str, str]:
+    return _browser_boundary_environment(
+        unix_socket=runtime.unix_socket,
+        real_executable=runtime.chromium_executable,
+    )
+
+
+def _browser_boundary_environment(
+    *,
+    unix_socket: str,
+    real_executable: str,
+) -> dict[str, str]:
+    environment = _sanitized_process_environment()
+    environment.update({
+        "OPPORTUNITY_RADAR_BROWSER_PARENT_NETNS": _browser_parent_netns_inode(),
+        "OPPORTUNITY_RADAR_BROWSER_PROXY_SOCKET": unix_socket,
+        "OPPORTUNITY_RADAR_CHROMIUM_EXECUTABLE": real_executable,
+    })
+    return environment
+
+
+def _browser_parent_netns_inode() -> str:
+    try:
+        return str(Path("/proc/self/ns/net").stat().st_ino)
+    except OSError as exc:
+        raise BrowserEgressConfigurationError("Parent network namespace identity is unavailable.") from exc
+
+
+def _sanitized_process_environment(*, include_playwright_path: bool = False) -> dict[str, str]:
+    environment: dict[str, str] = {
+        "HOME": "/tmp",
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "PYTHONUNBUFFERED": "1",
+        "TMPDIR": "/tmp",
+        "XDG_CACHE_HOME": "/tmp/.cache",
+    }
+    if include_playwright_path and os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        environment["PLAYWRIGHT_BROWSERS_PATH"] = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    return environment
+
+
+def _stop_browser_proxy_process() -> None:
+    global _browser_proxy_process
+    process = _browser_proxy_process
+    _browser_proxy_process = None
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2.0)
+
+
+atexit.register(_stop_browser_proxy_process)
 
 
 def safe_page_goto(

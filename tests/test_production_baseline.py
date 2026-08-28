@@ -30,6 +30,7 @@ CONFIG_KEYS = {
     "APP_WRITE_FRONTEND_MIRRORS", "APP_DATA_DIR", "APP_IMPORT_DIR", "APP_EXPORT_DIR",
     "APP_OUTPUT_DIR", "APP_BACKUP_DIR", "APP_LOG_DIR", "DATABASE_URL",
     "APP_MAX_HTTP_WORKERS", "APP_MAX_BROWSER_WORKERS", "APP_MAX_ACTIVE_MAINTENANCE",
+    "APP_BROWSER_EGRESS_MODE",
     "REQUIRE_EXISTING_DATABASE",
 }
 TRUSTED_ID = "17f975f1-e63a-4daa-985a-82d39ed60684"
@@ -178,7 +179,17 @@ class ProductionConfigurationTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("APP_ENABLE_BROWSER_JOBS", result.stderr)
-        self.assertIn("DNS-pinned", result.stderr)
+        self.assertIn("egress boundary", result.stderr)
+
+    def test_production_rejects_unverified_browser_runtime_even_when_mode_is_claimed(self) -> None:
+        values = valid_production_environment()
+        values["APP_ENABLE_BROWSER_JOBS"] = "true"
+        values["APP_BROWSER_EGRESS_MODE"] = "network_namespace_dns_pinned_proxy_v1"
+
+        result = run_validation(values)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("verified DNS-pinned proxy", result.stderr)
 
     def test_runtime_paths_are_independently_configurable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

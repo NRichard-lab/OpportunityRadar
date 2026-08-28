@@ -17,9 +17,14 @@ from uuid import UUID
 
 import requests
 
-from backend.outbound_security import OutboundSecurityError, SSRFProtectedSession
+from backend.outbound_security import (
+    OutboundSecurityError,
+    SSRFProtectedSession,
+    validate_browser_runtime_boundary,
+)
 from config import (
     APP_BASE_PATH,
+    APP_BROWSER_EGRESS_MODE,
     APP_ENABLE_BROWSER_JOBS,
     APP_ENV,
     APP_PUBLIC_URL,
@@ -38,6 +43,7 @@ from config import (
     IMPORT_DIR,
     LOG_DIR,
     OPPORTUNITY_RADAR_SECRET_KEY,
+    PRODUCTION_BROWSER_EGRESS_MODE,
     RADAR_HANDOFF_STATE_TTL_SECONDS,
     RADAR_INTROSPECTION_CACHE_SECONDS,
     RADAR_SESSION_ABSOLUTE_MAX_SECONDS,
@@ -213,10 +219,18 @@ def validate_auth_configuration() -> None:
                 "SQLite mount cannot be replaced by an empty database."
             )
         if APP_ENABLE_BROWSER_JOBS:
-            raise BlueAshConfigurationError(
-                "APP_ENABLE_BROWSER_JOBS cannot be enabled in production in this release; "
-                "browser traffic does not yet have a DNS-pinned network egress boundary."
-            )
+            if APP_BROWSER_EGRESS_MODE != PRODUCTION_BROWSER_EGRESS_MODE:
+                raise BlueAshConfigurationError(
+                    "APP_ENABLE_BROWSER_JOBS requires the independently enforced production "
+                    "browser egress boundary."
+                )
+            try:
+                validate_browser_runtime_boundary()
+            except (OutboundSecurityError, OSError, RuntimeError) as exc:
+                raise BlueAshConfigurationError(
+                    "APP_ENABLE_BROWSER_JOBS requires a verified DNS-pinned proxy inside an "
+                    "isolated browser network namespace."
+                ) from exc
         if not _canonical_uuid(APP_TRUSTED_ADMIN_USER_ID):
             raise BlueAshConfigurationError("Production requires APP_TRUSTED_ADMIN_USER_ID to be a valid UUID.")
         if APP_WRITE_FRONTEND_MIRRORS:

@@ -9,9 +9,11 @@ Phase 2 supports a deliberately small first-release runtime. It does not authori
 - Production is restricted to the exact `APP_TRUSTED_ADMIN_USER_ID`. The database is not multi-user scoped.
 - Maintenance threads are tracked, cooperative cancellation is requested during shutdown, and stale active records are reconciled as interrupted during startup.
 
-## Safe initial feature state
+## Safe feature defaults
 
-Keep all of these values false for the initial release:
+The checked-in template keeps all features false. Enable a feature only through
+the protected production environment after its operational boundary has been
+validated:
 
 ```dotenv
 APP_ENABLE_BROWSER_JOBS=false
@@ -36,7 +38,7 @@ APP_MAX_BROWSER_WORKERS=1
 APP_MAX_ACTIVE_MAINTENANCE=1
 ```
 
-API models, scheduled actions, collectors, discovery operations, and CLI entry points clamp or reject values outside these configured limits. Browser work remains unavailable while `APP_ENABLE_BROWSER_JOBS=false` regardless of the browser worker setting. This release also rejects `APP_ENABLE_BROWSER_JOBS=true` when `APP_ENV=production`: Playwright validates every URL and redirect, but it cannot pin the browser's socket to the validated DNS answer. Keep browser jobs off until production browser traffic is forced through an independently enforced, allowlisted egress boundary.
+API models, scheduled actions, collectors, discovery operations, and CLI entry points clamp or reject values outside these configured limits. Browser work remains unavailable while `APP_ENABLE_BROWSER_JOBS=false` regardless of the browser worker setting. Production accepts `APP_ENABLE_BROWSER_JOBS=true` only when `APP_BROWSER_EGRESS_MODE=network_namespace_dns_pinned_proxy_v1` and runtime preflight proves the exact Playwright/Chromium pair, namespace launcher, Chromium wrapper, and no-direct-egress namespace are present. An environment assertion by itself is not sufficient.
 
 ## Persistent storage
 
@@ -67,4 +69,6 @@ The check never initializes or migrates SQLite, persists its database probe, con
 
 ## Outbound requests
 
-Application-controlled HTTP and browser destinations use the central outbound validator. Only HTTP(S) on approved ports is accepted; credentials and unsafe/malformed hosts are rejected; every DNS answer must be globally routable; and every redirect is revalidated with a bounded redirect count. Requests connections are pinned to a freshly validated address while preserving the original HTTP Host/TLS identity, and cross-origin redirects cannot carry request/session credentials or original query parameters. Browser service workers, WebSockets, and automatic proxy use are blocked by the current policy; browser jobs still remain production-disabled because Playwright cannot provide the same socket-level DNS pinning without an external egress boundary.
+Application-controlled HTTP and browser destinations use the central outbound validator. Only HTTP(S) on approved ports is accepted; credentials and unsafe/malformed hosts are rejected; every DNS answer must be globally routable; and every redirect is revalidated with a bounded redirect count. Requests connections are pinned to a freshly validated address while preserving the original HTTP Host/TLS identity, and cross-origin redirects cannot carry request/session credentials or original query parameters.
+
+When the production browser boundary is enabled, Chromium runs as UID/GID 10001 in a child user/network namespace with only loopback and no default route. Chromium is forced through a loopback relay that crosses the namespace only through a mode-0600 pathname Unix socket. The parent-side proxy validates every HTTP absolute-form or CONNECT destination and connects to a validated numeric address, closing the DNS-rebinding gap. The empty kernel network namespace independently prevents a browser transport from directly reaching Uvicorn loopback, Docker networks, private networks, link-local/metadata endpoints, or the public Internet. Service workers and WebSockets remain blocked, and QUIC and non-proxied WebRTC are disabled as defense in depth. If the proxy or relay is unavailable, browser traffic has no direct fallback.

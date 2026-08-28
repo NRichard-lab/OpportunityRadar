@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -12,15 +13,21 @@ class ContainerArtifactTests(unittest.TestCase):
     def test_backend_image_is_pinned_non_root_and_single_worker(self) -> None:
         dockerfile = (ROOT / "docker" / "backend" / "Dockerfile").read_text(encoding="utf-8")
 
-        self.assertRegex(dockerfile, r"FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}")
+        self.assertIn(
+            "FROM mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:"
+            "51d31fdfacb0cff99a1a724152e34ae408d2bd4e7da310ff157450f49261cc59",
+            dockerfile,
+        )
         self.assertIn("USER ${APP_UID}:${APP_GID}", dockerfile)
         self.assertIn('ARG APP_UID=10001', dockerfile)
         self.assertIn('"--workers", "1"', dockerfile)
         self.assertIn('"--no-access-log"', dockerfile)
         self.assertNotIn("requirements.txt /tmp", dockerfile)
-        self.assertNotIn("playwright install", dockerfile.lower())
+        self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_REVISION=1234", dockerfile)
+        self.assertIn("OPPORTUNITY_RADAR_CHROMIUM_VERSION=151.0.7922.34", dockerfile)
+        self.assertIn("opportunity-radar-chromium-netns", dockerfile)
 
-    def test_production_python_lock_is_exact_and_browser_free(self) -> None:
+    def test_production_python_lock_is_exact_and_browser_pinned(self) -> None:
         lock = (ROOT / "requirements-production.txt").read_text(encoding="utf-8")
         requirements = [
             line.strip()
@@ -30,7 +37,9 @@ class ContainerArtifactTests(unittest.TestCase):
 
         self.assertGreater(len(requirements), 20)
         self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_.-]+==[^\s]+", item) for item in requirements))
-        self.assertFalse(any(item.lower().startswith("playwright==") for item in requirements))
+        self.assertIn("playwright==1.62.0", requirements)
+        self.assertIn("greenlet==3.5.5", requirements)
+        self.assertIn("pyee==13.0.1", requirements)
 
     def test_frontend_server_separates_spa_api_data_and_assets(self) -> None:
         dockerfile = (ROOT / "docker" / "frontend" / "Dockerfile").read_text(encoding="utf-8")
@@ -58,8 +67,33 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertEqual(compose.count("init: true"), 2)
         self.assertIn("stop_grace_period: 60s", compose)
         self.assertIn('REQUIRE_EXISTING_DATABASE: "true"', compose)
-        self.assertIn('APP_ENABLE_BROWSER_JOBS: "false"', compose)
+        self.assertNotIn('APP_ENABLE_BROWSER_JOBS: "false"', compose)
+        self.assertIn("OPPORTUNITY_RADAR_BACKEND_RELEASE_SHA", compose)
+        self.assertIn("seccomp:${OPPORTUNITY_RADAR_SECCOMP_PROFILE", compose)
+        self.assertIn("/dev/shm:rw,nosuid,nodev,size=256m", compose)
+        self.assertNotIn("SYS_ADMIN", compose)
         self.assertIn("/srv/opportunity-radar", compose)
+
+    def test_browser_seccomp_profile_is_fail_closed_and_namespace_scoped(self) -> None:
+        profile = json.loads(
+            (ROOT / "docker" / "backend" / "seccomp_profile.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(profile["defaultAction"], "SCMP_ACT_ERRNO")
+        unconditional_namespace_allows = [
+            rule
+            for rule in profile["syscalls"]
+            if rule.get("action") == "SCMP_ACT_ALLOW"
+            and not rule.get("args")
+            and {"clone", "setns", "unshare"}.intersection(rule.get("names", []))
+            and not rule.get("includes", {}).get("caps")
+        ]
+        self.assertEqual(unconditional_namespace_allows, [])
+        unshare_values = {
+            rule["args"][0]["value"]
+            for rule in profile["syscalls"]
+            if rule.get("names") == ["unshare"] and rule.get("args")
+        }
+        self.assertEqual(unshare_values, {268435456, 1073741824, 1342177280})
 
     def test_production_environment_is_safe_template_only(self) -> None:
         template = (ROOT / "deploy" / "opportunity-radar.env.example").read_text(encoding="utf-8")
@@ -77,6 +111,7 @@ class ContainerArtifactTests(unittest.TestCase):
             "RADAR_INTROSPECTION_CACHE_SECONDS": "0",
             "REQUIRE_EXISTING_DATABASE": "true",
             "APP_ENABLE_BROWSER_JOBS": "false",
+            "APP_BROWSER_EGRESS_MODE": "disabled",
             "APP_ENABLE_COMPANY_REFRESH": "false",
             "APP_ENABLE_UTILITIES": "false",
             "APP_ENABLE_SCHEDULES": "false",
