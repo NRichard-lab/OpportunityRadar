@@ -199,6 +199,18 @@ class ADPCollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "meta object"):
                 ADPCollector(delay_seconds=0).collect(self.company)
 
+    def test_total_change_between_pages_fails_closed(self) -> None:
+        pages = {
+            1: {"jobRequisitions": self.records[:2], "meta": {"startSequence": 1, "totalNumber": 4}},
+            3: {"jobRequisitions": self.records[2:3], "meta": {"startSequence": 3, "totalNumber": 3}},
+        }
+        with (
+            patch("collectors.adp_collector.ADP_PAGE_SIZE", 2),
+            patch.object(ADPCollector, "get", new=response_router(pages, self.details, [])),
+        ):
+            with self.assertRaisesRegex(ValueError, "total changed"):
+                ADPCollector(delay_seconds=0).collect(self.company)
+
     def test_collector_selection_uses_verified_url_despite_stale_platform(self) -> None:
         selected = pick_collector(self.company, delay_seconds=0)
         self.assertIsInstance(selected, ADPCollector)

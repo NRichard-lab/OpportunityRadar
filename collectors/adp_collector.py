@@ -50,7 +50,12 @@ class ADPCollector(BaseCollector):
                 if not isinstance(meta, dict):
                     raise ValueError("ADP listing response did not contain a meta object")
                 total = required_nonnegative_integer(meta, "totalNumber")
-                expected_total = total
+                if expected_total is None:
+                    expected_total = total
+                elif total != expected_total:
+                    raise ValueError(
+                        f"ADP listing total changed during pagination from {expected_total} to {total}"
+                    )
                 if not requisitions:
                     if fetched_requisition_count < expected_total:
                         raise ValueError(
