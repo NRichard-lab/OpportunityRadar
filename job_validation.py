@@ -4,6 +4,7 @@ import re
 
 
 REJECTED_EXACT_TITLES = {
+    "general employment application",
     "skip to content",
     "careers",
     "career",
@@ -118,6 +119,7 @@ ROLE_NOUNS = {
     "teller",
     "banker",
     "representative",
+    "receptionist",
     "specialist",
     "manager",
     "analyst",

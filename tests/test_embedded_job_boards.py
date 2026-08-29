@@ -1,6 +1,7 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
+from browser_tools import BrowserCandidate, _discover_with_launched_browser, discover_job_board_with_browser
 from collectors.paylocity_collector import find_paylocity_listing_scope
 from collectors.base import BaseCollector
 from job_board_discovery import static_scan
@@ -56,6 +57,55 @@ class EmbeddedJobBoardTests(unittest.TestCase):
             resolved = collector.resolve_embedded_job_board_url("https://example.com/careers", "Paycor")
 
         self.assertIn("recruitingbypaycor.com/career/CareerHome.action", resolved)
+
+    def test_browser_discovery_always_closes_browser_when_context_creation_crashes(self):
+        manager = MagicMock()
+        manager.__enter__.return_value = Mock()
+        browser = Mock()
+        browser.new_context.side_effect = RuntimeError("page crashed")
+
+        with (
+            patch("playwright.sync_api.sync_playwright", return_value=manager),
+            patch("browser_tools.launch_playwright_chromium", return_value=browser),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "page crashed"):
+                discover_job_board_with_browser("https://example.com/careers", "Example Bank")
+
+        browser.close.assert_called_once_with()
+
+    def test_browser_discovery_rejects_final_redirect_to_indeed_company_profile(self):
+        browser = Mock()
+        context = Mock()
+        browser.new_context.return_value = context
+        initial_page = Mock()
+        candidate_page = Mock()
+        final_page = Mock()
+        final_page.url = "https://www.indeed.com/cmp/Acnb-Bank-1"
+        context.new_page.side_effect = [initial_page, candidate_page]
+        context.pages = [initial_page, candidate_page, final_page]
+        popup = MagicMock()
+        popup.__enter__.return_value = Mock(value=final_page)
+        candidate_page.expect_popup.return_value = popup
+        candidate_page.locator.return_value.nth.return_value = Mock()
+        candidate = BrowserCandidate(
+            index=0,
+            text="View Open Positions",
+            href="https://bank.example/jobs",
+            tag="a",
+            score=80,
+        )
+
+        with (
+            patch("browser_tools.install_playwright_url_guard"),
+            patch("browser_tools.safe_page_goto"),
+            patch("browser_tools.find_platform_iframe", return_value=""),
+            patch("browser_tools.choose_candidates", return_value=[candidate]),
+        ):
+            result = _discover_with_launched_browser(browser, "https://bank.example/careers", TimeoutError)
+
+        self.assertEqual(result["status"], "Needs Review")
+        self.assertIsNone(result["final_url"])
+        self.assertIn("Rejected https://www.indeed.com/cmp/Acnb-Bank-1", str(result["notes"]))
 
 
 if __name__ == "__main__":

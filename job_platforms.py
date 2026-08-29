@@ -30,7 +30,6 @@ PLATFORM_DOMAIN_MAP = {
     "jazzhr.com": "JazzHR",
     "clearcompany.com": "ClearCompany",
     "paycor.com": "Paycor",
-    "indeed.com/cmp/": "Indeed Company Jobs",
     "app.joinhandshake.com": "Handshake",
 }
 

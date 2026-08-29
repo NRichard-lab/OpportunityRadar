@@ -85,96 +85,111 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
 
     with sync_playwright() as playwright:
         browser = launch_playwright_chromium(playwright, headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "FinancialJobsRadar/1.0 "
-                "(public job board URL discovery; no applications or form submissions)"
-            ),
-            service_workers="block",
-        )
-        install_playwright_url_guard(context)
-        page = context.new_page()
         try:
-            safe_page_goto(page, careers_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except PlaywrightTimeoutError:
-            pass
-
-        iframe_url = find_platform_iframe(page)
-        if iframe_url:
-            platform = detect_job_platform(iframe_url)
+            return _discover_with_launched_browser(
+                browser,
+                careers_url,
+                PlaywrightTimeoutError,
+            )
+        finally:
+            # Releasing this leased browser is mandatory even when Chromium crashes
+            # during context creation or navigation.
             browser.close()
-            return {
-                "final_url": iframe_url,
-                "platform": platform or None,
-                "status": "Completed",
-                "notes": f"Found embedded public job board iframe for {platform or 'job board'}.",
-                "clicked_text": "Embedded job board iframe",
-            }
 
-        candidates = choose_candidates(page, careers_url)
-        if not candidates:
-            browser.close()
-            return not_found("No job board button/link found with browser automation.")
 
-        last_error = ""
-        for candidate in candidates[:6]:
+def _discover_with_launched_browser(browser, careers_url: str, playwright_timeout_error) -> dict[str, str | None]:
+    context = browser.new_context(
+        user_agent=(
+            "FinancialJobsRadar/1.0 "
+            "(public job board URL discovery; no applications or form submissions)"
+        ),
+        service_workers="block",
+    )
+    install_playwright_url_guard(context)
+    page = context.new_page()
+    try:
+        safe_page_goto(page, careers_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except playwright_timeout_error:
+        pass
+
+    iframe_url = find_platform_iframe(page)
+    if iframe_url:
+        platform = detect_job_platform(iframe_url)
+        return {
+            "final_url": iframe_url,
+            "platform": platform or None,
+            "status": "Completed",
+            "notes": f"Found embedded public job board iframe for {platform or 'job board'}.",
+            "clicked_text": "Embedded job board iframe",
+        }
+
+    candidates = choose_candidates(page, careers_url)
+    if not candidates:
+        return not_found("No job board button/link found with browser automation.")
+
+    last_error = ""
+    for candidate in candidates[:6]:
+        before_pages = len(context.pages)
+        candidate_page = None
+        try:
+            candidate_page = context.new_page()
+            safe_page_goto(candidate_page, careers_url, wait_until="domcontentloaded", timeout=30000)
+            candidate_page.wait_for_load_state("networkidle", timeout=7000)
             before_pages = len(context.pages)
-            try:
-                candidate_page = context.new_page()
-                safe_page_goto(candidate_page, careers_url, wait_until="domcontentloaded", timeout=30000)
-                candidate_page.wait_for_load_state("networkidle", timeout=7000)
-                before_pages = len(context.pages)
-                locator = candidate_page.locator("a, button, [role='button'], [role='link']").nth(candidate.index)
-                locator.scroll_into_view_if_needed(timeout=3000)
-                with candidate_page.expect_popup(timeout=5000) as popup_info:
-                    try:
-                        locator.click(timeout=8000, no_wait_after=False)
-                    except PlaywrightTimeoutError:
-                        raise
-                final_page = popup_info.value
-                final_page.wait_for_load_state("domcontentloaded", timeout=12000)
-            except PlaywrightTimeoutError:
-                final_page = context.pages[-1] if len(context.pages) > before_pages else candidate_page
-            except Exception as exc:
-                last_error = str(exc)
+            locator = candidate_page.locator("a, button, [role='button'], [role='link']").nth(candidate.index)
+            locator.scroll_into_view_if_needed(timeout=3000)
+            with candidate_page.expect_popup(timeout=5000) as popup_info:
                 try:
-                    candidate_page.close()
-                except Exception:
-                    pass
-                continue
-
+                    locator.click(timeout=8000, no_wait_after=False)
+                except playwright_timeout_error:
+                    raise
+            final_page = popup_info.value
+            final_page.wait_for_load_state("domcontentloaded", timeout=12000)
+        except playwright_timeout_error:
+            final_page = context.pages[-1] if len(context.pages) > before_pages else candidate_page
+        except Exception as exc:
+            last_error = str(exc)
             try:
-                final_page.wait_for_timeout(1500)
+                if candidate_page is not None:
+                    candidate_page.close()
             except Exception:
                 pass
-            final_url = final_page.url or candidate.href or careers_url
-            if candidate.href and final_url.rstrip("/") == careers_url.rstrip("/"):
-                final_url = candidate.href
-            platform = detect_job_platform(final_url)
-            if platform or score_candidate(candidate.text, final_url, candidate.tag) >= 45:
-                notes = (
-                    f"Clicked {candidate.text} and landed on {platform}."
-                    if platform
-                    else f"Clicked {candidate.text} and landed on a public careers/jobs URL."
-                )
-                browser.close()
-                return {
-                    "final_url": final_url,
-                    "platform": platform or None,
-                    "status": "Completed",
-                    "notes": notes,
-                    "clicked_text": candidate.text,
-                }
+            continue
 
-        browser.close()
-        return {
-            "final_url": None,
-            "platform": None,
-            "status": "Needs Review",
-            "notes": f"Browser automation found candidates but no public job board navigation completed. Last error: {last_error}",
-            "clicked_text": None,
-        }
+        try:
+            final_page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        final_url = final_page.url or candidate.href or careers_url
+        if candidate.href and final_url.rstrip("/") == careers_url.rstrip("/"):
+            final_url = candidate.href
+        rejected_reason = job_board_rejection_reason(final_url)
+        if rejected_reason:
+            last_error = f"Rejected {final_url}: {rejected_reason}"
+            continue
+        platform = detect_job_platform(final_url)
+        if platform or score_candidate(candidate.text, final_url, candidate.tag) >= 45:
+            notes = (
+                f"Clicked {candidate.text} and landed on {platform}."
+                if platform
+                else f"Clicked {candidate.text} and landed on a public careers/jobs URL."
+            )
+            return {
+                "final_url": final_url,
+                "platform": platform or None,
+                "status": "Completed",
+                "notes": notes,
+                "clicked_text": candidate.text,
+            }
+
+    return {
+        "final_url": None,
+        "platform": None,
+        "status": "Needs Review",
+        "notes": f"Browser automation found candidates but no public job board navigation completed. Last error: {last_error}",
+        "clicked_text": None,
+    }
 
 
 def choose_candidate(page, base_url: str) -> BrowserCandidate | None:
@@ -209,6 +224,8 @@ def choose_candidates(page, base_url: str) -> list[BrowserCandidate]:
         full_href = urljoin(base_url, href) if href else ""
         if not visible or (not label and not full_href):
             continue
+        if full_href and job_board_rejection_reason(full_href):
+            continue
         if button_type == "submit":
             continue
         if any(term in f"{label} {full_href}".lower() for term in LOW_VALUE_TERMS):
@@ -232,7 +249,7 @@ def find_platform_iframe(page) -> str:
             src = iframe_locator.nth(index).get_attribute("src") or ""
         except Exception:
             continue
-        if src and detect_job_platform(src):
+        if src and detect_job_platform(src) and not job_board_rejection_reason(src):
             return src
     return ""
 
@@ -262,6 +279,13 @@ def score_candidate(label: str, href: str, tag: str) -> int:
 
 def clean_text(value: str) -> str:
     return " ".join(value.split())
+
+
+def job_board_rejection_reason(url: str) -> str:
+    # Import lazily because job_board_discovery invokes this browser module.
+    from job_board_discovery import rejection_reason
+
+    return rejection_reason(url)
 
 
 def not_found(notes: str) -> dict[str, str | None]:

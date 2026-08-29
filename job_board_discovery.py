@@ -87,6 +87,7 @@ REJECT_DOMAINS = [
     "careerbuilder.com",
     "simplyhired.com",
     "yelp.com",
+    "indeed.com",
 ]
 
 JOB_INDICATORS = [

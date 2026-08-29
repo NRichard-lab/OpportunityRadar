@@ -157,8 +157,10 @@ def pick_collector(
 
     platform = str(company.get("Job Platform") or detect_job_platform(str(company.get("Job Board URL") or ""))).lower()
     url = str(company.get("Job Board URL") or "").lower()
-    if "adp" in platform or "workforcenow.adp.com" in url:
-        return with_reason(ADPCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched ADP Workforce Now.")
+    direct_workforce_api = "workforcenow.adp.com" in url and "/mdf/recruitment/recruitment.html" in url
+    embedded_workforce_board = platform.strip() == "adp workforce now" and "workforcenow.adp.com" not in url
+    if direct_workforce_api or embedded_workforce_board:
+        return with_reason(ADPCollector(delay_seconds, debug, debug_dir), "Job Board URL matched or embeds the ADP Workforce Now public API.")
     if "workday" in platform or "myworkdayjobs.com" in url:
         return with_reason(WorkdayCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Workday.")
     if "greenhouse" in platform or "greenhouse.io" in url:

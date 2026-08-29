@@ -98,6 +98,7 @@ REJECTED_CANDIDATE_COLUMNS = [
 ]
 
 INVALID_JOB_BOARD_URL_PARTS = [
+    "indeed.com/cmp/",
     "loan",
     "loan-application",
     "mortgage",
@@ -123,8 +124,8 @@ class JobRecord:
     title: str
     location: str = ""
     workType: str = "Not Listed"
-    payMin: int | None = None
-    payMax: int | None = None
+    payMin: int | float | None = None
+    payMax: int | float | None = None
     payText: str = ""
     payPeriod: str = "unknown"
     payCurrency: str = "USD"
@@ -167,8 +168,8 @@ class CollectionDiagnostic:
     payExtractionSource: str = ""
     payCandidateText: str = ""
     payPatternMatched: str = ""
-    parsedPayMin: int | None = None
-    parsedPayMax: int | None = None
+    parsedPayMin: int | float | None = None
+    parsedPayMax: int | float | None = None
     parsedPayPeriod: str = ""
     firstCandidateTitles: str = ""
     firstCandidateUrls: str = ""
