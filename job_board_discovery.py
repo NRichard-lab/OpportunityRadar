@@ -14,7 +14,7 @@ from openpyxl.styles import Font
 
 from backend.file_security import atomic_save_workbook, atomic_write_text, sanitize_spreadsheet_value
 from config import LOG_DIR, OUTPUT_DIR, POLITE_DELAY_SECONDS, REQUEST_TIMEOUT
-from job_platforms import detect_job_platform
+from job_platforms import canonical_job_board_url, detect_job_platform
 from search_tools import (
     company_identity_tokens,
     domain_matches_company,
@@ -472,6 +472,7 @@ def verify_search_candidate(
         candidate.rejection_reason = f"could not verify search result page: {exc}"
         return False
 
+    final_url = canonical_job_board_url(final_url)
     candidate.url = final_url
     candidate.platform = detect_job_platform(final_url)
     rejection = rejection_reason(final_url)
@@ -508,7 +509,7 @@ def evaluate_candidate(
     reached_from_official: bool = False,
     clicked: bool = False,
 ) -> JobBoardCandidate:
-    normalized = normalize_url(url)
+    normalized = canonical_job_board_url(normalize_url(url))
     candidate = JobBoardCandidate(url=normalized, text=clean_text(text), source_url=source_url, source_method=source_method)
     rejection = rejection_reason(normalized)
     if rejection:

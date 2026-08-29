@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
@@ -67,11 +67,12 @@ class GenericCollector(BaseCollector):
 
         with sync_playwright() as playwright:
             browser = launch_playwright_chromium(playwright, headless=True)
-            context = browser.new_context(service_workers="block")
-            install_playwright_url_guard(context)
-            self._detail_context = context
-            page = context.new_page()
+            context = None
             try:
+                context = browser.new_context(service_workers="block")
+                install_playwright_url_guard(context)
+                self._detail_context = context
+                page = context.new_page()
                 safe_page_goto(page, url, wait_until="domcontentloaded", timeout=45000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
@@ -82,6 +83,11 @@ class GenericCollector(BaseCollector):
                 jobs = self.parse_listing_html(company, url, self.final_url_after_redirect or url, html, source_type)
             finally:
                 self._detail_context = None
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
                 browser.close()
 
         self.flush_debug(company)
@@ -119,13 +125,14 @@ class GenericCollector(BaseCollector):
                 continue
             href = best_card_href(card, final_url)
             raw_title = extract_card_title(card)
+            is_document_posting = is_job_document_url(href)
             self.record_candidate(raw_title or card_text[:120], href)
 
             detail_attempted = False
             detail_title = ""
             detail: dict[str, str] = {}
             title = raw_title
-            if is_action_label(title) or not is_valid_job_title(title):
+            if (is_action_label(title) or not is_valid_job_title(title)) and not is_document_posting:
                 if href:
                     detail_attempted = True
                     detail = self.fetch_detail_page(href)
@@ -151,7 +158,17 @@ class GenericCollector(BaseCollector):
                 self.reject_candidate(title, "duplicate job URL", href, surrounding_text=card_text, company=company, job_board_url=board_url)
                 continue
             seen_hrefs.add(href)
-            if not detail:
+            if not detail and is_document_posting:
+                # The official careers card is the authoritative listing and
+                # the linked PDF is its stable destination. Avoid decoding a
+                # binary document as HTML or launching a PDF viewer.
+                detail = {
+                    "title": title,
+                    "description": card_text,
+                    "location": extract_document_location(card),
+                    "postedDate": "",
+                }
+            elif not detail:
                 detail_attempted = True
                 detail = self.fetch_detail_page(href)
 
@@ -188,7 +205,12 @@ class GenericCollector(BaseCollector):
                     description=description,
                     descriptionSnippet=description[:240],
                     collectedAt=datetime.now().astimezone().replace(microsecond=0).isoformat(),
-                    rawData={"collector": self.__class__.__name__, "sourceType": source_type, "finalUrl": final_url},
+                    rawData={
+                        "collector": self.__class__.__name__,
+                        "sourceType": source_type,
+                        "finalUrl": final_url,
+                        "officialJobDocument": is_document_posting,
+                    },
                 )
             )
         return jobs
@@ -326,7 +348,35 @@ def likely_job_cards(soup: BeautifulSoup) -> list[Tag]:
         for node in soup.select(selector):
             if isinstance(node, Tag):
                 cards.append(node)
+    cards.extend(job_document_cards(soup))
     return cards[:500]
+
+
+def job_document_cards(soup: BeautifulSoup) -> list[Tag]:
+    """Return compact careers-page cards that link an official job PDF."""
+
+    cards: list[Tag] = []
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "")
+        if not is_job_document_url(href):
+            continue
+        signal = clean_text(
+            f"{anchor.get_text(' ', strip=True)} {anchor.get('title') or ''} {href}"
+        ).casefold()
+        if not any(term in signal for term in ("job", "position", "career", "employment")):
+            continue
+        for parent in list(anchor.parents)[:6]:
+            if not isinstance(parent, Tag):
+                continue
+            if parent.name not in {"article", "section", "li", "div", "td"}:
+                continue
+            if parent.select_one("h1, h2, h3, h4, h5, h6") is None:
+                continue
+            text = clean_text(parent.get_text(" ", strip=True))
+            if 10 <= len(text) <= 2500:
+                cards.append(parent)
+                break
+    return cards
 
 
 def card_has_job_signal(text: str, card: Tag) -> bool:
@@ -336,7 +386,14 @@ def card_has_job_signal(text: str, card: Tag) -> bool:
 
 
 def extract_card_title(card: Tag) -> str:
-    for selector in ["h1", "h2", "h3", "strong", "[class*='title']", "[class*='heading']", "[data-testid*='title']"]:
+    if any(is_job_document_url(str(anchor.get("href") or "")) for anchor in card.find_all("a", href=True)):
+        # Careers cards commonly place a region/branch heading before the job
+        # heading. The heading nearest the PDF action is the posting title.
+        for node in reversed(card.select("h1, h2, h3, h4, h5, h6")):
+            title = normalize_job_title(node.get_text(" ", strip=True))
+            if title and not is_action_label(title):
+                return title
+    for selector in ["h1", "h2", "h3", "h4", "h5", "h6", "strong", "[class*='title']", "[class*='heading']", "[data-testid*='title']"]:
         node = card.select_one(selector)
         if node:
             title = normalize_job_title(node.get_text(" ", strip=True))
@@ -366,6 +423,19 @@ def best_card_href(card: Tag, base_url: str) -> str:
     if not scored:
         return ""
     return sorted(scored, key=lambda item: item[0], reverse=True)[0][1]
+
+
+def is_job_document_url(url: str) -> bool:
+    return urlsplit(str(url or "")).path.casefold().endswith(".pdf")
+
+
+def extract_document_location(card: Tag) -> str:
+    headings = [
+        normalize_job_title(node.get_text(" ", strip=True))
+        for node in card.select("h1, h2, h3, h4, h5, h6")
+    ]
+    headings = [heading for heading in headings if heading]
+    return headings[-2] if len(headings) >= 2 else ""
 
 
 def extract_detail_title(soup: BeautifulSoup) -> str:

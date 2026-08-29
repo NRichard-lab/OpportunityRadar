@@ -165,6 +165,50 @@ def normalize_job_title(title: str) -> str:
 
 
 def is_valid_job_title(title: str) -> bool:
+    if not has_safe_job_title_shape(title):
+        return False
+    if job_title_score(title) < 1:
+        return False
+    return True
+
+
+def is_valid_structured_job_title(title: str) -> bool:
+    """Validate a title supplied by a structured ATS opportunity record.
+
+    Structured endpoints already identify each item as a job, so requiring a
+    finance-oriented role noun would incorrectly discard legitimate short roles
+    such as "Paralegal". Navigation and boilerplate checks still apply.
+    """
+
+    normalized = normalize_job_title(title)
+    lowered = normalized.lower()
+    if not normalized or len(normalized) < 2:
+        return False
+    if lowered in REJECTED_EXACT_TITLES:
+        return False
+    if re.fullmatch(r"\d+\+?\s+days?\s+ago", lowered):
+        return False
+    words = re.findall(r"[a-z0-9]+", lowered)
+    if not words or all(word in GENERIC_ONLY_WORDS for word in words):
+        return False
+    # These phrases cannot be legitimate ATS job titles even when surrounded
+    # by other text. Broad words such as "benefits", "locations", or
+    # "application" are intentionally not blocked here because structured
+    # providers can publish real roles containing them.
+    structured_boilerplate = {
+        "join our talent community",
+        "equal opportunity employer",
+        "skip navigation",
+        "forgot password",
+        "create account",
+        "powered by",
+        "search open positions",
+        "search jobs",
+    }
+    return not any(phrase in lowered for phrase in structured_boilerplate)
+
+
+def has_safe_job_title_shape(title: str) -> bool:
     normalized = normalize_job_title(title)
     lowered = normalized.lower()
     if not normalized or len(normalized) < 4:
@@ -183,8 +227,6 @@ def is_valid_job_title(title: str) -> bool:
     if len(words) <= 2 and any(word in GENERIC_ONLY_WORDS for word in words):
         return False
     if len(normalized) > 140 and any(term in lowered for term in ["apply", "join", "search", "opening"]):
-        return False
-    if job_title_score(normalized) < 1:
         return False
     return True
 

@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 from backend.outbound_security import SSRFProtectedSession
 from config import CAREERS_KEYWORDS, COMMON_FEED_PATHS, MAX_CRAWL_PAGES, POLITE_DELAY_SECONDS, REQUEST_TIMEOUT, USER_AGENT
-from job_platforms import detect_job_platform
+from job_platforms import canonical_job_board_url, detect_job_platform
 from search_tools import registered_domain, request_with_limited_retries, validate_and_canonicalize_url
 
 
@@ -166,7 +166,7 @@ def find_careers_page(
                 careers_matches.append((text, href))
 
         if platform_urls:
-            platform_url = platform_urls[0]
+            platform_url = canonical_job_board_url(platform_urls[0])
             return platform_url, detect_job_platform(platform_url), notes
         if careers_matches:
             href = careers_matches[0][1]
@@ -177,7 +177,7 @@ def find_careers_page(
                 queue.append(href)
 
     if platform_urls:
-        platform_url = platform_urls[0]
+        platform_url = canonical_job_board_url(platform_urls[0])
         return platform_url, detect_job_platform(platform_url), notes
 
     notes.append(f"no careers link found after inspecting {len(visited)} page(s)")

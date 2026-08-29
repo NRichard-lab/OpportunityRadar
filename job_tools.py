@@ -22,7 +22,7 @@ from config import (
 )
 from excel_tools import read_company_rows, stable_company_id
 from job_enrichment import classify_role_type, extract_pay_info
-from job_validation import is_valid_job_title, rejection_reason
+from job_validation import is_valid_job_title, is_valid_structured_job_title, rejection_reason
 from job_platforms import detect_job_platform
 
 logger = logging.getLogger(__name__)
@@ -493,12 +493,24 @@ def diagnostic_notes(collector: Any, jobs_saved: int, error_message: str) -> str
 
 
 def is_valid_job_record(job: JobRecord) -> bool:
-    if not is_valid_job_title(job.title):
+    raw_data = job.rawData if isinstance(job.rawData, dict) else {}
+    structured_source = bool(raw_data.get("structuredSource"))
+    official_job_document = bool(raw_data.get("officialJobDocument"))
+    title_is_valid = (
+        is_valid_structured_job_title(job.title)
+        if structured_source
+        else is_valid_job_title(job.title)
+    )
+    if not title_is_valid:
         logger.debug("Rejected job title %r: %s", job.title, rejection_reason(job.title))
         return False
     if not job.sourceUrl:
         return False
-    if invalid_job_board_reason(job.sourceUrl):
+    if invalid_job_destination_reason(
+        job.sourceUrl,
+        structured_source=structured_source,
+        allow_official_job_document=official_job_document,
+    ):
         return False
     return bool(job.description or job.location or job.postedDate or job.sourceUrl or job.payText)
 
@@ -693,6 +705,32 @@ def invalid_job_board_reason(url: str) -> str:
     for part in INVALID_JOB_BOARD_URL_PARTS:
         if part in lowered:
             return f"URL contains disallowed non-job pattern: {part}"
+    if lowered.endswith((".pdf", ".doc", ".docx")):
+        return "URL points to a document"
+    return ""
+
+
+def invalid_job_destination_reason(
+    url: str,
+    *,
+    structured_source: bool,
+    allow_official_job_document: bool = False,
+) -> str:
+    """Validate a job destination without treating role words as board-page signals.
+
+    The board discovery denylist intentionally rejects generic bank pages whose URLs
+    contain words such as ``loan`` or ``mortgage``. Those same words are legitimate
+    in ATS-generated job-detail paths, so structured collectors retain only the
+    public HTTP(S) and document checks here.
+    """
+
+    lowered = str(url or "").strip().lower()
+    if not lowered.startswith(("http://", "https://")):
+        return "URL is not public HTTP(S)"
+    if allow_official_job_document and lowered.endswith(".pdf"):
+        return ""
+    if not structured_source:
+        return invalid_job_board_reason(url)
     if lowered.endswith((".pdf", ".doc", ".docx")):
         return "URL points to a document"
     return ""

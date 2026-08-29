@@ -145,6 +145,9 @@ def pick_collector(
     debug_dir: Path | None = None,
 ) -> BaseCollector:
     from collectors.adp_collector import ADPCollector
+    from collectors.clearcompany_collector import ClearCompanyCollector
+    from collectors.csod_collector import CSODCollector
+    from collectors.dayforce_collector import DayforceCollector
     from collectors.generic_collector import GenericCollector
     from collectors.greenhouse_collector import GreenhouseCollector
     from collectors.icims_collector import ICIMSCollector
@@ -155,12 +158,25 @@ def pick_collector(
     from collectors.ukg_collector import UKGCollector
     from collectors.workday_collector import WorkdayCollector
 
-    platform = str(company.get("Job Platform") or detect_job_platform(str(company.get("Job Board URL") or ""))).lower()
     url = str(company.get("Job Board URL") or "").lower()
+    detected_platform = detect_job_platform(url).lower()
+    stored_platform = str(company.get("Job Platform") or "").lower()
+    # A verified vendor URL is stronger evidence than stale stored metadata.
+    # Keep the stored value as a fallback for official pages that embed an ATS.
+    platform = detected_platform or stored_platform
     direct_workforce_api = "workforcenow.adp.com" in url and "/mdf/recruitment/recruitment.html" in url
     embedded_workforce_board = platform.strip() == "adp workforce now" and "workforcenow.adp.com" not in url
     if direct_workforce_api or embedded_workforce_board:
         return with_reason(ADPCollector(delay_seconds, debug, debug_dir), "Job Board URL matched or embeds the ADP Workforce Now public API.")
+    if "hrmdirect.com" in url:
+        return with_reason(
+            ClearCompanyCollector(delay_seconds, debug, debug_dir),
+            "Job Board URL matched a ClearCompany HRMDirect public listing.",
+        )
+    if "dayforce" in platform or "jobs.dayforcehcm.com" in url:
+        return with_reason(DayforceCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Dayforce.")
+    if "cornerstone" in platform or "csod" in platform or "csod.com" in url:
+        return with_reason(CSODCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Cornerstone.")
     if "workday" in platform or "myworkdayjobs.com" in url:
         return with_reason(WorkdayCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Workday.")
     if "greenhouse" in platform or "greenhouse.io" in url:
