@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urlparse, urlunparse
 
 import requests
 import tldextract
 from bs4 import BeautifulSoup
 
 from config import DISALLOWED_RESULT_DOMAINS, OFFICIAL_WEBSITE_SEARCH_PHRASES, REQUEST_TIMEOUT
-from job_platforms import detect_job_platform
+from job_platforms import detect_job_platform, hostname_matches_domain
 
 
 LOGGER = logging.getLogger(__name__)
+
+MAX_HTTP_ATTEMPTS = 2
+MAX_OFFICIAL_SEARCH_QUERIES = 3
+MAX_OFFICIAL_RESULTS_PER_QUERY = 4
+MAX_OFFICIAL_SEARCH_RESULTS = 8
+RETRY_BACKOFF_SECONDS = 0.15
 
 STATE_NAMES = {
     "CO": "colorado",
@@ -41,6 +48,99 @@ class WebsiteEvaluation:
     rejection_reason: str = ""
     discovery_method: str = "Not Found"
     candidate_urls: list[str] = field(default_factory=list)
+    html: str = field(default="", repr=False)
+
+
+def request_with_limited_retries(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: float = REQUEST_TIMEOUT,
+    max_attempts: int = MAX_HTTP_ATTEMPTS,
+    backoff_seconds: float = RETRY_BACKOFF_SECONDS,
+    **kwargs: object,
+) -> requests.Response:
+    """GET a public URL with a small retry budget for transient failures only."""
+    attempts = max(1, min(int(max_attempts), 3))
+    last_error: requests.RequestException | None = None
+    for attempt in range(attempts):
+        try:
+            response = session.get(url, timeout=timeout, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                raise
+        else:
+            status = int(getattr(response, "status_code", 0) or 0)
+            retryable = status == 429 or 500 <= status < 600
+            if not retryable or attempt + 1 >= attempts:
+                return response
+            response.close()
+        if backoff_seconds > 0:
+            time.sleep(backoff_seconds * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("HTTP retry loop ended without a response")
+
+
+def canonicalize_http_url(url: str) -> str:
+    """Normalize a public HTTP(S) URL while preserving its path and query."""
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("blank URL")
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not hostname:
+        raise ValueError("URL must use HTTP or HTTPS and include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL credentials are not allowed")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL contains an invalid port") from exc
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 80 if scheme == "http" else 443
+    netloc = display_host if port in {None, default_port} else f"{display_host}:{port}"
+    path = parsed.path or "/"
+    canonical = urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
+    return urldefrag(canonical)[0]
+
+
+def validate_and_canonicalize_url(
+    url: str,
+    session: requests.Session,
+    *,
+    require_html: bool = False,
+    reject_disallowed: bool = True,
+    max_attempts: int = MAX_HTTP_ATTEMPTS,
+) -> tuple[str, requests.Response]:
+    """Confirm a URL responds and return its final canonical redirect target."""
+    canonical = canonicalize_http_url(url)
+    if reject_disallowed and is_disallowed_result(canonical):
+        raise ValueError("URL points to a disallowed third-party or aggregator domain")
+    response = request_with_limited_retries(
+        session,
+        canonical,
+        timeout=REQUEST_TIMEOUT,
+        max_attempts=max_attempts,
+        allow_redirects=True,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException:
+        response.close()
+        raise
+    final_url = canonicalize_http_url(str(response.url or canonical))
+    if reject_disallowed and is_disallowed_result(final_url):
+        response.close()
+        raise ValueError("URL redirected to a disallowed third-party or aggregator domain")
+    if require_html:
+        content_type = str(response.headers.get("content-type", "")).lower()
+        if "html" not in content_type:
+            response.close()
+            raise ValueError(f"non-HTML content type: {content_type or 'unknown'}")
+    return final_url, response
 
 
 def normalize_company_name(name: str) -> str:
@@ -70,9 +170,10 @@ def domain_matches_company(company: str, url: str) -> bool:
 
 def registered_domain(url: str) -> str:
     parsed = urlparse(url if "://" in url else f"https://{url}")
-    extracted = tldextract.extract(parsed.netloc)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    extracted = tldextract.extract(hostname)
     if not extracted.domain or not extracted.suffix:
-        return parsed.netloc.lower()
+        return hostname
     return f"{extracted.domain}.{extracted.suffix}".lower()
 
 
@@ -83,23 +184,34 @@ def site_root(url: str) -> str:
 
 def resolve_site_root(url: str, session: requests.Session) -> str:
     try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        return site_root(response.url)
+        final_url, response = validate_and_canonicalize_url(url, session, require_html=False)
+        response.close()
+        return site_root(final_url)
     except Exception:
         return site_root(url)
 
 
 def is_disallowed_result(url: str) -> bool:
-    domain = registered_domain(url)
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    hostname = (parsed.hostname or "").lower().rstrip(".")
     lowered = url.lower()
     if lowered.endswith((".pdf", ".doc", ".docx")):
         return True
     if any(term in lowered for term in ["routing-number", "routingnumber", "reviews", "review", "directory", "branches"]):
         return True
-    return any(domain == blocked or domain.endswith(f".{blocked}") or blocked in domain for blocked in DISALLOWED_RESULT_DOMAINS)
+    return any(hostname_matches_domain(hostname, blocked) for blocked in DISALLOWED_RESULT_DOMAINS)
 
 
-def search_web(company: str, city: str = "", state: str = "", max_results: int = 8) -> list[SearchCandidate]:
+def search_web(
+    company: str,
+    city: str = "",
+    state: str = "",
+    max_results: int = MAX_OFFICIAL_RESULTS_PER_QUERY,
+    *,
+    max_queries: int = MAX_OFFICIAL_SEARCH_QUERIES,
+    max_total_results: int = MAX_OFFICIAL_SEARCH_RESULTS,
+    cancelled: object | None = None,
+) -> list[SearchCandidate]:
     try:
         from ddgs import DDGS
     except ImportError as exc:
@@ -109,20 +221,25 @@ def search_web(company: str, city: str = "", state: str = "", max_results: int =
     candidates: list[SearchCandidate] = []
     seen: set[str] = set()
 
+    per_query_limit = max(1, min(int(max_results), MAX_OFFICIAL_RESULTS_PER_QUERY))
+    query_limit = max(1, min(int(max_queries), MAX_OFFICIAL_SEARCH_QUERIES))
+    total_limit = max(1, min(int(max_total_results), MAX_OFFICIAL_SEARCH_RESULTS))
     location = " ".join(part for part in [city, state] if part).strip()
-    phrase_templates = list(OFFICIAL_WEBSITE_SEARCH_PHRASES)
+    phrase_templates = ["\"{company}\" official website", *OFFICIAL_WEBSITE_SEARCH_PHRASES]
     if location:
         phrase_templates = [
-            "{company} {location} official website",
-            "{company} {location} careers",
+            "\"{company}\" {location} official website",
             *phrase_templates,
         ]
+    phrase_templates = list(dict.fromkeys(phrase_templates))[:query_limit]
 
     for phrase_template in phrase_templates:
+        check_search_cancelled(cancelled)
         phrase = phrase_template.format(company=company, location=location)
         try:
-            with DDGS(timeout=REQUEST_TIMEOUT) as ddgs:
-                for result in ddgs.text(phrase, max_results=max_results):
+            with DDGS(timeout=min(REQUEST_TIMEOUT, 5)) as ddgs:
+                for result in ddgs.text(phrase, max_results=per_query_limit):
+                    check_search_cancelled(cancelled)
                     url = result.get("href") or result.get("url") or ""
                     if not url or url in seen or is_disallowed_result(url):
                         continue
@@ -135,6 +252,8 @@ def search_web(company: str, city: str = "", state: str = "", max_results: int =
                             rank=len(candidates) + 1,
                         )
                     )
+                    if len(candidates) >= total_limit:
+                        return candidates
         except Exception as exc:
             LOGGER.warning("Search failed for '%s': %s", phrase, exc)
 
@@ -162,26 +281,22 @@ def evaluate_official_website_details(
         return result
 
     try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        response.raise_for_status()
-        result.final_url = site_root(response.url)
-        if is_disallowed_result(response.url):
-            result.rejected = True
-            result.rejection_reason = "redirected to disallowed third-party source"
-            result.notes.append(result.rejection_reason)
-            return result
-        content_type = response.headers.get("content-type", "").lower()
-        if "html" not in content_type:
-            result.rejected = True
-            result.rejection_reason = f"non-HTML content type: {content_type or 'unknown'}"
-            result.notes.append(result.rejection_reason)
-            return result
+        final_url, response = validate_and_canonicalize_url(
+            url,
+            session,
+            require_html=True,
+            reject_disallowed=True,
+        )
+        result.final_url = site_root(final_url)
 
-        domain_related = domain_matches_company(company, response.url)
+        domain_related = domain_matches_company(company, final_url)
         if domain_related:
             result.score += 18
             result.notes.append("domain resembles company name")
-        soup = BeautifulSoup(response.text, "html.parser")
+        html = response.text
+        response.close()
+        result.html = html
+        soup = BeautifulSoup(html, "html.parser")
         meta_description = ""
         meta = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
         if meta:
@@ -225,7 +340,7 @@ def evaluate_official_website_details(
         if finance_matches == 0:
             result.score -= 30
             result.notes.append("banking/credit union terms not found on homepage")
-        if detect_job_board_only(response.url, page_text):
+        if detect_job_board_only(final_url, page_text):
             result.score -= 50
             result.notes.append("site appears to be only a job board or third-party recruiting page")
         if looks_parked_or_unrelated(page_text):
@@ -294,18 +409,37 @@ def choose_official_website_details(
     city: str = "",
     state: str = "",
     allow_low_confidence: bool = False,
+    cancelled: object | None = None,
 ) -> WebsiteEvaluation:
     score_by_confidence = {"Low": 1, "Medium": 2, "High": 3}
+    check_search_cancelled(cancelled)
+    known_result: WebsiteEvaluation | None = None
     if known_website:
-        result = evaluate_official_website_details(company, known_website, session, city=city, state=state)
-        result.discovery_method = "Known Website"
-        result.notes.insert(0, "validated known website" if result.verified else "known website did not pass verification")
-        return result
+        known_result = evaluate_official_website_details(company, known_website, session, city=city, state=state)
+        check_search_cancelled(cancelled)
+        known_result.discovery_method = "Known Website"
+        known_result.notes.insert(
+            0,
+            "validated known website" if known_result.verified else "known website did not pass verification",
+        )
+        if known_result.verified:
+            return known_result
 
-    candidates = search_web(company, city=city, state=state)
+    candidates = search_web(
+        company,
+        city=city,
+        state=state,
+        max_results=MAX_OFFICIAL_RESULTS_PER_QUERY,
+        max_queries=2 if known_result else MAX_OFFICIAL_SEARCH_QUERIES,
+        max_total_results=6 if known_result else MAX_OFFICIAL_SEARCH_RESULTS,
+        cancelled=cancelled,
+    )
     candidate_urls = [site_root(candidate.url) for candidate in candidates]
     LOGGER.info("Candidate URLs for %s: %s", company, candidate_urls)
     if not candidates:
+        if known_result is not None:
+            known_result.notes.append("limited web search found no verified replacement")
+            return known_result
         return WebsiteEvaluation(
             url="",
             final_url="",
@@ -319,6 +453,7 @@ def choose_official_website_details(
     best = WebsiteEvaluation(url="", candidate_urls=candidate_urls, notes=["no verified candidate selected"])
 
     for candidate in candidates:
+        check_search_cancelled(cancelled)
         candidate_url = site_root(candidate.url)
         evaluation = evaluate_official_website_details(
             company,
@@ -361,12 +496,24 @@ def choose_official_website_details(
                 break
 
     if best.verified and best.confidence in {"High", "Medium"}:
-        best.notes.insert(0, "selected verified official website from web search")
+        best.notes.insert(
+            0,
+            "known website failed verification; selected verified replacement from web search"
+            if known_result is not None
+            else "selected verified official website from web search",
+        )
         return best
     if allow_low_confidence and best.final_url:
         best.verified = True
         best.notes.insert(0, "selected low-confidence website because --allow-low-confidence was used")
         return best
     best.verified = False
+    if known_result is not None:
+        best.notes.append("known website also failed verification")
     best.notes.insert(0, f"possible website, needs review: {best.final_url or best.url}")
     return best
+
+
+def check_search_cancelled(cancelled: object | None) -> None:
+    if cancelled is not None and getattr(cancelled, "is_set", lambda: False)():
+        raise InterruptedError("Cancelled by user.")

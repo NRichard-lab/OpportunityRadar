@@ -1,29 +1,45 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import fields
 import re
 from pathlib import Path
-from threading import Event
+from threading import Event, local
 from typing import Any, Callable
 from uuid import uuid4
 
 from bs4 import BeautifulSoup
 
 from backend.backup_restore import create_sqlite_backup
+from backend.company_information import (
+    FIELD_LABELS,
+    CompanyInformationDiscovery,
+    confirmed_company_domain,
+    discover_company_information,
+    merge_company_records,
+    missing_company_information_fields,
+    needs_company_information as company_needs_company_information,
+    normalized_company_key,
+    plausible_company_domains,
+    field_is_clearly_invalid,
+)
 from backend.exports import SnapshotExporter
 from backend.import_security import enforce_record_limit, validate_staged_import
 from backend.migration import excel_company_to_api
 from backend.outbound_security import OutboundSecurityError, validate_outbound_url
 from backend.repository import OpportunityRepository, company_api_to_excel, utc_now
-from config import APP_ENABLE_BROWSER_JOBS, DEPLOYMENT_VERSION
+from config import APP_ENABLE_BROWSER_JOBS, APP_MAX_HTTP_WORKERS, DEPLOYMENT_VERSION
 from excel_tools import read_company_rows
 from job_tools import JobRecord, enrich_job_record
 from main import enrich_company
 from website_tools import fetch_html, make_session
 
 
-ProgressCallback = Callable[[int, int, str], None]
+ProgressCallback = Callable[..., None]
+
+
+_worker_state = local()
 
 
 class UtilityCancelled(Exception):
@@ -61,38 +77,338 @@ def refresh_missing_company_information(
     progress: ProgressCallback,
     cancelled: Event,
 ) -> dict[str, Any]:
-    companies = [company for company in repository.list_companies() if needs_company_information(company)]
-    updated = 0
-    boards_verified = 0
-    needs_review = 0
-    unreachable = 0
-    for index, company in enumerate(companies, start=1):
-        check_cancelled(cancelled)
-        progress(index, len(companies), company["name"])
-        before = repository.get_company(company["id"])
-        discovered = enrich_company(
-            company_api_to_excel(company),
-            utc_now(),
-            use_browser_discovery=APP_ENABLE_BROWSER_JOBS,
+    groups, duplicate_records_skipped = _company_refresh_groups(repository.list_companies())
+    total = len(groups)
+    summary = _new_company_refresh_summary(total, duplicate_records_skipped)
+    progress(0, total, "Preparing company review", dict(summary))
+    if not groups:
+        return summary
+
+    max_workers = max(1, min(APP_MAX_HTTP_WORKERS, total))
+    group_iterator = iter(groups)
+    pending: dict[Future[CompanyInformationDiscovery], dict[str, Any]] = {}
+
+    def submit_next(executor: ThreadPoolExecutor) -> bool:
+        if cancelled.is_set():
+            return False
+        try:
+            group = next(group_iterator)
+        except StopIteration:
+            return False
+        # Current-company updates stay compact; per-company results are published
+        # separately as bounded live snapshots below.
+        progress(summary["processedCount"], total, group["name"])
+        future = executor.submit(_discover_company_refresh_group, group, cancelled)
+        pending[future] = group
+        return True
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="company-info") as executor:
+        for _ in range(max_workers):
+            if not submit_next(executor):
+                break
+
+        while pending:
+            done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in done:
+                group = pending.pop(future)
+                if cancelled.is_set() and future.cancelled():
+                    continue
+                try:
+                    discovery = future.result()
+                except (InterruptedError, UtilityCancelled):
+                    if cancelled.is_set():
+                        continue
+                    discovery = CompanyInformationDiscovery(failed=True, notes=["The company review was interrupted."])
+                except Exception as exc:
+                    discovery = CompanyInformationDiscovery(
+                        failed=True,
+                        notes=[f"The company could not be reviewed: {_safe_company_error(exc)}"],
+                    )
+                company_result = _save_company_refresh_group(repository, group, discovery)
+                summary["processedCount"] += 1
+                summary[f"{_outcome_counter(company_result['outcome'])}"] += 1
+                summary["companyResults"].append(company_result)
+                summary["jobBoardsVerified"] += int(
+                    "Job-board URL" in company_result.get("updatedFields", [])
+                )
+                _add_legacy_company_summary_fields(summary)
+                live_summary = dict(summary)
+                live_summary["companyResults"] = [company_result]
+                progress(
+                    summary["processedCount"],
+                    total,
+                    group["name"],
+                    live_summary,
+                )
+                submit_next(executor)
+
+    if cancelled.is_set():
+        # Preserve the complete partial report once when cancellation finishes,
+        # rather than rewriting the growing list after every company.
+        progress(
+            summary["processedCount"],
+            total,
+            summary["companyResults"][-1]["companyName"] if summary["companyResults"] else "Cancelled",
+            dict(summary),
         )
-        updates = discovery_to_api(discovered)
-        website = str(updates.get("officialWebsite") or company.get("officialWebsite") or company.get("knownWebsite") or "")
-        if website:
-            updates.update(extract_public_company_metadata(website))
-        after = repository.update_discovered_company_fields(company["id"], updates)
-        if any(before.get(key) != after.get(key) for key in discoverable_keys()):
-            updated += 1
-        if not before.get("jobBoardUrl") and after.get("jobBoardUrl"):
-            boards_verified += 1
-        if after.get("searchStatus") in {"Needs Review", "Partial"}:
-            needs_review += 1
-        if discovered.get("Search Status") == "Failed":
-            unreachable += 1
+        raise UtilityCancelled("Cancelled by user.")
+    _add_legacy_company_summary_fields(summary)
+    return summary
+
+
+def _discover_company_refresh_group(
+    group: dict[str, Any],
+    cancelled: Event,
+) -> CompanyInformationDiscovery:
+    check_cancelled(cancelled)
+    return discover_company_information(
+        group["merged"],
+        requested_fields=group["requestedFields"],
+        session=_company_refresh_session(),
+        use_browser_discovery=APP_ENABLE_BROWSER_JOBS,
+        cancelled=cancelled,
+    )
+
+
+def _company_refresh_session():
+    session = getattr(_worker_state, "company_information_session", None)
+    if session is None:
+        session = make_session()
+        _worker_state.company_information_session = session
+    return session
+
+
+def _company_refresh_groups(companies: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for company in companies:
+        name_key = normalized_company_key(str(company.get("name") or ""))
+        by_name.setdefault(name_key or str(company.get("id") or id(company)), []).append(company)
+
+    by_identity: dict[str, list[dict[str, Any]]] = {}
+    for name_key, records in by_name.items():
+        confirmed_domains = {
+            domain for record in records
+            if (domain := confirmed_company_domain(record))
+        }
+        sole_confirmed_domain = next(iter(confirmed_domains)) if len(confirmed_domains) == 1 else ""
+        for company in records:
+            plausible_domains = plausible_company_domains(company)
+            plausible_domain = next(iter(plausible_domains)) if len(plausible_domains) == 1 else ""
+            # A name alone is not a safe merge key. A blank legacy duplicate can
+            # share the sole verified domain for that name, but conflicting domains
+            # remain independent to avoid cross-filling distinct organizations.
+            can_share_sole_domain = bool(
+                sole_confirmed_domain
+                and (not plausible_domains or plausible_domains == {sole_confirmed_domain})
+            )
+            domain = confirmed_company_domain(company)
+            key = (
+                f"{name_key}|domain:{sole_confirmed_domain}"
+                if can_share_sole_domain
+                else f"{name_key}|domain:{domain}"
+                if domain and plausible_domain == domain
+                else f"{name_key}|record:{company.get('id') or id(company)}"
+            )
+            by_identity.setdefault(key, []).append(company)
+
+    groups: list[dict[str, Any]] = []
+    duplicates_skipped = 0
+    for records in by_identity.values():
+        selected = [record for record in records if company_needs_company_information(record)]
+        if not selected:
+            continue
+        requested_fields = set().union(
+            *(missing_company_information_fields(record) for record in selected)
+        )
+        merged = merge_company_records(records)
+        merged["name"] = str(selected[0].get("name") or merged.get("name") or "")
+        groups.append(
+            {
+                "name": merged["name"],
+                "merged": merged,
+                "selectedRecords": selected,
+                "requestedFields": requested_fields,
+            }
+        )
+        duplicates_skipped += max(0, len(selected) - 1)
+    groups.sort(key=lambda group: (str(group["name"]).casefold(), str(group["merged"].get("id") or "")))
+    return groups, duplicates_skipped
+
+
+def _save_company_refresh_group(
+    repository: OpportunityRepository,
+    group: dict[str, Any],
+    discovery: CompanyInformationDiscovery,
+) -> dict[str, Any]:
+    changed_fields: set[str] = set()
+    errors: list[str] = []
+    saved_records = 0
+    remaining_requested: set[str] = set()
+    updates = {**discovery.updates, "lastChecked": utc_now()}
+    replacement_sources = updates.pop("replacementSourceValues", {})
+    requested_replacements = updates.get("replaceConfirmedFields", [])
+    change_keys = (*FIELD_LABELS.keys(), "websiteVerified")
+    for record in group["selectedRecords"]:
+        try:
+            before = repository.get_company(record["id"])
+            record_updates = dict(updates)
+            replacement_candidates = set(requested_replacements)
+            replacement_candidates.update(
+                field_name
+                for field_name in group["requestedFields"]
+                if field_name in discovery.updates
+                and field_name in FIELD_LABELS
+                and bool(str(before.get(field_name) or "").strip())
+                and field_is_clearly_invalid(before, field_name)
+            )
+            allowed_replacements = [
+                field_name
+                for field_name in sorted(replacement_candidates)
+                if field_is_clearly_invalid(before, field_name)
+                or _same_replacement_source(before.get(field_name), replacement_sources.get(field_name))
+            ]
+            if allowed_replacements:
+                record_updates["replaceConfirmedFields"] = allowed_replacements
+            else:
+                record_updates.pop("replaceConfirmedFields", None)
+            record_updates["searchStatus"] = _company_status_after_updates(
+                before,
+                record_updates,
+                set(allowed_replacements),
+            )
+            record_updates["reconcileSearchStatus"] = True
+            after = repository.update_discovered_company_fields(record["id"], record_updates)
+            saved_records += 1
+            changed_fields.update(
+                key for key in change_keys if before.get(key) != after.get(key)
+            )
+            remaining_requested.update(
+                missing_company_information_fields(after).intersection(group["requestedFields"])
+            )
+        except Exception as exc:
+            errors.append(f"{record.get('name') or record.get('id')}: {_safe_company_error(exc)}")
+
+    if changed_fields:
+        outcome = "updated"
+        message = f"Updated {', '.join(_company_field_label(key) for key in sorted(changed_fields))}."
+        if remaining_requested:
+            message += (
+                f" Still missing {', '.join(_company_field_label(key) for key in sorted(remaining_requested))}."
+            )
+    elif discovery.failed or (errors and not saved_records):
+        outcome = "failed"
+        message = "The company could not be reviewed; existing information was preserved."
+    elif remaining_requested:
+        outcome = "no_information_found"
+        message = "No additional high-confidence information was found; existing information was preserved."
+    else:
+        outcome = "unchanged"
+        message = "Confirmed available information; no saved values needed to change."
+
+    if len(group["selectedRecords"]) > 1:
+        message += f" One lookup safely covered {len(group['selectedRecords'])} duplicate records."
+    useful_notes = [note for note in discovery.notes if note]
+    if errors:
+        useful_notes.extend(errors)
+    if useful_notes:
+        message += f" {' '.join(useful_notes[:2])}"
+    representative = group["selectedRecords"][0]
+    reported_found_fields = [
+        key for key in discovery.found_fields
+        if key in group["requestedFields"] or key in changed_fields
+    ]
     return {
-        "companiesChecked": len(companies), "companiesUpdated": updated,
-        "jobBoardsVerified": boards_verified, "companiesNeedReview": needs_review,
-        "couldNotBeReached": unreachable,
+        "companyId": str(representative.get("id") or ""),
+        "companyName": str(group["name"]),
+        "outcome": outcome,
+        "foundFields": [_company_field_label(key) for key in reported_found_fields],
+        "updatedFields": [_company_field_label(key) for key in sorted(changed_fields)],
+        "message": message,
     }
+
+
+def _same_replacement_source(current: Any, source: Any) -> bool:
+    current_value = str(current or "").strip().rstrip("/")
+    source_value = str(source or "").strip().rstrip("/")
+    return bool(current_value and source_value and current_value == source_value)
+
+
+def _company_status_after_updates(
+    current: dict[str, Any],
+    updates: dict[str, Any],
+    allowed_replacements: set[str],
+) -> str:
+    effective = dict(current)
+    for field_name in FIELD_LABELS:
+        value = updates.get(field_name)
+        if value in (None, ""):
+            continue
+        if current.get(field_name) in (None, "") or field_name in allowed_replacements:
+            effective[field_name] = value
+
+    if updates.get("websiteVerified"):
+        discovered_website = str(
+            updates.get("officialWebsite") or current.get("officialWebsite") or ""
+        )
+        current_website = str(current.get("officialWebsite") or "")
+        if (
+            not current_website
+            or discovered_website == current_website
+            or "officialWebsite" in allowed_replacements
+        ):
+            effective["websiteVerified"] = True
+
+    return "Completed" if not missing_company_information_fields(effective) else "Partial"
+
+
+def _new_company_refresh_summary(total: int, duplicates_skipped: int) -> dict[str, Any]:
+    return {
+        "totalCompaniesNeedingReview": total,
+        "processedCount": 0,
+        "updatedCount": 0,
+        "noInformationFoundCount": 0,
+        "failedCount": 0,
+        "unchangedCount": 0,
+        "duplicateRecordsSkipped": duplicates_skipped,
+        "companiesChecked": 0,
+        "companiesUpdated": 0,
+        "companiesNeedReview": 0,
+        "couldNotBeReached": 0,
+        "jobBoardsVerified": 0,
+        "companyResults": [],
+    }
+
+
+def _company_field_label(field_name: str) -> str:
+    if field_name == "websiteVerified":
+        return "Website verification"
+    return FIELD_LABELS.get(field_name, field_name)
+
+
+def _outcome_counter(outcome: str) -> str:
+    return {
+        "updated": "updatedCount",
+        "no_information_found": "noInformationFoundCount",
+        "failed": "failedCount",
+        "unchanged": "unchangedCount",
+    }[outcome]
+
+
+def _add_legacy_company_summary_fields(summary: dict[str, Any]) -> None:
+    summary.update(
+        {
+            "companiesChecked": summary["processedCount"],
+            "companiesUpdated": summary["updatedCount"],
+            "companiesNeedReview": summary["noInformationFoundCount"] + summary["unchangedCount"],
+            "couldNotBeReached": summary["failedCount"],
+        }
+    )
+
+
+def _safe_company_error(exc: Exception) -> str:
+    if isinstance(exc, (KeyError, ValueError)):
+        return str(exc)[:240]
+    return f"{type(exc).__name__} while saving or validating the company"
 
 
 def refresh_company_discovery(
@@ -291,8 +607,7 @@ def import_data_file(
 
 
 def needs_company_information(company: dict[str, Any]) -> bool:
-    keys = ("officialWebsite", "careersPageUrl", "jobBoardUrl", "jobPlatform", "city", "state", "foundedYear", "totalAssets")
-    return not company.get("websiteVerified") or any(company.get(key) in (None, "") for key in keys)
+    return company_needs_company_information(company)
 
 
 def discovery_to_api(discovered: dict[str, Any]) -> dict[str, Any]:
@@ -335,6 +650,23 @@ def extract_public_company_metadata(url: str) -> dict[str, Any]:
             if isinstance(address, dict):
                 result.setdefault("city", str(address.get("addressLocality") or ""))
                 result.setdefault("state", str(address.get("addressRegion") or ""))
+            if isinstance(item, dict):
+                description = " ".join(str(item.get("description") or "").split())
+                if len(description) >= 40:
+                    result.setdefault("companyDescription", description[:1500])
+                industry = item.get("industry")
+                if isinstance(industry, str) and industry.strip():
+                    result.setdefault("industry", " ".join(industry.split()))
+    if not result.get("companyDescription"):
+        for attributes in (
+            {"property": re.compile(r"^og:description$", re.I)},
+            {"name": re.compile(r"^description$", re.I)},
+        ):
+            meta = soup.find("meta", attrs=attributes)
+            description = " ".join(str(meta.get("content") if meta else "").split())
+            if len(description) >= 40:
+                result["companyDescription"] = description[:1500]
+                break
     result["officialWebsite"] = final_url
     return {key: value for key, value in result.items() if value not in (None, "")}
 
@@ -394,7 +726,11 @@ def validate_imported_urls(record: dict[str, Any], keys: tuple[str, ...]) -> Non
 
 
 def discoverable_keys() -> tuple[str, ...]:
-    return ("industry", "city", "state", "officialWebsite", "careersPageUrl", "jobBoardUrl", "jobPlatform", "foundedYear", "totalAssets", "assetsAsOfDate")
+    return (
+        "industry", "companyDescription", "city", "state", "officialWebsite",
+        "careersPageUrl", "jobBoardUrl", "jobPlatform", "foundedYear",
+        "totalAssets", "assetsAsOfDate",
+    )
 
 
 def check_cancelled(cancelled: Event) -> None:

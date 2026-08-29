@@ -9,16 +9,27 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
-from backend.db import connect, initialize_schema
+from backend.db import connect, initialize_schema, normalize_company_name
 from backend.match_constants import MATCH_ALGORITHM_VERSION, job_match_fingerprint
 
 
-COMPANY_SELECT = """SELECT id, name, industry, city, state, country, known_website,
-official_website, website_discovery_method, website_candidate_urls,
+COMPANY_SELECT = """SELECT id, name, normalized_name, industry, company_description,
+ city, state, country, known_website,
+ official_website, website_discovery_method, website_candidate_urls,
 website_verification_notes, website_verified, careers_page_url, job_board_url,
 job_board_discovery_method, jobs_rss_feed_url, job_platform, feed_found,
 search_status, confidence, last_checked, notes, founded_year, total_assets,
-assets_as_of_date, company_info_last_checked FROM companies"""
+ assets_as_of_date, company_info_last_checked FROM companies"""
+
+
+class DuplicateCompanyError(ValueError):
+    """Raised when a create or rename would duplicate a normalized company name."""
+
+    def __init__(self, name: str, existing_company_id: str, existing_name: str) -> None:
+        self.name = name
+        self.existing_company_id = existing_company_id
+        self.existing_name = existing_name
+        super().__init__(f'A company named "{existing_name}" already exists.')
 
 JOB_MATCH_SELECT = """SELECT j.*, r.version AS active_resume_version,
 f.score AS match_score, f.status AS match_status, f.resume_version AS match_resume_version,
@@ -167,10 +178,15 @@ class OpportunityRepository:
     def create_company(self, payload: dict[str, str]) -> dict[str, Any]:
         company_id = f"company-{uuid4()}"
         now = utc_now()
+        name = payload["name"].strip()
+        normalized_name = normalize_company_name(name)
+        if not normalized_name:
+            raise ValueError("Company Name is required.")
         website = payload.get("companyWebsite", "").strip()
         job_board = payload.get("jobBoardUrl", "").strip()
         values = (
-            company_id, payload["name"].strip(), payload.get("industry", "Financial Services").strip(),
+            company_id, name, normalized_name, payload.get("industry", "Financial Services").strip(),
+            payload.get("companyDescription", "").strip(),
             payload.get("city", "").strip(), payload.get("state", "").strip(),
             payload.get("country", "United States").strip(), website, website,
             "Not Found", "", "", 0, payload.get("careersPageUrl", "").strip(), job_board,
@@ -178,42 +194,81 @@ class OpportunityRepository:
             payload.get("notes", "").strip(), now, now,
         )
         with self.connection() as connection:
-            connection.execute(
-                """INSERT INTO companies (id, name, industry, city, state, country,
+            duplicate = find_company_by_normalized_name(connection, normalized_name)
+            if duplicate is not None:
+                raise duplicate_company_error(name, duplicate)
+            try:
+                connection.execute(
+                    """INSERT INTO companies (id, name, normalized_name, industry,
+                company_description, city, state, country,
                 known_website, official_website, website_discovery_method,
                 website_candidate_urls, website_verification_notes, website_verified,
                 careers_page_url, job_board_url, job_board_discovery_method,
                 jobs_rss_feed_url, job_platform, feed_found, search_status, confidence,
                 last_checked, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                values,
-            )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            except sqlite3.IntegrityError as exc:
+                duplicate = find_company_by_normalized_name(connection, normalized_name)
+                if duplicate is not None:
+                    raise duplicate_company_error(name, duplicate) from None
+                raise exc
         return self.get_company(company_id)
 
     def update_company(self, company_id: str, payload: dict[str, str]) -> dict[str, Any]:
-        current = self.get_company(company_id)
+        name = payload["name"].strip()
+        normalized_name = normalize_company_name(name)
+        if not normalized_name:
+            raise ValueError("Company Name is required.")
         website = payload.get("companyWebsite", "").strip()
         careers = payload.get("careersPageUrl", "").strip()
         job_board = payload.get("jobBoardUrl", "").strip()
-        urls_changed = any((current[api_key] or "").strip() != value for api_key, value in (
-            ("officialWebsite", website), ("careersPageUrl", careers), ("jobBoardUrl", job_board)
-        ))
         with self.connection() as connection:
-            cursor = connection.execute(
-                """UPDATE companies SET name = ?, industry = ?, city = ?, state = ?, country = ?,
+            row = connection.execute(f"{COMPANY_SELECT} WHERE id = ?", (company_id,)).fetchone()
+            if row is None:
+                raise KeyError(company_id)
+            current = company_row_to_api(row)
+            current_normalized_name = normalize_company_name(current["name"])
+            duplicate = find_company_by_normalized_name(
+                connection, normalized_name, exclude_id=company_id,
+            )
+            if duplicate is not None and normalized_name != current_normalized_name:
+                raise duplicate_company_error(name, duplicate)
+            stored_normalized_name = normalized_name_for_existing_company(
+                row, normalized_name, duplicate,
+            )
+            urls_changed = any((current[api_key] or "").strip() != value for api_key, value in (
+                ("officialWebsite", website), ("careersPageUrl", careers), ("jobBoardUrl", job_board)
+            ))
+            company_description = payload.get("companyDescription", "").strip()
+            if not company_description:
+                company_description = current.get("companyDescription", "")
+            try:
+                cursor = connection.execute(
+                    """UPDATE companies SET name = ?, normalized_name = ?, industry = ?,
+                company_description = ?, city = ?, state = ?, country = ?,
                 known_website = ?, official_website = ?, careers_page_url = ?, job_board_url = ?,
                 notes = ?, website_verified = CASE WHEN ? THEN 0 ELSE website_verified END,
                 job_board_discovery_method = CASE WHEN ? THEN 'Manual Re-verification Required' ELSE job_board_discovery_method END,
                 search_status = CASE WHEN ? THEN 'Needs Review' ELSE search_status END,
                 last_checked = CASE WHEN ? THEN '' ELSE last_checked END, updated_at = ? WHERE id = ?""",
-                (
-                    payload["name"].strip(), payload.get("industry", "Financial Services").strip(),
-                    payload.get("city", "").strip(), payload.get("state", "").strip(),
-                    payload.get("country", "United States").strip(), website, website, careers,
-                    job_board, payload.get("notes", "").strip(), urls_changed, urls_changed,
-                    urls_changed, urls_changed, utc_now(), company_id,
-                ),
-            )
+                    (
+                        name, stored_normalized_name,
+                        payload.get("industry", "Financial Services").strip(), company_description,
+                        payload.get("city", "").strip(), payload.get("state", "").strip(),
+                        payload.get("country", "United States").strip(), website, website, careers,
+                        job_board, payload.get("notes", "").strip(), urls_changed, urls_changed,
+                        urls_changed, urls_changed, utc_now(), company_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                duplicate = find_company_by_normalized_name(
+                    connection, normalized_name, exclude_id=company_id,
+                )
+                if duplicate is not None:
+                    raise duplicate_company_error(name, duplicate) from None
+                raise exc
             if cursor.rowcount != 1:
                 raise KeyError(company_id)
         company = self.get_company(company_id)
@@ -223,7 +278,8 @@ class OpportunityRepository:
     def update_discovered_company_fields(self, company_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         current = self.get_company(company_id)
         columns = {
-            "industry": "industry", "city": "city", "state": "state",
+            "industry": "industry", "companyDescription": "company_description",
+            "city": "city", "state": "state",
             "knownWebsite": "known_website", "officialWebsite": "official_website",
             "websiteDiscoveryMethod": "website_discovery_method",
             "websiteCandidateUrls": "website_candidate_urls",
@@ -233,25 +289,44 @@ class OpportunityRepository:
             "foundedYear": "founded_year", "totalAssets": "total_assets",
             "assetsAsOfDate": "assets_as_of_date",
         }
+        raw_replace_confirmed = updates.get("replaceConfirmedFields")
+        replace_confirmed_fields = {
+            str(field) for field in raw_replace_confirmed
+            if isinstance(field, str) and field in columns
+        } if isinstance(raw_replace_confirmed, (list, tuple, set, frozenset)) else set()
         assignments: list[str] = []
         parameters: list[Any] = []
         for api_key, column in columns.items():
             value = updates.get(api_key)
+            if api_key == "companyDescription" and isinstance(value, str):
+                value = value.strip()
             may_replace_invalid_board = api_key == "jobBoardUrl" and updates.get("replaceInvalidJobBoard")
+            may_replace_confirmed = api_key in replace_confirmed_fields
             may_replace_on_refresh = updates.get("replaceDiscoveredValues") and api_key in {
                 "officialWebsite", "websiteDiscoveryMethod", "websiteCandidateUrls",
                 "websiteVerificationNotes", "careersPageUrl", "jobBoardUrl",
                 "jobBoardDiscoveryMethod", "jobPlatform", "totalAssets", "assetsAsOfDate",
             }
-            if value in (None, "") or (current.get(api_key) not in (None, "") and not may_replace_invalid_board and not may_replace_on_refresh):
+            if value in (None, "") or (
+                current.get(api_key) not in (None, "")
+                and not may_replace_invalid_board
+                and not may_replace_confirmed
+                and not may_replace_on_refresh
+            ):
                 continue
             assignments.append(f"{column} = ?")
             parameters.append(value)
 
         discovered_website = str(updates.get("officialWebsite") or current.get("officialWebsite") or "")
-        if updates.get("websiteVerified") and (updates.get("replaceDiscoveredValues") or discovered_website == str(current.get("officialWebsite") or discovered_website)):
+        if updates.get("websiteVerified") and (
+            updates.get("replaceDiscoveredValues")
+            or "officialWebsite" in replace_confirmed_fields
+            or discovered_website == str(current.get("officialWebsite") or discovered_website)
+        ):
             assignments.append("website_verified = 1")
-        if updates.get("searchStatus") and current.get("searchStatus") != "Completed":
+        if updates.get("searchStatus") and (
+            current.get("searchStatus") != "Completed" or updates.get("reconcileSearchStatus")
+        ):
             assignments.append("search_status = ?")
             parameters.append(updates["searchStatus"])
         assignments.extend(["last_checked = ?", "company_info_last_checked = ?", "updated_at = ?"])
@@ -472,18 +547,71 @@ class OpportunityRepository:
         return fit_result_to_api(row) if row else None
 
     def upsert_company_snapshots(self, companies: Iterable[dict[str, Any]]) -> int:
-        prepared = list(companies)
+        prepared = [dict(company) for company in companies]
         now = utc_now()
         with self.connection() as connection:
-            for company in prepared:
-                connection.execute(
-                    """INSERT INTO companies (id,name,industry,city,state,country,known_website,official_website,
+            for source in prepared:
+                incoming_id = str(source.get("id") or "").strip()
+                existing_row = connection.execute(
+                    f"{COMPANY_SELECT} WHERE id = ?", (incoming_id,),
+                ).fetchone() if incoming_id else None
+                name = str(source.get("name") or "").strip()
+                if existing_row is not None and not name:
+                    name = str(existing_row["name"])
+                normalized_name = normalize_company_name(name)
+                if not normalized_name:
+                    raise ValueError("Company Name is required.")
+                source["name"] = name
+
+                if existing_row is not None:
+                    current = company_row_to_api(existing_row)
+                    duplicate = find_company_by_normalized_name(
+                        connection, normalized_name, exclude_id=incoming_id,
+                    )
+                    if (
+                        duplicate is not None
+                        and normalized_name != normalize_company_name(current["name"])
+                    ):
+                        raise duplicate_company_error(name, duplicate)
+                    stored_normalized_name = normalized_name_for_existing_company(
+                        existing_row, normalized_name, duplicate,
+                    )
+                    company = merge_company_snapshot(current, source, prefer_incoming=True)
+                    company["id"] = incoming_id
+                else:
+                    duplicate = find_company_by_normalized_name(connection, normalized_name)
+                    if duplicate is not None:
+                        target_row = connection.execute(
+                            f"{COMPANY_SELECT} WHERE id = ?", (duplicate["id"],),
+                        ).fetchone()
+                        if target_row is None:  # pragma: no cover - same-transaction defensive guard
+                            raise KeyError(duplicate["id"])
+                        other_duplicate = find_company_by_normalized_name(
+                            connection, normalized_name, exclude_id=duplicate["id"],
+                        )
+                        stored_normalized_name = normalized_name_for_existing_company(
+                            target_row, normalized_name, other_duplicate,
+                        )
+                        company = merge_company_snapshot(
+                            company_row_to_api(target_row), source, prefer_incoming=False,
+                        )
+                        company["id"] = duplicate["id"]
+                    else:
+                        stored_normalized_name = normalized_name
+                        company = source
+                        company["id"] = incoming_id or f"company-{uuid4()}"
+
+                try:
+                    connection.execute(
+                        """INSERT INTO companies (id,name,normalized_name,industry,company_description,
+                    city,state,country,known_website,official_website,
                     website_discovery_method,website_candidate_urls,website_verification_notes,website_verified,
                     careers_page_url,job_board_url,job_board_discovery_method,jobs_rss_feed_url,job_platform,
                     feed_found,search_status,confidence,last_checked,notes,founded_year,total_assets,
                     assets_as_of_date,company_info_last_checked,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET name=excluded.name,industry=excluded.industry,city=excluded.city,
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET name=excluded.name,normalized_name=excluded.normalized_name,
+                    industry=excluded.industry,company_description=excluded.company_description,city=excluded.city,
                     state=excluded.state,country=excluded.country,known_website=excluded.known_website,
                     official_website=excluded.official_website,website_discovery_method=excluded.website_discovery_method,
                     website_candidate_urls=excluded.website_candidate_urls,website_verification_notes=excluded.website_verification_notes,
@@ -494,8 +622,15 @@ class OpportunityRepository:
                     last_checked=excluded.last_checked,notes=excluded.notes,founded_year=excluded.founded_year,
                     total_assets=excluded.total_assets,assets_as_of_date=excluded.assets_as_of_date,
                     company_info_last_checked=excluded.company_info_last_checked,updated_at=excluded.updated_at""",
-                    company_insert_values(company, now),
-                )
+                        company_insert_values(company, now, normalized_name=stored_normalized_name),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    duplicate = find_company_by_normalized_name(
+                        connection, normalized_name, exclude_id=company["id"],
+                    )
+                    if duplicate is not None:
+                        raise duplicate_company_error(name, duplicate) from None
+                    raise exc
         return len(prepared)
 
     def record_utility_run(self, utility_name: str, status: str, started_at: str, completed_at: str, payload: dict[str, Any]) -> str:
@@ -548,6 +683,7 @@ class OpportunityRepository:
 def company_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     company = {
         "id": row["id"], "name": row["name"], "industry": row["industry"],
+        "companyDescription": row["company_description"],
         "city": row["city"], "state": row["state"], "country": row["country"],
         "knownWebsite": row["known_website"], "officialWebsite": row["official_website"],
         "websiteDiscoveryMethod": row["website_discovery_method"],
@@ -586,6 +722,7 @@ def distinct_values(connection: sqlite3.Connection, column: str) -> list[str]:
 def company_api_to_excel(company: dict[str, Any]) -> dict[str, Any]:
     return {
         "Company ID": company["id"], "Company Name": company["name"], "Industry": company.get("industry", ""),
+        "Company Description": company.get("companyDescription", ""),
         "City": company.get("city", ""), "State": company.get("state", ""), "Country": company.get("country", ""),
         "Known Website": company.get("knownWebsite", ""), "Official Website": company.get("officialWebsite", ""),
         "Website Discovery Method": company.get("websiteDiscoveryMethod", ""),
@@ -733,9 +870,19 @@ def prune_missing_jobs(connection: sqlite3.Connection, keep_ids: set[str], *, co
     )
 
 
-def company_insert_values(company: dict[str, Any], now: str) -> tuple[Any, ...]:
+def company_insert_values(
+    company: dict[str, Any],
+    now: str,
+    *,
+    normalized_name: str | None = None,
+) -> tuple[Any, ...]:
+    stored_normalized_name = (
+        normalize_company_name(company.get("name"))
+        if normalized_name is None else normalized_name
+    )
     return (
-        company["id"], company["name"], company.get("industry", "Financial Services"), company.get("city", ""),
+        company["id"], company["name"], stored_normalized_name,
+        company.get("industry", "Financial Services"), company.get("companyDescription", ""), company.get("city", ""),
         company.get("state", ""), company.get("country", "United States"), company.get("knownWebsite", ""),
         company.get("officialWebsite", ""), company.get("websiteDiscoveryMethod", ""),
         company.get("websiteCandidateUrls", ""), company.get("websiteVerificationNotes", ""),
@@ -746,6 +893,91 @@ def company_insert_values(company: dict[str, Any], now: str) -> tuple[Any, ...]:
         company.get("foundedYear"), company.get("totalAssets"), company.get("assetsAsOfDate", ""),
         company.get("companyInfoLastChecked", ""), now, now,
     )
+
+
+COMPANY_SNAPSHOT_FIELDS = (
+    "name", "industry", "companyDescription", "city", "state", "country",
+    "knownWebsite", "officialWebsite", "websiteDiscoveryMethod", "websiteCandidateUrls",
+    "websiteVerificationNotes", "websiteVerified", "careersPageUrl", "jobBoardUrl",
+    "jobBoardDiscoveryMethod", "jobsRssFeedUrl", "jobPlatform", "feedFound",
+    "searchStatus", "confidence", "lastChecked", "notes", "foundedYear", "totalAssets",
+    "assetsAsOfDate", "companyInfoLastChecked",
+)
+
+
+def find_company_by_normalized_name(
+    connection: sqlite3.Connection,
+    normalized_name: str,
+    *,
+    exclude_id: str | None = None,
+) -> sqlite3.Row | None:
+    """Find a duplicate even when it predates the normalized-name migration."""
+    if not normalized_name:
+        return None
+    parameters: list[Any] = []
+    where = ""
+    if exclude_id is not None:
+        where = "WHERE id <> ?"
+        parameters.append(exclude_id)
+    rows = connection.execute(
+        f"""SELECT id, name, normalized_name, created_at FROM companies {where}
+        ORDER BY CASE WHEN normalized_name <> '' THEN 0 ELSE 1 END, created_at, id""",
+        parameters,
+    ).fetchall()
+    return next(
+        (row for row in rows if normalize_company_name(row["name"]) == normalized_name),
+        None,
+    )
+
+
+def duplicate_company_error(name: str, row: sqlite3.Row) -> DuplicateCompanyError:
+    return DuplicateCompanyError(name, str(row["id"]), str(row["name"]))
+
+
+def normalized_name_for_existing_company(
+    row: sqlite3.Row,
+    normalized_name: str,
+    duplicate: sqlite3.Row | None,
+) -> str:
+    if str(row["normalized_name"] or "") == normalized_name:
+        return normalized_name
+    # A preserved legacy duplicate must remain outside the unique partial index.
+    return "" if duplicate is not None else normalized_name
+
+
+def merge_company_snapshot(
+    current: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    prefer_incoming: bool,
+) -> dict[str, Any]:
+    """Merge snapshots without allowing blanks to erase confirmed stored values.
+
+    Same-ID snapshots retain the established refresh behavior for nonblank values.
+    A different ID with the same normalized name is treated as a duplicate import:
+    the stored record wins and only its missing fields are filled.
+    """
+    merged = dict(current)
+    for key in COMPANY_SNAPSHOT_FIELDS:
+        value = incoming.get(key)
+        if not has_company_value(value):
+            continue
+        if prefer_incoming or not has_company_value(merged.get(key)):
+            merged[key] = value.strip() if isinstance(value, str) else value
+            continue
+        if key in {"websiteVerified", "feedFound"}:
+            merged[key] = bool(merged.get(key)) or bool(value)
+        elif key == "confidence":
+            merged[key] = max(int(merged.get(key) or 0), int(value or 0))
+    return merged
+
+
+def has_company_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
 
 
 def utc_now() -> str:

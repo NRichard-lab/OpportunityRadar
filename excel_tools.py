@@ -26,6 +26,7 @@ COLUMN_MAP = {
     "Company ID": "id",
     "Company Name": "name",
     "Industry": "industry",
+    "Company Description": "companyDescription",
     "City": "city",
     "State": "state",
     "Country": "country",

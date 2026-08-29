@@ -1,12 +1,21 @@
 import { useEffect, useMemo, useState, type ChangeEvent, type ReactNode } from "react";
 import { Building2, CalendarClock, DatabaseBackup, Download, History, Mail, RefreshCw, RotateCw, Save, Search, Send, Upload, X, type LucideIcon } from "lucide-react";
-import type { MaintenanceJobState, MaintenanceJobsState, MaintenanceRun } from "../types/Maintenance";
+import {
+  COMPANY_INFO_REFRESH_ACTION,
+  type CompanyInfoRefreshOutcome,
+  type CompanyInfoRefreshResult,
+  type CompanyInfoRefreshSummary,
+  type MaintenanceJobState,
+  type MaintenanceJobsState,
+  type MaintenanceRun,
+} from "../types/Maintenance";
 import type { FeatureFlags } from "../types/FeatureFlags";
 import {
   isEmailDigestMutationResponse,
   isEmailHistoryPayload,
   isEmailSettingsPayload,
   isEmailStatusPayload,
+  isCompanyInfoRefreshSummary,
   isMaintenanceHistoryResponse,
   isMessageResponse,
   isScheduleMutationResponse,
@@ -18,15 +27,15 @@ import {
 } from "../runtimeSchemas";
 import { ApiError, apiJson, userMessage } from "../api";
 
-type UtilityKey = "refresh-missing-company-information" | "refresh-company-discovery" | "refresh-all-job-listings" | "reprocess-saved-jobs" | "create-backup" | "export-data" | "import-data";
+type UtilityKey = typeof COMPANY_INFO_REFRESH_ACTION | "refresh-company-discovery" | "refresh-all-job-listings" | "reprocess-saved-jobs" | "create-backup" | "export-data" | "import-data";
 interface UtilitiesProps { maintenance: MaintenanceJobsState; onMaintenanceRefresh: () => Promise<MaintenanceJobsState>; features: FeatureFlags; }
-interface UtilityPresentation { key: UtilityKey; confirmation: string; icon: LucideIcon; }
+export interface UtilityPresentation { key: UtilityKey; confirmation: string; icon: LucideIcon; }
 type UtilityTab = "refresh" | "data" | "email";
 
 const timezoneOptions = ["America/Denver", "America/Chicago", "America/New_York", "America/Los_Angeles", "UTC"];
 const refreshSections: Array<{ title: string; actions: UtilityPresentation[] }> = [
   { title: "Company Maintenance", actions: [
-    { key: "refresh-missing-company-information", confirmation: "This checks companies with missing or unverified information and fills only blank fields. Existing verified or user-entered information will not be replaced.", icon: Building2 },
+    { key: COMPANY_INFO_REFRESH_ACTION, confirmation: "This checks only companies with missing or clearly invalid information and fills fields when a better result is confirmed. Existing verified or user-entered information will not be replaced.", icon: Building2 },
     { key: "refresh-company-discovery", confirmation: "This rechecks companies that need review or do not have a verified job board. Companies with current verified information will be skipped.", icon: Search },
   ] },
   { title: "Job Maintenance", actions: [
@@ -51,10 +60,17 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
   const [historyJob, setHistoryJob] = useState<MaintenanceJobState | null>(null);
   const [historyRuns, setHistoryRuns] = useState<MaintenanceRun[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [cancellingRunIds, setCancellingRunIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => { void onMaintenanceRefresh(); }, []);
   useEffect(() => { const url = new URL(window.location.href); url.searchParams.set("tab", activeTab); window.history.replaceState(null, "", url); }, [activeTab]);
   const jobsByKey = useMemo(() => new Map(maintenance.jobs.map((job) => [job.jobKey, job])), [maintenance.jobs]);
+  const terminalCompanyInfoRun = latestFinishedCompanyInfoRun(jobsByKey.get(COMPANY_INFO_REFRESH_ACTION));
+  const [retainedCompanyInfoRun, setRetainedCompanyInfoRun] = useState<MaintenanceRun | null>(terminalCompanyInfoRun);
+  useEffect(() => {
+    if (terminalCompanyInfoRun) setRetainedCompanyInfoRun(terminalCompanyInfoRun);
+  }, [terminalCompanyInfoRun?.id, terminalCompanyInfoRun?.updatedAt]);
+  const latestCompanyInfoRun = terminalCompanyInfoRun || retainedCompanyInfoRun;
 
   const startAction = async () => {
     if (!pendingAction || (pendingAction.key === "import-data" && !importFile)) return;
@@ -118,7 +134,8 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
   };
 
   const cancelRun = async (runId: string) => {
-    if (!features.utilities) return;
+    if (!features.utilities || cancellingRunIds.has(runId)) return;
+    setCancellingRunIds((current) => new Set(current).add(runId));
     try {
       const cancelledRun = await apiJson<unknown>(`/maintenance/runs/${runId}/cancel`, { method: "POST" }, "Could not cancel this action.");
       if (!isUtilityCancelResponse(cancelledRun) || cancelledRun.id !== runId || cancelledRun.run_id !== runId) {
@@ -126,13 +143,15 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
       }
       await onMaintenanceRefresh();
     } catch (caught) { setError(userMessage(caught, "Could not cancel this action.")); }
+    finally { setCancellingRunIds((current) => { const next = new Set(current); next.delete(runId); return next; }); }
   };
 
   return <div className="space-y-8">
     <nav className="flex gap-1 border-b border-radar-line" aria-label="Utilities sections">
       {([{"key":"refresh","label":"Refresh"},{"key":"data","label":"Data & Recovery"},{"key":"email","label":"Email"}] as Array<{key: UtilityTab; label: string}>).map((tab) => <button className={`border-b-2 px-4 py-3 text-sm font-medium transition ${activeTab === tab.key ? "border-radar-highlight text-white" : "border-transparent text-slate-400 hover:text-white"}`} type="button" key={tab.key} aria-current={activeTab === tab.key ? "page" : undefined} onClick={() => setActiveTab(tab.key)}>{tab.label}</button>)}
     </nav>
-    {maintenance.activeRuns.map((run) => <ProgressPanel key={run.id} run={run} onCancel={cancelRun} />)}
+    {maintenance.activeRuns.map((run) => <ProgressPanel key={run.id} run={run} cancelling={cancellingRunIds.has(run.id)} onCancel={cancelRun} />)}
+    {activeTab === "refresh" && latestCompanyInfoRun ? <CompanyInfoFinalReport run={latestCompanyInfoRun} /> : null}
     {error && !pendingAction && !scheduleJob && !historyJob ? <Alert message={error} /> : null}
     {activeTab === "refresh" && (!maintenance.jobs.length ? <p className="text-sm text-slate-400">Loading utilities...</p> : refreshSections.map((section) => <section key={section.title}>
       <h2 className="text-lg font-semibold text-white">{section.title}</h2>
@@ -270,7 +289,7 @@ function EmailTab() {
 function EmailField({ label, children }: { label: string; children: ReactNode }) { return <label className="block text-sm text-slate-300">{label}{children}</label>; }
 function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="flex items-center justify-between gap-4 border-b border-radar-line pb-4"><span className="text-sm font-medium text-slate-200">{label}</span><button className={`relative h-6 w-11 rounded-full transition ${checked ? "bg-radar-accent" : "bg-slate-700"}`} type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span className={`absolute top-1 size-4 rounded-full bg-white transition-all ${checked ? "left-6" : "left-1"}`} /></button></div>; }
 
-function MaintenanceCard({ action, job, enabled, schedulesEnabled, onRun, onToggle, onEditSchedule, onHistory }: { action: UtilityPresentation; job: MaintenanceJobState; enabled: boolean; schedulesEnabled: boolean; onRun: () => void; onToggle: () => void; onEditSchedule: () => void; onHistory: () => void; }) {
+export function MaintenanceCard({ action, job, enabled, schedulesEnabled, onRun, onToggle, onEditSchedule, onHistory }: { action: UtilityPresentation; job: MaintenanceJobState; enabled: boolean; schedulesEnabled: boolean; onRun: () => void; onToggle: () => void; onEditSchedule: () => void; onHistory: () => void; }) {
   const Icon = action.icon;
   const scheduleText = job.schedule?.enabled ? `Daily at ${formatClockTime(job.schedule.runTime)} (${job.schedule.timezone})` : "Automatic schedule is off";
   return <article className="card flex flex-col p-5">
@@ -278,13 +297,87 @@ function MaintenanceCard({ action, job, enabled, schedulesEnabled, onRun, onTogg
     <dl className="mt-5 grid grid-cols-2 gap-x-5 gap-y-4 border-y border-radar-line py-4 sm:grid-cols-3"><Stat label="Last Run" value={job.lastRun ? formatTimestamp(job.lastRun.startedAt) : "Never"} /><Stat label="Last Runtime" value={formatDuration(job.lastRuntimeSeconds)} /><Stat label="Average Runtime" value={formatDuration(job.averageRuntimeSeconds)} /></dl>
     {!enabled ? <p className="mt-4 text-sm text-amber-200">Disabled for the initial production release.</p> : null}
     {job.supportsScheduling && job.schedule ? <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm font-medium text-slate-200">{schedulesEnabled ? scheduleText : "Scheduling unavailable"}</p><p className="mt-1 text-xs text-slate-500">{schedulesEnabled ? "Runs once each day while scheduled." : "Schedules are disabled for the initial production release."}</p></div><div className="flex items-center gap-2"><button className={`relative h-6 w-11 rounded-full transition disabled:cursor-not-allowed disabled:opacity-50 ${job.schedule.enabled ? "bg-radar-accent" : "bg-slate-700"}`} type="button" role="switch" aria-checked={job.schedule.enabled} aria-label={`Scheduled ${job.schedule.enabled ? "ON" : "OFF"} for ${job.taskName}`} disabled={!schedulesEnabled} onClick={onToggle}><span className={`absolute top-1 size-4 rounded-full bg-white transition-all ${job.schedule.enabled ? "left-6" : "left-1"}`} /></button><span className="w-24 text-sm text-slate-300">Scheduled {job.schedule.enabled ? "ON" : "OFF"}</span><button className="icon-btn disabled:cursor-not-allowed disabled:opacity-50" type="button" title={schedulesEnabled ? `Edit schedule for ${job.taskName}` : "Schedules are disabled for the initial production release."} aria-label={`Edit schedule for ${job.taskName}`} disabled={!schedulesEnabled} onClick={onEditSchedule}><CalendarClock size={18} /></button></div></div> : null}
-    <div className="mt-5 flex flex-wrap gap-3"><button className="btn btn-primary" type="button" title={!enabled ? "This utility is disabled for the initial production release." : undefined} disabled={!enabled || job.running} onClick={onRun}><RefreshCw className={job.running ? "animate-spin" : ""} size={17} />{job.running ? "Running..." : enabled ? job.jobKey === "import-data" ? "Import Data" : "Run Now" : "Unavailable"}</button><button className="btn" type="button" onClick={onHistory}><History size={17} />History</button></div>
+    <div className="mt-5 flex flex-wrap gap-3"><button className="btn btn-primary" type="button" title={!enabled ? "This utility is disabled for the initial production release." : undefined} disabled={!enabled || job.running} onClick={onRun}><RefreshCw className={job.running ? "animate-spin" : ""} size={17} />{job.running ? "Running..." : enabled ? utilityActionLabel(job.jobKey) : "Unavailable"}</button><button className="btn" type="button" onClick={onHistory}><History size={17} />History</button></div>
   </article>;
 }
 
-function ProgressPanel({ run, onCancel }: { run: MaintenanceRun; onCancel: (runId: string) => Promise<void> }) {
-  const unit = run.progressText.split(" ").slice(-1)[0] || "items";
-  return <section className="panel p-5" aria-live="polite"><div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-semibold uppercase text-radar-highlight">Maintenance running</p><ResultBadge result="Running" /></div><h2 className="mt-2 text-lg font-semibold text-white">{run.taskName}</h2><p className="mt-2 text-sm text-slate-300">Started: {formatTimestamp(run.startedAt)} · Elapsed: {formatDuration(run.runtimeSeconds)}</p><p className="mt-1 text-sm text-slate-300">Progress: {run.total ? `${run.current} / ${run.total} ${unit}` : "Running..."}</p><p className="mt-1 text-sm text-slate-400">Current item: {run.currentCompany || run.currentMessage || "Preparing"}</p><p className="mt-2 break-all font-mono text-xs text-slate-500">Run {run.id}</p></div><button className="btn" type="button" disabled={run.status === "Cancelling"} onClick={() => void onCancel(run.id)}>{run.status === "Cancelling" ? "Cancelling..." : "Cancel"}</button></div>{run.total ? <div className="mt-4 h-2 overflow-hidden rounded-full bg-radar-bg" aria-label={`${run.progress ?? 0}% complete`}><div className="h-full bg-radar-accent transition-all" style={{ width: `${run.progress ?? 0}%` }} /></div> : null}</section>;
+export function ProgressPanel({ run, cancelling = false, onCancel }: { run: MaintenanceRun; cancelling?: boolean; onCancel: (runId: string) => Promise<void> }) {
+  const isCancelling = cancelling || run.status === "Cancelling";
+  const summary = companyInfoSummary(run);
+  const total = summary?.totalCompaniesNeedingReview ?? run.total;
+  const processed = summary?.processedCount ?? run.current;
+  const progress = total ? Math.min(100, Math.round((processed / total) * 100)) : run.progress;
+  return <section className="panel p-5" aria-live="polite"><div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-semibold uppercase text-radar-highlight">Maintenance running</p><ResultBadge result="Running" /></div><h2 className="mt-2 text-lg font-semibold text-white">{run.taskName}</h2><p className="mt-2 text-sm text-slate-300">Started: {formatTimestamp(run.startedAt)} · Elapsed: {formatDuration(run.runtimeSeconds)}</p>{run.action === COMPANY_INFO_REFRESH_ACTION ? null : <><p className="mt-1 text-sm text-slate-300">Progress: {run.total ? `${run.current} / ${run.total} ${run.progressUnit || "items"}` : "Running..."}</p><p className="mt-1 text-sm text-slate-400">Current item: {run.currentCompany || run.currentMessage || "Preparing"}</p></>}<p className="mt-2 break-all font-mono text-xs text-slate-500">Run {run.id}</p></div><button className="btn" type="button" disabled={isCancelling} onClick={() => void onCancel(run.id)}>{isCancelling ? "Cancelling..." : "Cancel"}</button></div>{run.action === COMPANY_INFO_REFRESH_ACTION ? <CompanyInfoRunDetails run={run} showCurrentCompany /> : null}{total ? <div className="mt-4 h-2 overflow-hidden rounded-full bg-radar-bg" aria-label={`${progress ?? 0}% complete`}><div className="h-full bg-radar-accent transition-all" style={{ width: `${progress ?? 0}%` }} /></div> : null}</section>;
+}
+
+export function CompanyInfoFinalReport({ run }: { run: MaintenanceRun }) {
+  return <section className="panel p-5" aria-live="polite">
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div><p className="text-xs font-semibold uppercase text-radar-highlight">Latest company information refresh</p><h2 className="mt-2 text-lg font-semibold text-white">Refresh Missing Company Info Result</h2><p className="mt-2 text-sm text-slate-300">Finished: {formatTimestamp(run.completedAt || run.updatedAt)} · Runtime: {formatDuration(run.runtimeSeconds)}</p></div>
+      <RunStatusBadge status={run.status} />
+    </div>
+    {run.message ? <p className="mt-4 rounded-md border border-radar-line bg-radar-bg/60 px-4 py-3 text-sm text-slate-200">{run.message}</p> : null}
+    <CompanyInfoRunDetails run={run} />
+  </section>;
+}
+
+export function CompanyInfoRunDetails({ run, showCurrentCompany = false, compact = false }: { run: MaintenanceRun; showCurrentCompany?: boolean; compact?: boolean }) {
+  const summary = companyInfoSummary(run);
+  const totals = summary || fallbackCompanyInfoSummary(run);
+  return <div className={compact ? "mt-3" : "mt-4"}>
+    {showCurrentCompany ? <p className="mb-3 text-sm text-slate-300"><span className="text-slate-500">Current company:</span> {run.currentCompany || "Preparing"}</p> : null}
+    <dl className="grid grid-cols-2 gap-x-5 gap-y-4 rounded-md border border-radar-line bg-radar-bg/40 p-4 sm:grid-cols-4">
+      <Stat label="Total needing review" value={String(totals.totalCompaniesNeedingReview)} />
+      <Stat label="Processed" value={String(totals.processedCount)} />
+      <Stat label="Updated" value={String(totals.updatedCount)} />
+      <Stat label="No information found" value={String(totals.noInformationFoundCount)} />
+      <Stat label="Failed" value={String(totals.failedCount)} />
+      <Stat label="Unchanged" value={String(totals.unchangedCount)} />
+      <Stat label="Duplicates skipped" value={String(totals.duplicateRecordsSkipped)} />
+    </dl>
+    {!summary && !run.running ? <p className="mt-3 text-sm text-slate-400">Detailed company results were not available for this run.</p> : null}
+    {totals.companyResults.length ? <CompanyResultList results={totals.companyResults} heading={run.running ? "Latest company result" : "Company results"} /> : null}
+  </div>;
+}
+
+function CompanyResultList({ results, heading }: { results: CompanyInfoRefreshResult[]; heading: string }) {
+  return <div className="mt-4"><h3 className="text-sm font-semibold text-white">{heading}</h3><ul className="mt-2 space-y-2">{results.map((result, index) => <CompanyResultRow key={`${result.companyId}-${index}`} result={result} />)}</ul></div>;
+}
+
+function CompanyResultRow({ result }: { result: CompanyInfoRefreshResult }) {
+  const presentation = outcomePresentation[result.outcome];
+  return <li className="rounded-md border border-radar-line bg-radar-bg/50 px-4 py-3 text-sm">
+    <div className="flex flex-wrap items-center justify-between gap-2"><strong className="text-slate-100">{result.companyName}</strong><span className={`badge ${presentation.className}`}>{presentation.label}</span></div>
+    <p className="mt-2 text-slate-300">{result.message}</p>
+    {result.foundFields.length ? <p className="mt-1 text-xs text-slate-400"><span className="font-semibold text-slate-300">Found:</span> {formatFields(result.foundFields)}</p> : null}
+    {result.updatedFields.length ? <p className="mt-1 text-xs text-slate-400"><span className="font-semibold text-slate-300">Updated:</span> {formatFields(result.updatedFields)}</p> : null}
+  </li>;
+}
+
+const outcomePresentation: Record<CompanyInfoRefreshOutcome, { label: string; className: string }> = {
+  updated: { label: "Updated", className: "border-emerald-800 text-emerald-300" },
+  unchanged: { label: "No changes needed", className: "border-slate-700 text-slate-300" },
+  no_information_found: { label: "No information found", className: "border-amber-800 text-amber-300" },
+  failed: { label: "Failed", className: "border-red-900 text-red-300" },
+};
+
+export function companyInfoSummary(run: MaintenanceRun): CompanyInfoRefreshSummary | null {
+  if (run.action !== COMPANY_INFO_REFRESH_ACTION) return null;
+  if (isCompanyInfoRefreshSummary(run.resultSummary)) return run.resultSummary;
+  return isCompanyInfoRefreshSummary(run.summary) ? run.summary : null;
+}
+
+function fallbackCompanyInfoSummary(run: MaintenanceRun): CompanyInfoRefreshSummary {
+  return {
+    totalCompaniesNeedingReview: run.total,
+    processedCount: run.current,
+    updatedCount: 0,
+    noInformationFoundCount: 0,
+    failedCount: 0,
+    unchangedCount: 0,
+    duplicateRecordsSkipped: 0,
+    companyResults: [],
+  };
 }
 
 function ScheduleModal({ job, error, onCancel, onSave }: { job: MaintenanceJobState; error: string; onCancel: () => void; onSave: (enabled: boolean, runTime: string, timezone: string) => Promise<void>; }) {
@@ -295,25 +388,48 @@ function ScheduleModal({ job, error, onCancel, onSave }: { job: MaintenanceJobSt
   return <Modal title={`Schedule ${job.taskName}`} onClose={onCancel}><p className="text-sm text-slate-400">Set a daily time for this maintenance job. The application timezone is shared by all schedules.</p><label className="mt-5 flex items-center justify-between gap-4 border-y border-radar-line py-4"><span><span className="block font-medium text-white">Scheduled</span><span className="mt-1 block text-sm text-slate-400">Run this job automatically once per day.</span></span><input className="size-5 accent-radar-accent" type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /></label><div className="mt-4 grid gap-4 sm:grid-cols-2"><label className="text-sm text-slate-300">Run Time<input className="field mt-1" type="time" value={runTime} onChange={(event) => setRunTime(event.target.value)} /></label><label className="text-sm text-slate-300">Application Timezone<select className="field mt-1" value={timezone} onChange={(event) => setTimezone(event.target.value)}>{timezoneOptions.map((value) => <option key={value}>{value}</option>)}</select></label></div>{error ? <Alert message={error} /> : null}<div className="mt-5 flex justify-end gap-3"><button className="btn" type="button" disabled={saving} onClick={onCancel}>Cancel</button><button className="btn btn-primary" type="button" disabled={saving || !runTime} onClick={() => { setSaving(true); void onSave(enabled, runTime, timezone).finally(() => setSaving(false)); }}>{saving ? "Saving..." : "Save Schedule"}</button></div></Modal>;
 }
 
-function HistoryModal({ job, runs, loading, error, onClose }: { job: MaintenanceJobState; runs: MaintenanceRun[]; loading: boolean; error: string; onClose: () => void; }) {
-  return <Modal title={`${job.taskName} History`} onClose={onClose}>{loading ? <p className="text-sm text-slate-400">Loading history...</p> : error ? <Alert message={error} /> : runs.length ? <div className="max-h-[60vh] overflow-auto"><div className="grid min-w-[34rem] grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 border-b border-radar-line pb-2 text-xs font-semibold uppercase text-slate-500"><span>Started</span><span>Trigger</span><span>Runtime</span><span>Result</span></div>{runs.map((run) => <div className="min-w-[34rem] border-b border-radar-line py-3 last:border-0" key={run.id}><div className="grid grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 text-sm text-slate-300"><span>{formatTimestamp(run.startedAt || run.createdAt)}</span><span className="capitalize">{run.triggerType}</span><span>{formatDuration(run.runtimeSeconds)}</span><span className={run.status === "Completed" ? "text-emerald-300" : run.status === "Failed" ? "text-red-300" : "text-slate-400"}>{run.status === "Completed" ? "Success" : run.status}</span></div>{run.error ? <p className="mt-2 text-sm text-red-300">This maintenance run failed. Try the action again or contact an administrator.</p> : null}</div>)}</div> : <p className="text-sm text-slate-400">This utility has not run yet.</p>}</Modal>;
+export function HistoryModal({ job, runs, loading, error, onClose }: { job: MaintenanceJobState; runs: MaintenanceRun[]; loading: boolean; error: string; onClose: () => void; }) {
+  return <Modal title={`${job.taskName} History`} onClose={onClose}>{loading ? <p className="text-sm text-slate-400">Loading history...</p> : error ? <Alert message={error} /> : runs.length ? <div className="max-h-[60vh] overflow-auto"><div className="grid min-w-[34rem] grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 border-b border-radar-line pb-2 text-xs font-semibold uppercase text-slate-500"><span>Started</span><span>Trigger</span><span>Runtime</span><span>Result</span></div>{runs.map((run) => <div className="min-w-[34rem] border-b border-radar-line py-3 last:border-0" key={run.id}><div className="grid grid-cols-[minmax(9rem,1.5fr)_6rem_5rem_5rem] gap-3 text-sm text-slate-300"><span>{formatTimestamp(run.startedAt || run.createdAt)}</span><span className="capitalize">{run.triggerType}</span><span>{formatDuration(run.runtimeSeconds)}</span><span className={run.status === "Completed" ? "text-emerald-300" : run.status === "Failed" ? "text-red-300" : "text-slate-400"}>{run.status === "Completed" ? "Success" : run.status}</span></div>{run.action === COMPANY_INFO_REFRESH_ACTION && run.message ? <p className="mt-2 text-sm text-slate-300">{run.message}</p> : null}{run.action === COMPANY_INFO_REFRESH_ACTION ? <CompanyInfoRunDetails run={run} compact /> : null}{run.error ? <p className="mt-2 text-sm text-red-300">This maintenance run failed. Try the action again or contact an administrator.</p> : null}</div>)}</div> : <p className="text-sm text-slate-400">This utility has not run yet.</p>}</Modal>;
 }
 
 function ConfirmationModal({ action, job, file, error, starting, onFileChange, onCancel, onConfirm }: { action: UtilityPresentation; job?: MaintenanceJobState; file: File | null; error: string; starting: boolean; onFileChange: (event: ChangeEvent<HTMLInputElement>) => void; onCancel: () => void; onConfirm: () => Promise<void>; }) {
-  return <Modal title={job?.taskName || "Run Maintenance"} onClose={onCancel}><p className="text-sm leading-6 text-slate-300">{action.confirmation}</p>{action.key === "import-data" ? <label className="mt-4 block text-sm text-slate-300">Import file<input className="field mt-1" type="file" accept=".json,.xlsx,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onFileChange} /></label> : null}{file ? <p className="mt-2 text-sm text-slate-400">Selected: {file.name}</p> : null}{error ? <Alert message={error} /> : null}<div className="mt-5 flex justify-end gap-3"><button className="btn" type="button" disabled={starting} onClick={onCancel}>Cancel</button><button className="btn btn-primary" type="button" disabled={starting || (action.key === "import-data" && !file)} onClick={() => void onConfirm()}>{starting ? "Starting..." : action.key === "import-data" ? "Import Data" : "Run Now"}</button></div></Modal>;
+  return <Modal title={job?.taskName || "Run Maintenance"} onClose={onCancel}><p className="text-sm leading-6 text-slate-300">{action.confirmation}</p>{action.key === "import-data" ? <label className="mt-4 block text-sm text-slate-300">Import file<input className="field mt-1" type="file" accept=".json,.xlsx,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onFileChange} /></label> : null}{file ? <p className="mt-2 text-sm text-slate-400">Selected: {file.name}</p> : null}{error ? <Alert message={error} /> : null}<div className="mt-5 flex justify-end gap-3"><button className="btn" type="button" disabled={starting} onClick={onCancel}>Cancel</button><button className="btn btn-primary" type="button" disabled={starting || (action.key === "import-data" && !file)} onClick={() => void onConfirm()}>{starting ? "Starting..." : utilityActionLabel(action.key)}</button></div></Modal>;
 }
 
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) { return <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="panel w-full max-w-2xl p-5" role="dialog" aria-modal="true" aria-label={title}><header className="mb-4 flex items-center justify-between gap-4"><h2 className="text-xl font-semibold text-white">{title}</h2><button className="icon-btn" type="button" onClick={onClose} title="Close" aria-label="Close"><X size={18} /></button></header>{children}</section></div>; }
 function Stat({ label, value }: { label: string; value: string }) { return <div><dt className="text-xs uppercase text-slate-500">{label}</dt><dd className="mt-1 text-sm text-slate-200">{value}</dd></div>; }
 function Alert({ message }: { message: string }) { return <div className="mt-4 rounded-md border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300" role="alert">{message}</div>; }
 function ResultBadge({ result }: { result: MaintenanceJobState["lastResult"] }) { const colors = result === "Success" ? "border-emerald-800 text-emerald-300" : result === "Failed" ? "border-red-900 text-red-300" : result === "Running" ? "border-blue-800 text-blue-300" : "border-slate-700 text-slate-400"; return <span className={`badge shrink-0 ${colors}`}>{result}</span>; }
+function RunStatusBadge({ status }: { status: MaintenanceRun["status"] }) { const label = status === "Completed" ? "Success" : status; const colors = status === "Completed" ? "border-emerald-800 text-emerald-300" : status === "Failed" ? "border-red-900 text-red-300" : status === "Cancelled" ? "border-amber-800 text-amber-300" : "border-slate-700 text-slate-400"; return <span className={`badge shrink-0 ${colors}`}>{label}</span>; }
 function formatTimestamp(value: string): string { if (!value) return "Never"; return new Date(value).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }); }
 function formatClockTime(value: string): string { const [hour, minute] = value.split(":").map(Number); return new Date(2000, 0, 1, hour, minute).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
 function formatDuration(seconds: number | null): string { if (seconds === null) return "Not available"; if (seconds > 0 && seconds < 1) return "<1s"; const total = Math.max(0, Math.floor(seconds)); const hours = Math.floor(total / 3600); const minutes = Math.floor((total % 3600) / 60); const remaining = total % 60; return [hours ? `${hours}h` : "", minutes || hours ? `${minutes}m` : "", `${remaining}s`].filter(Boolean).join(" "); }
 
+function formatFields(fields: string[]): string {
+  return fields.map((field) => field
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\burl\b/gi, "URL")
+    .replace(/\brss\b/gi, "RSS")
+    .replace(/^./, (character) => character.toUpperCase())
+    .trim()).join(", ");
+}
+
+function latestFinishedCompanyInfoRun(job?: MaintenanceJobState): MaintenanceRun | null {
+  const terminalStatuses = new Set<MaintenanceRun["status"]>(["Completed", "Cancelled", "Failed"]);
+  return [job?.latestRun, job?.lastRun].find((run): run is MaintenanceRun => Boolean(
+    run && run.action === COMPANY_INFO_REFRESH_ACTION && terminalStatuses.has(run.status),
+  )) || null;
+}
+
+export function utilityActionLabel(jobKey: string): string {
+  if (jobKey === COMPANY_INFO_REFRESH_ACTION) return "Refresh Missing Company Info";
+  return jobKey === "import-data" ? "Import Data" : "Run Now";
+}
+
 function actionEnabled(action: UtilityKey, features: FeatureFlags): boolean {
   if (!features.utilities) return false;
-  if (action === "refresh-missing-company-information" || action === "refresh-company-discovery") {
+  if (action === COMPANY_INFO_REFRESH_ACTION || action === "refresh-company-discovery") {
     return features.companyRefresh && features.discovery && features.browserJobs;
   }
   if (action === "refresh-all-job-listings") return features.browserJobs;

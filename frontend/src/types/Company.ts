@@ -3,6 +3,7 @@ export type SearchStatus = "Completed" | "Partial" | "Needs Review" | "Failed" |
 export interface Company {
   id: string;
   name: string;
+  companyDescription: string;
   industry?: string;
   city: string;
   state: string;

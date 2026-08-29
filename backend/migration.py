@@ -237,13 +237,14 @@ def apply_plan(connection: sqlite3.Connection, plan: MigrationPlan) -> None:
     now = utc_now()
     for company in plan.companies:
         connection.execute(
-            """INSERT INTO companies (id,name,industry,city,state,country,known_website,official_website,
+            """INSERT INTO companies (id,name,industry,company_description,city,state,country,known_website,official_website,
             website_discovery_method,website_candidate_urls,website_verification_notes,website_verified,
             careers_page_url,job_board_url,job_board_discovery_method,jobs_rss_feed_url,job_platform,
             feed_found,search_status,confidence,last_checked,notes,founded_year,total_assets,
             assets_as_of_date,company_info_last_checked,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET name=excluded.name,industry=excluded.industry,city=excluded.city,
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET name=excluded.name,industry=excluded.industry,
+            company_description=COALESCE(NULLIF(excluded.company_description,''), companies.company_description),city=excluded.city,
             state=excluded.state,country=excluded.country,known_website=excluded.known_website,
             official_website=excluded.official_website,website_discovery_method=excluded.website_discovery_method,
             website_candidate_urls=excluded.website_candidate_urls,website_verification_notes=excluded.website_verification_notes,
@@ -341,6 +342,7 @@ def run_crud_cascade_probe(connection: sqlite3.Connection) -> None:
     try:
         probe = {
             "id": company_id, "name": "Migration CRUD Probe", "industry": "Financial Services",
+            "companyDescription": "Migration validation company.",
             "city": "", "state": "", "country": "United States", "knownWebsite": "https://probe.invalid",
             "officialWebsite": "https://probe.invalid", "websiteDiscoveryMethod": "Not Found",
             "websiteCandidateUrls": "", "websiteVerificationNotes": "", "websiteVerified": False,
@@ -349,12 +351,12 @@ def run_crud_cascade_probe(connection: sqlite3.Connection) -> None:
             "confidence": 0, "lastChecked": "", "notes": "",
         }
         connection.execute(
-            """INSERT INTO companies (id,name,industry,city,state,country,known_website,official_website,
+            """INSERT INTO companies (id,name,industry,company_description,city,state,country,known_website,official_website,
             website_discovery_method,website_candidate_urls,website_verification_notes,website_verified,
             careers_page_url,job_board_url,job_board_discovery_method,jobs_rss_feed_url,job_platform,
             feed_found,search_status,confidence,last_checked,notes,founded_year,total_assets,
             assets_as_of_date,company_info_last_checked,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             company_values(probe, now),
         )
         connection.execute("UPDATE companies SET official_website=?, job_board_discovery_method='Manual Re-verification Required', search_status='Needs Review' WHERE id=?", ("https://edited.invalid", company_id))
@@ -526,7 +528,9 @@ def action_for_id(table: str, record_id: str, existing_ids: dict[str, set[str]],
 def excel_company_to_api(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(row.get("Company ID") or ""), "name": str(row.get("Company Name") or ""),
-        "industry": str(row.get("Industry") or "Financial Services"), "city": str(row.get("City") or ""),
+        "industry": str(row.get("Industry") or "Financial Services"),
+        "companyDescription": str(row.get("Company Description") or ""),
+        "city": str(row.get("City") or ""),
         "state": str(row.get("State") or ""), "country": str(row.get("Country") or "United States"),
         "knownWebsite": str(row.get("Known Website") or ""), "officialWebsite": str(row.get("Official Website") or ""),
         "websiteDiscoveryMethod": str(row.get("Website Discovery Method") or ""),
@@ -545,7 +549,7 @@ def excel_company_to_api(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def company_values(company: dict[str, Any], now: str) -> tuple[Any, ...]:
-    return (company["id"],company["name"],company.get("industry","Financial Services"),company.get("city",""),company.get("state",""),company.get("country","United States"),company.get("knownWebsite",""),company.get("officialWebsite",""),company.get("websiteDiscoveryMethod",""),company.get("websiteCandidateUrls",""),company.get("websiteVerificationNotes",""),bool(company.get("websiteVerified")),company.get("careersPageUrl",""),company.get("jobBoardUrl",""),company.get("jobBoardDiscoveryMethod","Not Found"),company.get("jobsRssFeedUrl",""),company.get("jobPlatform",""),bool(company.get("feedFound")),company.get("searchStatus","Needs Review"),company.get("confidence",0),company.get("lastChecked",""),company.get("notes",""),company.get("foundedYear"),company.get("totalAssets"),company.get("assetsAsOfDate",""),company.get("companyInfoLastChecked",""),now,now)
+    return (company["id"],company["name"],company.get("industry","Financial Services"),company.get("companyDescription",""),company.get("city",""),company.get("state",""),company.get("country","United States"),company.get("knownWebsite",""),company.get("officialWebsite",""),company.get("websiteDiscoveryMethod",""),company.get("websiteCandidateUrls",""),company.get("websiteVerificationNotes",""),bool(company.get("websiteVerified")),company.get("careersPageUrl",""),company.get("jobBoardUrl",""),company.get("jobBoardDiscoveryMethod","Not Found"),company.get("jobsRssFeedUrl",""),company.get("jobPlatform",""),bool(company.get("feedFound")),company.get("searchStatus","Needs Review"),company.get("confidence",0),company.get("lastChecked",""),company.get("notes",""),company.get("foundedYear"),company.get("totalAssets"),company.get("assetsAsOfDate",""),company.get("companyInfoLastChecked",""),now,now)
 
 
 def job_values(job: dict[str, Any], now: str) -> tuple[Any, ...]:

@@ -1,5 +1,29 @@
 export type MaintenanceStatus = "Queued" | "Running" | "Cancelling" | "Completed" | "Cancelled" | "Failed" | "Skipped";
 
+export const COMPANY_INFO_REFRESH_ACTION = "refresh-missing-company-information" as const;
+
+export type CompanyInfoRefreshOutcome = "updated" | "unchanged" | "no_information_found" | "failed";
+
+export interface CompanyInfoRefreshResult {
+  companyId: string;
+  companyName: string;
+  outcome: CompanyInfoRefreshOutcome;
+  foundFields: string[];
+  updatedFields: string[];
+  message: string;
+}
+
+export interface CompanyInfoRefreshSummary {
+  totalCompaniesNeedingReview: number;
+  processedCount: number;
+  updatedCount: number;
+  noInformationFoundCount: number;
+  failedCount: number;
+  unchangedCount: number;
+  duplicateRecordsSkipped: number;
+  companyResults: CompanyInfoRefreshResult[];
+}
+
 export interface MaintenanceSchedule {
   jobKey: string;
   enabled: boolean;

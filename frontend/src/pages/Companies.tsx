@@ -30,6 +30,7 @@ const initialPage: CompanyPage = {
 
 interface CompanyFormData {
   name: string;
+  companyDescription: string;
   companyWebsite: string;
   careersPageUrl: string;
   jobBoardUrl: string;
@@ -42,6 +43,7 @@ interface CompanyFormData {
 
 const emptyCompany: CompanyFormData = {
   name: "",
+  companyDescription: "",
   companyWebsite: "",
   careersPageUrl: "",
   jobBoardUrl: "",
@@ -248,9 +250,10 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
   );
 }
 
-function CompanyModal({ company, busy, error, onClose, onSave }: { company: Company | null; busy: boolean; error: string; onClose: () => void; onSave: (form: CompanyFormData) => Promise<void> }) {
+export function CompanyModal({ company, busy, error, onClose, onSave }: { company: Company | null; busy: boolean; error: string; onClose: () => void; onSave: (form: CompanyFormData) => Promise<void> }) {
   const [form, setForm] = useState<CompanyFormData>(() => company ? {
     name: company.name,
+    companyDescription: company.companyDescription || "",
     companyWebsite: company.officialWebsite || company.knownWebsite || "",
     careersPageUrl: company.careersPageUrl || "",
     jobBoardUrl: company.jobBoardUrl || "",
@@ -276,6 +279,7 @@ function CompanyModal({ company, busy, error, onClose, onSave }: { company: Comp
           <Field label="State" value={form.state} onChange={(value) => update("state", value)} />
           <Field label="Country" value={form.country} onChange={(value) => update("country", value)} />
         </div>
+        <label className="block text-sm text-slate-300">Company Description<textarea className="field mt-1 min-h-24 resize-y" value={form.companyDescription} onChange={(event) => update("companyDescription", event.target.value)} /></label>
         <label className="block text-sm text-slate-300">Notes<textarea className="field mt-1 min-h-24 resize-y" value={form.notes} onChange={(event) => update("notes", event.target.value)} /></label>
         {error ? <p className="text-sm text-red-400" role="alert">{error}</p> : null}
         <div className="flex justify-end gap-3">

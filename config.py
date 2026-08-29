@@ -217,6 +217,7 @@ OUTPUT_COLUMNS = [
     "Company ID",
     "Company Name",
     "Industry",
+    "Company Description",
     "City",
     "State",
     "Country",

@@ -80,6 +80,7 @@ export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdi
         {refreshResult ? <RefreshResult result={refreshResult} /> : null}
       </summary>
       <div className="mt-4 grid gap-3 text-sm md:grid-cols-2">
+        <Info label="Company description" value={company.companyDescription} wide />
         <Info label="Official website" value={company.officialWebsite} link />
         <Info label="Careers page" value={company.careersPageUrl} link />
         <Info label="Job board URL" value={company.jobBoardUrl} link />

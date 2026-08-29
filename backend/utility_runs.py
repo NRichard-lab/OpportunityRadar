@@ -263,7 +263,10 @@ class UtilityRunManager:
                     current_message=f"{run['taskName']} is running.",
                 )
 
+            latest_details: dict[str, Any] = {}
+
             def progress(current: int, total: int, item: str, details: dict[str, Any] | None = None) -> None:
+                nonlocal latest_details
                 progress_text = (
                     f"{run['progressVerb']} {current} of {total} {run['progressUnit']}"
                     if total else "Running..."
@@ -275,6 +278,7 @@ class UtilityRunManager:
                     "current_message": progress_text,
                 }
                 if details is not None:
+                    latest_details = dict(details)
                     updates["result_summary_json"] = json.dumps(details, default=str, sort_keys=True)
                 self._update_run(run_id, **updates)
 
@@ -298,9 +302,11 @@ class UtilityRunManager:
                         }
             except (UtilityCancelled, InterruptedError):
                 status = "Cancelled"
+                summary = latest_details or summary
                 message = f"{run['taskName']} was cancelled. No remaining items were processed."
             except Exception as exc:
                 status = "Failed"
+                summary = latest_details
                 logging.exception("Maintenance operation %s failed.", run["action"])
                 error = safe_error_summary(exc)
                 message = f"{run['taskName']} could not be completed."

@@ -18,6 +18,7 @@ from job_platforms import detect_job_platform
 from search_tools import (
     company_identity_tokens,
     domain_matches_company,
+    is_disallowed_result,
     registered_domain,
 )
 from website_tools import extract_embedded_urls, extract_links, fetch_html, is_same_registered_domain, make_session, normalize_url
@@ -141,8 +142,12 @@ def discover_job_board_for_row(
     max_pages: int = 5,
     force: bool = False,
     debug: bool = False,
+    session: requests.Session | None = None,
+    allow_search_fallback: bool = True,
+    cancelled: object | None = None,
 ) -> JobBoardDiscoveryResult:
-    session = make_session()
+    check_discovery_cancelled(cancelled)
+    session = session if session is not None else make_session()
     company_name = str(row.get("Company Name") or "").strip()
     official_website = str(row.get("Official Website") or row.get("Known Website") or "").strip()
     careers_page_url = str(row.get("Careers Page URL") or "").strip()
@@ -183,7 +188,7 @@ def discover_job_board_for_row(
         result.reason = "No Careers Page URL, Official Website, or Known Website available."
         return result
 
-    candidates = static_scan(start_url, company_name, session, "Static Link")
+    candidates = static_scan(start_url, company_name, session, "Static Link", cancelled=cancelled)
     best = best_acceptable_candidate(candidates)
     for candidate in candidates:
         append_candidate(result, candidate)
@@ -197,6 +202,7 @@ def discover_job_board_for_row(
             session,
             max_pages=max_pages,
             seed_url=careers_page_url,
+            cancelled=cancelled,
         )
         for candidate in expanded:
             append_candidate(result, candidate)
@@ -205,13 +211,21 @@ def discover_job_board_for_row(
             return select_candidate(result, best, best.source_method, "Found job board link while scanning internal careers pages.")
 
     if use_browser_discovery:
+        check_discovery_cancelled(cancelled)
         browser_candidate = browser_discovery(start_url, company_name)
+        check_discovery_cancelled(cancelled)
         if browser_candidate:
             append_candidate(result, browser_candidate)
             if not browser_candidate.rejected:
                 if browser_candidate.platform:
                     return select_candidate(result, browser_candidate, "Browser Click", "Reached known job platform after clicking public careers/jobs link.")
-                nested = static_scan(browser_candidate.url, company_name, session, "Browser Follow-up Scan")
+                nested = static_scan(
+                    browser_candidate.url,
+                    company_name,
+                    session,
+                    "Browser Follow-up Scan",
+                    cancelled=cancelled,
+                )
                 for candidate in nested:
                     append_candidate(result, candidate)
                 best = best_acceptable_candidate(nested)
@@ -220,12 +234,14 @@ def discover_job_board_for_row(
                 if browser_candidate.score >= 85:
                     return select_candidate(result, browser_candidate, "Browser Click", "Reached strong public careers/jobs page after clicking.")
 
-    search_candidates = verified_search_fallback(company_name, official_website, session)
-    for candidate in search_candidates:
-        append_candidate(result, candidate)
-    best = best_acceptable_candidate(search_candidates)
-    if best and best.score >= 90:
-        return select_candidate(result, best, "Verified Search", "Verified search result as related public job board.")
+    if allow_search_fallback:
+        check_discovery_cancelled(cancelled)
+        search_candidates = verified_search_fallback(company_name, official_website, session)
+        for candidate in search_candidates:
+            append_candidate(result, candidate)
+        best = best_acceptable_candidate(search_candidates)
+        if best and best.score >= 90:
+            return select_candidate(result, best, "Verified Search", "Verified search result as related public job board.")
 
     result.status = "Needs Review"
     result.reason = "No high-confidence public job board URL found."
@@ -238,7 +254,10 @@ def static_scan(
     company_name: str,
     session: requests.Session,
     source_method: str,
+    *,
+    cancelled: object | None = None,
 ) -> list[JobBoardCandidate]:
+    check_discovery_cancelled(cancelled)
     candidates: list[JobBoardCandidate] = []
     try:
         final_url, html = fetch_html(page_url, session)
@@ -252,6 +271,8 @@ def static_scan(
                 rejection_reason=f"could not fetch page: {exc}",
             )
         ]
+
+    check_discovery_cancelled(cancelled)
 
     for text, href in extract_links(final_url, html):
         if not could_be_job_link(text, href):
@@ -286,11 +307,27 @@ def same_domain_careers_expansion(
     *,
     max_pages: int,
     seed_url: str = "",
+    cancelled: object | None = None,
 ) -> list[JobBoardCandidate]:
+    check_discovery_cancelled(cancelled)
     candidates: list[JobBoardCandidate] = []
-    pages = find_internal_candidate_pages(official_website, company_name, session, max_pages=max_pages, seed_url=seed_url)
+    pages = find_internal_candidate_pages(
+        official_website,
+        company_name,
+        session,
+        max_pages=max_pages,
+        seed_url=seed_url,
+        cancelled=cancelled,
+    )
     for page_url in pages:
-        candidates.extend(static_scan(page_url, company_name, session, "Internal Careers Scan"))
+        check_discovery_cancelled(cancelled)
+        candidates.extend(static_scan(
+            page_url,
+            company_name,
+            session,
+            "Internal Careers Scan",
+            cancelled=cancelled,
+        ))
     return candidates
 
 
@@ -301,7 +338,9 @@ def find_internal_candidate_pages(
     *,
     max_pages: int,
     seed_url: str = "",
+    cancelled: object | None = None,
 ) -> list[str]:
+    check_discovery_cancelled(cancelled)
     pages: list[str] = []
     seen: set[str] = set()
     if seed_url and is_same_registered_domain(official_website, seed_url):
@@ -312,6 +351,8 @@ def find_internal_candidate_pages(
     except Exception as exc:
         LOGGER.info("Could not expand careers pages for %s: %s", company_name, exc)
         return pages
+
+    check_discovery_cancelled(cancelled)
 
     scored: list[tuple[int, str]] = []
     for text, href in extract_links(final_url, html):
@@ -329,6 +370,11 @@ def find_internal_candidate_pages(
             break
         pages.append(href)
     return pages
+
+
+def check_discovery_cancelled(cancelled: object | None) -> None:
+    if cancelled is not None and getattr(cancelled, "is_set", lambda: False)():
+        raise InterruptedError("Cancelled by user.")
 
 
 def browser_discovery(start_url: str, company_name: str) -> JobBoardCandidate | None:
@@ -362,6 +408,10 @@ def verified_search_fallback(
     company_name: str,
     official_website: str,
     session: requests.Session,
+    *,
+    max_queries: int = 4,
+    max_results_per_query: int = 2,
+    max_total_results: int = 6,
 ) -> list[JobBoardCandidate]:
     try:
         from ddgs import DDGS
@@ -371,18 +421,18 @@ def verified_search_fallback(
     phrases = [
         f'"{company_name}" careers',
         f'"{company_name}" jobs',
-        f'"{company_name}" "open positions"',
-        f'"{company_name}" "Workday"',
-        f'"{company_name}" "ADP"',
-        f'"{company_name}" "Paylocity"',
-        f'"{company_name}" "ICIMS"',
+        f'"{company_name}" (Workday OR ADP OR iCIMS OR Paylocity)',
+        f'"{company_name}" (Greenhouse OR Lever OR UKG)',
     ]
+    query_limit = max(1, min(int(max_queries), 4))
+    result_limit = max(1, min(int(max_results_per_query), 3))
+    total_limit = max(1, min(int(max_total_results), 8))
     candidates: list[JobBoardCandidate] = []
     seen: set[str] = set()
-    for phrase in phrases:
+    for phrase in phrases[:query_limit]:
         try:
             with DDGS(timeout=min(REQUEST_TIMEOUT, 5)) as ddgs:
-                results = list(ddgs.text(phrase, max_results=3))
+                results = list(ddgs.text(phrase, max_results=result_limit))
         except Exception as exc:
             LOGGER.info("Job board search fallback failed for %s: %s", phrase, exc)
             continue
@@ -402,6 +452,8 @@ def verified_search_fallback(
             )
             if verify_search_candidate(candidate, company_name, official_website, session):
                 candidates.append(candidate)
+                if len(candidates) >= total_limit:
+                    return candidates
     return candidates
 
 
@@ -413,20 +465,28 @@ def verify_search_candidate(
 ) -> bool:
     if candidate.rejected:
         return False
-    if candidate.platform and company_related_to_url(company_name, candidate.url):
-        candidate.score += 18
-        candidate.notes.append("search result URL includes company identity")
-        return True
-    if official_website and is_same_registered_domain(official_website, candidate.url):
-        candidate.score += 20
-        candidate.notes.append("search result is on official domain")
-        return True
     try:
         final_url, html = fetch_html(candidate.url, session)
     except Exception as exc:
         candidate.rejected = True
         candidate.rejection_reason = f"could not verify search result page: {exc}"
         return False
+
+    candidate.url = final_url
+    candidate.platform = detect_job_platform(final_url)
+    rejection = rejection_reason(final_url)
+    if rejection:
+        candidate.rejected = True
+        candidate.rejection_reason = f"final URL rejected: {rejection}"
+        return False
+    if candidate.platform and company_related_to_url(company_name, final_url):
+        candidate.score += 18
+        candidate.notes.append("search result URL includes company identity")
+        return True
+    if official_website and is_same_registered_domain(official_website, final_url):
+        candidate.score += 20
+        candidate.notes.append("search result is on official domain")
+        return True
     text = page_text(html)
     if any(token in text for token in company_identity_tokens(company_name)) and any(term in text for term in JOB_INDICATORS):
         candidate.url = final_url
@@ -539,6 +599,8 @@ def rejection_reason(url: str) -> str:
     domain = registered_domain(url)
     if not parsed.scheme.startswith("http"):
         return "non-public URL scheme"
+    if is_disallowed_result(url):
+        return "directory, aggregator, social media, review, or document URL"
     if lower.endswith((".pdf", ".doc", ".docx")):
         return "document URL"
     if any(domain == blocked or domain.endswith(f".{blocked}") for blocked in REJECT_DOMAINS):

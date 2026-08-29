@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import closing
 from pathlib import Path
 from typing import Sequence
 
@@ -11,6 +12,7 @@ from backend.backup_restore import (
     restore_sqlite_backup,
     validate_sqlite_backup,
 )
+from backend.db import connect, initialize_schema
 from backend.health import MINIMUM_SCHEMA_VERSION
 from backend.migration import apply_migration, build_migration_plan
 from config import BACKUP_DIR, BASE_DIR, DEFAULT_DATABASE, DEPLOYMENT_VERSION
@@ -25,6 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--apply", action="store_true", help="Back up sources, migrate transactionally, validate, and activate SQLite.")
     migrate.add_argument("--project-root", type=Path, default=BASE_DIR)
     migrate.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+
+    upgrade = commands.add_parser(
+        "upgrade-schema",
+        help="Transactionally apply idempotent schema upgrades to an existing SQLite database.",
+    )
+    upgrade.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
 
     backup = commands.add_parser(
         "backup-sqlite", help="Create, validate, and atomically publish a SQLite backup."
@@ -70,6 +78,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report = build_migration_plan(args.project_root, args.database).report
             else:
                 report = apply_migration(args.project_root, args.database)
+        elif args.command == "upgrade-schema":
+            with closing(connect(args.database, require_existing=True)) as connection:
+                initialize_schema(connection)
+                version_row = connection.execute("PRAGMA user_version").fetchone()
+                report = {
+                    "status": "completed",
+                    "schemaVersion": int(version_row[0]) if version_row else 0,
+                }
         elif args.command == "backup-sqlite":
             report = create_sqlite_backup(
                 args.database,

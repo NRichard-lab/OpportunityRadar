@@ -49,7 +49,7 @@ from backend.migration import excel_company_to_api
 from backend.maintenance_scheduler import DEFAULT_TIMEZONE, MaintenanceScheduler
 from backend.operation_gate import GLOBAL_MUTATION_GATE, OperationConflictError
 from backend.outbound_security import OutboundSecurityError, validate_outbound_url
-from backend.repository import OpportunityRepository
+from backend.repository import DuplicateCompanyError, OpportunityRepository
 from backend.resume_files import build_resume_profile
 from backend.resume_matching import ResumeMatchService
 from backend.utility_runs import UtilityRunManager, reconcile_interrupted_runs
@@ -300,6 +300,7 @@ class UtilityRequest(BaseModel):
 
 class CompanyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=300)
+    companyDescription: str = Field(default="", max_length=20_000)
     companyWebsite: str = ""
     careersPageUrl: str = ""
     jobBoardUrl: str = ""
@@ -698,7 +699,10 @@ def create_company_endpoint(request: CompanyRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="Company Name is required.")
     validate_company_request_urls(request)
     with api_mutation("create-company"):
-        company = company_service().add_company(request.model_dump())
+        try:
+            company = company_service().add_company(request.model_dump())
+        except DuplicateCompanyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
     return {"message": "Company added.", "company": company}
 
 
@@ -710,6 +714,8 @@ def update_company_endpoint(company_id: str, request: CompanyRequest) -> dict[st
     with api_mutation("update-company"):
         try:
             company = company_service().edit_company(company_id, request.model_dump())
+        except DuplicateCompanyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except KeyError:
             raise HTTPException(status_code=404, detail="Company not found.") from None
     return {"message": "Company updated.", "company": company}
@@ -1398,7 +1404,7 @@ def user_utility_definitions() -> dict[str, dict[str, Any]]:
 
     definitions = {
         "refresh-missing-company-information": {
-            "task_name": "Refresh Missing Company Information", "progress_verb": "Checking",
+            "task_name": "Refresh Missing Company Info", "progress_verb": "Checking",
             "progress_unit": "companies", "worker": company_info_worker,
             "format_summary": format_company_refresh_summary,
             "description": "Finds missing public company details and verifies careers and job-board links.",
@@ -1465,6 +1471,15 @@ def user_utility_definitions() -> dict[str, dict[str, Any]]:
 
 
 def format_company_refresh_summary(summary: dict[str, Any]) -> str:
+    if "processedCount" in summary:
+        return (
+            f"Company information refresh complete: {summary.get('processedCount', 0)} of "
+            f"{summary.get('totalCompaniesNeedingReview', 0)} companies reviewed, "
+            f"{summary.get('updatedCount', 0)} updated, "
+            f"{summary.get('noInformationFoundCount', 0)} with no additional information found, "
+            f"{summary.get('failedCount', 0)} failed, and "
+            f"{summary.get('duplicateRecordsSkipped', 0)} duplicate lookups skipped."
+        )
     return (
         f"Company information refresh complete: {summary.get('companiesUpdated', 0)} companies updated, "
         f"{summary.get('jobBoardsVerified', 0)} job boards verified, "

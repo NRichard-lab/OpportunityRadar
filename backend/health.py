@@ -25,7 +25,8 @@ REQUIRED_CORE_COLUMNS = {
     ),
     "companies": frozenset(
         {
-            "id", "name", "industry", "city", "state", "country", "known_website",
+            "id", "name", "normalized_name", "industry", "company_description",
+            "city", "state", "country", "known_website",
             "official_website", "website_discovery_method", "website_candidate_urls",
             "website_verification_notes", "website_verified", "careers_page_url",
             "job_board_url", "job_board_discovery_method", "jobs_rss_feed_url",

@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from backend.outbound_security import SSRFProtectedSession
 from config import CAREERS_KEYWORDS, COMMON_FEED_PATHS, MAX_CRAWL_PAGES, POLITE_DELAY_SECONDS, REQUEST_TIMEOUT, USER_AGENT
 from job_platforms import detect_job_platform
-from search_tools import registered_domain
+from search_tools import registered_domain, request_with_limited_retries, validate_and_canonicalize_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -32,18 +32,32 @@ def normalize_url(url: str) -> str:
 
 
 def can_fetch(url: str, session: requests.Session) -> bool:
-    parsed = urlparse(normalize_url(url))
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    parser = RobotFileParser()
-    parser.set_url(robots_url)
-    try:
-        response = session.get(robots_url, timeout=REQUEST_TIMEOUT)
-        if response.status_code >= 400:
-            return True
-        parser.parse(response.text.splitlines())
-        return parser.can_fetch(USER_AGENT, url)
-    except Exception:
-        return True
+    normalized = normalize_url(url)
+    parsed_url = urlparse(normalized)
+    origin = f"{parsed_url.scheme.lower()}://{parsed_url.netloc.lower()}"
+    cache = getattr(session, "_opportunity_radar_robots_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(session, "_opportunity_radar_robots_cache", cache)
+
+    if origin not in cache:
+        robots_url = f"{origin}/robots.txt"
+        parser = RobotFileParser()
+        parser.set_url(robots_url)
+        try:
+            response = request_with_limited_retries(session, robots_url, timeout=REQUEST_TIMEOUT)
+            if response.status_code >= 400:
+                response.close()
+                cache[origin] = None
+            else:
+                parser.parse(response.text.splitlines())
+                response.close()
+                cache[origin] = parser
+        except Exception:
+            cache[origin] = None
+
+    parser = cache[origin]
+    return True if parser is None else parser.can_fetch(USER_AGENT, normalized)
 
 
 def fetch_html(url: str, session: requests.Session) -> tuple[str, str]:
@@ -51,12 +65,19 @@ def fetch_html(url: str, session: requests.Session) -> tuple[str, str]:
     if not can_fetch(normalized, session):
         raise PermissionError(f"robots.txt disallows {normalized}")
     time.sleep(POLITE_DELAY_SECONDS)
-    response = session.get(normalized, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-    response.raise_for_status()
+    final_url, response = validate_and_canonicalize_url(
+        normalized,
+        session,
+        require_html=False,
+        reject_disallowed=False,
+    )
     content_type = response.headers.get("content-type", "").lower()
     if "html" not in content_type and response.text[:100].lstrip().lower().startswith("<?xml"):
+        response.close()
         raise ValueError(f"non-HTML content at {normalized}")
-    return response.url, response.text
+    html = response.text
+    response.close()
+    return final_url, html
 
 
 def is_same_registered_domain(source_url: str, target_url: str) -> bool:
@@ -94,26 +115,41 @@ def extract_embedded_urls(base_url: str, html: str) -> list[str]:
     return urls
 
 
-def find_careers_page(official_url: str, session: requests.Session) -> tuple[str, str, list[str]]:
+def find_careers_page(
+    official_url: str,
+    session: requests.Session,
+    *,
+    initial_html: str = "",
+    initial_final_url: str = "",
+    cancelled: object | None = None,
+) -> tuple[str, str, list[str]]:
     if not official_url:
         return "", "", ["no official website available"]
 
     notes: list[str] = []
     visited: set[str] = set()
-    queue: deque[str] = deque([normalize_url(official_url)])
+    first_url = normalize_url(initial_final_url or official_url)
+    queue: deque[str] = deque([first_url])
     platform_urls: list[str] = []
+    cached_html = str(initial_html or "")
 
     while queue and len(visited) < MAX_CRAWL_PAGES:
+        if cancelled is not None and getattr(cancelled, "is_set", lambda: False)():
+            raise InterruptedError("Cancelled by user.")
         url = queue.popleft()
         if url in visited:
             continue
         visited.add(url)
 
-        try:
-            final_url, html = fetch_html(url, session)
-        except Exception as exc:
-            notes.append(f"could not inspect {url}: {exc}")
-            continue
+        if cached_html:
+            final_url, html = first_url, cached_html
+            cached_html = ""
+        else:
+            try:
+                final_url, html = fetch_html(url, session)
+            except Exception as exc:
+                notes.append(f"could not inspect {url}: {exc}")
+                continue
 
         links = extract_links(final_url, html)
         careers_matches: list[tuple[str, str]] = []
@@ -123,22 +159,26 @@ def find_careers_page(official_url: str, session: requests.Session) -> tuple[str
         for text, href in links:
             platform = detect_job_platform(href)
             if platform:
-                platform_urls.append(href)
+                if link_matches_careers(text, ""):
+                    platform_urls.append(href)
+                continue
             if link_matches_careers(text, href):
                 careers_matches.append((text, href))
 
         if platform_urls:
-            return platform_urls[0], detect_job_platform(platform_urls[0]), notes
+            platform_url = platform_urls[0]
+            return platform_url, detect_job_platform(platform_url), notes
         if careers_matches:
             href = careers_matches[0][1]
             return href, detect_job_platform(href), notes
 
         for text, href in links:
-            if href not in visited and is_same_registered_domain(official_url, href):
+            if href not in visited and is_same_registered_domain(first_url, href):
                 queue.append(href)
 
     if platform_urls:
-        return platform_urls[0], detect_job_platform(platform_urls[0]), notes
+        platform_url = platform_urls[0]
+        return platform_url, detect_job_platform(platform_url), notes
 
     notes.append(f"no careers link found after inspecting {len(visited)} page(s)")
     return "", "", notes
@@ -161,9 +201,14 @@ def validate_feed(feed_url: str, session: requests.Session) -> bool:
         if not can_fetch(feed_url, session):
             return False
         time.sleep(POLITE_DELAY_SECONDS)
-        response = session.get(feed_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        response.raise_for_status()
+        _, response = validate_and_canonicalize_url(
+            feed_url,
+            session,
+            require_html=False,
+            reject_disallowed=False,
+        )
         parsed = feedparser.parse(response.content)
+        response.close()
         return not parsed.bozo and bool(parsed.feed) and (bool(parsed.entries) or bool(parsed.version))
     except Exception:
         return False

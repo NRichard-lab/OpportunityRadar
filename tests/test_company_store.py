@@ -8,7 +8,8 @@ from pathlib import Path
 
 from backend.db import connect, initialize_schema
 from backend.exports import SnapshotExporter
-from backend.repository import OpportunityRepository
+from backend.migration import excel_company_to_api
+from backend.repository import DuplicateCompanyError, OpportunityRepository
 from company_store import CompanyService
 
 
@@ -99,7 +100,7 @@ class SQLiteCompanyStoreTests(unittest.TestCase):
             created = []
             for index in range(30):
                 created.append(repository.create_company(company_payload(
-                    name="Duplicate" if index < 2 else f"Company {index:02d}",
+                    name=f"Company {index:02d}",
                     companyWebsite=f"https://company-{index}.example",
                     jobBoardUrl="https://jobs.example" if index % 3 == 0 else "",
                     industry="Banking" if index % 5 == 0 else "Financial Services",
@@ -122,8 +123,6 @@ class SQLiteCompanyStoreTests(unittest.TestCase):
             second_page = repository.query_companies(page=2)
             self.assertEqual((first_page["total"], len(first_page["items"]), first_page["totalPages"]), (30, 25, 2))
             self.assertEqual(len(second_page["items"]), 5)
-            duplicate_ids = [item["id"] for item in first_page["items"] if item["name"] == "Duplicate"]
-            self.assertEqual(duplicate_ids, sorted(duplicate_ids, key=str.casefold))
 
             self.assertEqual(repository.query_companies(state="CO")["total"], 15)
             self.assertEqual(repository.query_companies(industry="Banking")["total"], 6)
@@ -140,11 +139,137 @@ class SQLiteCompanyStoreTests(unittest.TestCase):
             self.assertEqual(by_collection["items"][0]["id"], created[0]["id"])
             self.assertEqual(repository.query_companies(page=99)["page"], 2)
 
+    def test_company_description_round_trip_and_confirmed_field_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = OpportunityRepository(Path(temp_dir) / "opportunity_radar.db", initialize=True)
+            created = repository.create_company(company_payload(
+                name="Described Company", companyDescription="A confirmed description.",
+            ))
+            self.assertEqual(created["companyDescription"], "A confirmed description.")
+            exported_row = repository.list_company_rows()[0]
+            self.assertEqual(exported_row["Company Description"], "A confirmed description.")
+            self.assertEqual(
+                excel_company_to_api(exported_row)["companyDescription"],
+                "A confirmed description.",
+            )
+
+            edited = repository.update_company(created["id"], company_payload(
+                name="Described Company", companyDescription="   ",
+            ))
+            self.assertEqual(edited["companyDescription"], "A confirmed description.")
+
+            unchanged = repository.update_discovered_company_fields(
+                created["id"], {"companyDescription": "Lower quality replacement."},
+            )
+            self.assertEqual(unchanged["companyDescription"], "A confirmed description.")
+            replaced = repository.update_discovered_company_fields(created["id"], {
+                "companyDescription": "A newly confirmed canonical description.",
+                "replaceConfirmedFields": ["companyDescription"],
+            })
+            self.assertEqual(
+                replaced["companyDescription"], "A newly confirmed canonical description.",
+            )
+            canonical = repository.update_discovered_company_fields(created["id"], {
+                "officialWebsite": "https://canonical.example",
+                "websiteVerified": True,
+                "replaceConfirmedFields": ["officialWebsite", "notACompanyField"],
+            })
+            self.assertEqual(canonical["officialWebsite"], "https://canonical.example")
+            self.assertTrue(canonical["websiteVerified"])
+
+            blank = repository.create_company(company_payload(name="Blank Description"))
+            discovered = repository.update_discovered_company_fields(
+                blank["id"], {"companyDescription": "Discovered description."},
+            )
+            self.assertEqual(discovered["companyDescription"], "Discovered description.")
+
+    def test_create_and_rename_reject_normalized_duplicate_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = OpportunityRepository(Path(temp_dir) / "opportunity_radar.db", initialize=True)
+            acme = repository.create_company(company_payload(name="Acme   Bank"))
+            with self.assertRaises(DuplicateCompanyError) as create_error:
+                repository.create_company(company_payload(name="  ACME BANK  "))
+            self.assertEqual(create_error.exception.existing_company_id, acme["id"])
+
+            other = repository.create_company(company_payload(name="Other Bank"))
+            with self.assertRaises(DuplicateCompanyError):
+                repository.update_company(other["id"], company_payload(name=" acme bank "))
+            self.assertEqual(repository.get_company(other["id"])["name"], "Other Bank")
+
+            renamed = repository.update_company(acme["id"], company_payload(name=" ACME BANK "))
+            self.assertEqual(renamed["name"], "ACME BANK")
+
+    def test_snapshot_duplicate_reuses_and_safely_merges_existing_company(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = OpportunityRepository(Path(temp_dir) / "opportunity_radar.db", initialize=True)
+            existing = repository.create_company(company_payload(
+                name="North Star Bank", companyWebsite="https://northstar.example",
+                city="Denver", state="", companyDescription="",
+            ))
+            imported_id = "company-imported-duplicate"
+            count = repository.upsert_company_snapshots([{
+                "id": imported_id,
+                "name": "  NORTH   STAR BANK ",
+                "officialWebsite": "https://unconfirmed.example",
+                "city": "Austin",
+                "state": "CO",
+                "companyDescription": "A regional financial institution.",
+            }])
+            self.assertEqual(count, 1)
+            self.assertEqual(len(repository.list_companies()), 1)
+            merged = repository.get_company(existing["id"])
+            self.assertEqual(merged["officialWebsite"], "https://northstar.example")
+            self.assertEqual(merged["city"], "Denver")
+            self.assertEqual(merged["state"], "CO")
+            self.assertEqual(merged["companyDescription"], "A regional financial institution.")
+            with self.assertRaises(KeyError):
+                repository.get_company(imported_id)
+
+            repository.upsert_company_snapshots([{
+                **merged,
+                "officialWebsite": "",
+                "companyDescription": "",
+            }])
+            preserved = repository.get_company(existing["id"])
+            self.assertEqual(preserved["officialWebsite"], "https://northstar.example")
+            self.assertEqual(preserved["companyDescription"], "A regional financial institution.")
+
+    def test_additive_migration_preserves_legacy_normalized_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "opportunity_radar.db"
+            repository = OpportunityRepository(database_path, initialize=True)
+            original = repository.create_company(company_payload(name="Legacy Bank"))
+            with repository.connection() as connection:
+                connection.execute(
+                    """INSERT INTO companies (id,name,normalized_name,created_at,updated_at)
+                    VALUES ('company-legacy-duplicate',' legacy   BANK ','','2000-01-01','2000-01-01')"""
+                )
+                connection.execute("DROP INDEX idx_companies_normalized_name_unique")
+                connection.execute("ALTER TABLE companies DROP COLUMN normalized_name")
+                connection.execute("ALTER TABLE companies DROP COLUMN company_description")
+
+            connection = connect(database_path)
+            try:
+                initialize_schema(connection)
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
+                rows = connection.execute(
+                    "SELECT id, normalized_name FROM companies ORDER BY id",
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertIn("normalized_name", columns)
+            self.assertIn("company_description", columns)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(bool(row["normalized_name"]) for row in rows), 1)
+            self.assertEqual(repository.get_company(original["id"])["name"], "Legacy Bank")
+            with self.assertRaises(DuplicateCompanyError):
+                repository.create_company(company_payload(name="LEGACY BANK"))
+
 
 def company_payload(**overrides: str) -> dict[str, str]:
     payload = {
         "name": "Test Financial", "companyWebsite": "", "careersPageUrl": "", "jobBoardUrl": "",
-        "industry": "Financial Services", "city": "Denver", "state": "CO",
+        "industry": "Financial Services", "companyDescription": "", "city": "Denver", "state": "CO",
         "country": "United States", "notes": "",
     }
     payload.update(overrides)

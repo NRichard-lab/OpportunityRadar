@@ -2,6 +2,8 @@ import type { Company } from "./types/Company";
 import type { FeatureFlags } from "./types/FeatureFlags";
 import type { ApplicationStatus, Job } from "./types/Job";
 import type {
+  CompanyInfoRefreshResult,
+  CompanyInfoRefreshSummary,
   MaintenanceJobState,
   MaintenanceJobsState,
   MaintenanceRun,
@@ -313,7 +315,7 @@ export const parseSessionPayload = normalizeSessionPayload;
 export function isCompany(value: unknown): value is Company {
   if (!isRecord(value)) return false;
   if (!hasStringFields(value, [
-    "id", "name", "industry", "city", "state", "country", "knownWebsite",
+    "id", "name", "companyDescription", "industry", "city", "state", "country", "knownWebsite",
     "officialWebsite", "websiteDiscoveryMethod", "websiteCandidateUrls",
     "websiteVerificationNotes", "careersPageUrl", "jobBoardUrl",
     "jobBoardDiscoveryMethod", "jobsRssFeedUrl", "jobPlatform", "searchStatus",
@@ -475,6 +477,25 @@ export function isCompanyRefreshResponse(value: unknown): value is CompanyRefres
     && isNonNegativeInteger(value.activeJobs)
     && isStringArray(value.warnings)
     && isStringArray(value.errors);
+}
+
+export function isCompanyInfoRefreshResult(value: unknown): value is CompanyInfoRefreshResult {
+  return isRecord(value)
+    && hasStringFields(value, ["companyId", "companyName", "message"])
+    && isOneOf(value.outcome, ["updated", "unchanged", "no_information_found", "failed"] as const)
+    && isStringArray(value.foundFields)
+    && isStringArray(value.updatedFields);
+}
+
+export function isCompanyInfoRefreshSummary(value: unknown): value is CompanyInfoRefreshSummary {
+  if (!isRecord(value)) return false;
+  return [
+    "totalCompaniesNeedingReview", "processedCount", "updatedCount",
+    "noInformationFoundCount", "failedCount", "unchangedCount",
+    "duplicateRecordsSkipped",
+  ].every((field) => isNonNegativeInteger(value[field]))
+    && Array.isArray(value.companyResults)
+    && value.companyResults.every(isCompanyInfoRefreshResult);
 }
 
 export function isCompanyDeleteResponse(value: unknown): value is CompanyDeleteResponse {

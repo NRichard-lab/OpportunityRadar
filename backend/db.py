@@ -9,7 +9,9 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS companies (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL DEFAULT '',
     industry TEXT NOT NULL DEFAULT 'Financial Services',
+    company_description TEXT NOT NULL DEFAULT '',
     city TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL DEFAULT '',
     country TEXT NOT NULL DEFAULT 'United States',
@@ -274,49 +276,106 @@ def connect(
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(SCHEMA_SQL)
-    existing = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
-    for column, definition in (
-        ("founded_year", "INTEGER"),
-        ("total_assets", "REAL"),
-        ("assets_as_of_date", "TEXT NOT NULL DEFAULT ''"),
-        ("company_info_last_checked", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if column not in existing:
-            connection.execute(f"ALTER TABLE companies ADD COLUMN {column} {definition}")
-    run_columns = {row[1] for row in connection.execute("PRAGMA table_info(maintenance_job_runs)")}
-    if "trigger_type" not in run_columns:
-        connection.execute("ALTER TABLE maintenance_job_runs ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'manual'")
-    job_columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
-    if "first_seen_at" not in job_columns:
-        connection.execute("ALTER TABLE jobs ADD COLUMN first_seen_at TEXT NOT NULL DEFAULT ''")
-    connection.execute(
-        "UPDATE jobs SET first_seen_at=COALESCE(NULLIF(collected_at,''),created_at) WHERE first_seen_at=''"
-    )
-    resume_columns = {row[1] for row in connection.execute("PRAGMA table_info(resumes)")}
-    if "version" not in resume_columns:
-        connection.execute("ALTER TABLE resumes ADD COLUMN version TEXT NOT NULL DEFAULT ''")
-    connection.execute(
-        """UPDATE resumes SET version = COALESCE(
-        NULLIF(json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.version'), ''),
-        NULLIF(json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.id'), ''), id
-        ) WHERE version = ''"""
-    )
-    fit_columns = {row[1] for row in connection.execute("PRAGMA table_info(resume_fit_results)")}
-    for column, definition in (
-        ("status", "TEXT NOT NULL DEFAULT 'Matched'"),
-        ("resume_version", "TEXT NOT NULL DEFAULT ''"),
-        ("job_fingerprint", "TEXT NOT NULL DEFAULT ''"),
-        ("algorithm_version", "TEXT NOT NULL DEFAULT ''"),
-        ("matched_at", "TEXT NOT NULL DEFAULT ''"),
-        ("error", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if column not in fit_columns:
-            connection.execute(f"ALTER TABLE resume_fit_results ADD COLUMN {column} {definition}")
-    now = datetime.now().astimezone().replace(microsecond=0).isoformat()
-    connection.execute(
-        "INSERT OR IGNORE INTO settings (key,value_json,updated_at) VALUES ('scheduler_timezone','\"America/Denver\"',?)",
-        (now,),
-    )
-    connection.execute("PRAGMA user_version = 6")
-    connection.commit()
+    try:
+        # executescript otherwise commits before executing its first statement.
+        # An explicit BEGIN inside the script keeps table creation and every
+        # additive migration below in one rollback-capable transaction.
+        connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL)
+        existing = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
+        for column, definition in (
+            ("normalized_name", "TEXT NOT NULL DEFAULT ''"),
+            ("company_description", "TEXT NOT NULL DEFAULT ''"),
+            ("founded_year", "INTEGER"),
+            ("total_assets", "REAL"),
+            ("assets_as_of_date", "TEXT NOT NULL DEFAULT ''"),
+            ("company_info_last_checked", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in existing:
+                connection.execute(f"ALTER TABLE companies ADD COLUMN {column} {definition}")
+        backfill_company_normalized_names(connection)
+        connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_normalized_name_unique
+            ON companies(normalized_name) WHERE normalized_name <> ''"""
+        )
+        run_columns = {row[1] for row in connection.execute("PRAGMA table_info(maintenance_job_runs)")}
+        if "trigger_type" not in run_columns:
+            connection.execute("ALTER TABLE maintenance_job_runs ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'manual'")
+        job_columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        if "first_seen_at" not in job_columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN first_seen_at TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            "UPDATE jobs SET first_seen_at=COALESCE(NULLIF(collected_at,''),created_at) WHERE first_seen_at=''"
+        )
+        resume_columns = {row[1] for row in connection.execute("PRAGMA table_info(resumes)")}
+        if "version" not in resume_columns:
+            connection.execute("ALTER TABLE resumes ADD COLUMN version TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            """UPDATE resumes SET version = COALESCE(
+            NULLIF(json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.version'), ''),
+            NULLIF(json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.id'), ''), id
+            ) WHERE version = ''"""
+        )
+        fit_columns = {row[1] for row in connection.execute("PRAGMA table_info(resume_fit_results)")}
+        for column, definition in (
+            ("status", "TEXT NOT NULL DEFAULT 'Matched'"),
+            ("resume_version", "TEXT NOT NULL DEFAULT ''"),
+            ("job_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+            ("algorithm_version", "TEXT NOT NULL DEFAULT ''"),
+            ("matched_at", "TEXT NOT NULL DEFAULT ''"),
+            ("error", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in fit_columns:
+                connection.execute(f"ALTER TABLE resume_fit_results ADD COLUMN {column} {definition}")
+        now = datetime.now().astimezone().replace(microsecond=0).isoformat()
+        connection.execute(
+            "INSERT OR IGNORE INTO settings (key,value_json,updated_at) VALUES ('scheduler_timezone','\"America/Denver\"',?)",
+            (now,),
+        )
+        connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def normalize_company_name(value: object) -> str:
+    """Return the case- and whitespace-insensitive key used for company identity."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def backfill_company_normalized_names(connection: sqlite3.Connection) -> None:
+    """Assign one unique key per legacy name group without deleting duplicate rows.
+
+    Historical databases can contain several rows whose names normalize to the same
+    value. The oldest deterministic row owns the indexed key while preserved legacy
+    duplicates keep an empty key. Repository-level checks still compare every name.
+    """
+    rows = connection.execute(
+        """SELECT id, name, normalized_name, created_at
+        FROM companies ORDER BY created_at, id"""
+    ).fetchall()
+    preferred: dict[str, str] = {}
+    desired: dict[str, str] = {}
+    for row in rows:
+        normalized = normalize_company_name(row["name"])
+        if not normalized:
+            desired[row["id"]] = ""
+            continue
+        owner = preferred.setdefault(normalized, row["id"])
+        desired[row["id"]] = normalized if owner == row["id"] else ""
+
+    # Clear stale/conflicting keys first so this remains safe when the unique index
+    # already exists, then assign the deterministic owners.
+    for row in rows:
+        if row["normalized_name"] and row["normalized_name"] != desired[row["id"]]:
+            connection.execute(
+                "UPDATE companies SET normalized_name = '' WHERE id = ?",
+                (row["id"],),
+            )
+    for row in rows:
+        normalized = desired[row["id"]]
+        if normalized and row["normalized_name"] != normalized:
+            connection.execute(
+                "UPDATE companies SET normalized_name = ? WHERE id = ?",
+                (normalized, row["id"]),
+            )
