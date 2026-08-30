@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Opportunity Radar">
-  <rect width="64" height="64" rx="12" fill="#173A50"/>
-  <circle cx="32" cy="32" r="22" fill="none" stroke="#75B5D3" stroke-width="3"/>
-  <circle cx="32" cy="32" r="13" fill="none" stroke="#75B5D3" stroke-width="2" opacity=".8"/>
-  <path d="M32 32 48 18" fill="none" stroke="#EAF2F6" stroke-width="3" stroke-linecap="round"/>
-  <circle cx="43" cy="27" r="3.5" fill="#EAF2F6"/>
-  <circle cx="23" cy="42" r="2.5" fill="#2F6F91" stroke="#EAF2F6" stroke-width="1.5"/>
-  <circle cx="32" cy="32" r="3" fill="#EAF2F6"/>
-</svg>

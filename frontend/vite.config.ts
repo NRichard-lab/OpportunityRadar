@@ -5,7 +5,13 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 const frontendRoot = fileURLToPath(new URL(".", import.meta.url));
-const safePublicAssets = ["favicon.svg", "site.webmanifest"];
+const safePublicAssets = [
+  "opportunity-radar-icon-20260830-32.png",
+  "opportunity-radar-icon-20260830-180.png",
+  "opportunity-radar-icon-20260830-192.png",
+  "opportunity-radar-icon-20260830-512.png",
+  "site.webmanifest",
+];
 
 export default defineConfig({
   plugins: [

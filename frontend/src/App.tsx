@@ -415,14 +415,7 @@ function OpportunityApp({ sessionEmail, canAdminister, features, initialOperatio
     <div className="min-h-screen">
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-5 lg:flex-row lg:px-6">
         <aside className="panel h-fit p-4 lg:sticky lg:top-5 lg:w-72">
-          <div className="flex items-center gap-3 py-1">
-            <div className="grid h-11 w-11 place-items-center rounded-lg border border-radar-accent bg-radar-primary text-white shadow-sm">
-              <Radar size={24} />
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold text-white">Opportunity Radar</h1>
-            </div>
-          </div>
+          <OpportunityRadarBrand />
           <nav className="mt-6 space-y-2">
             {visibleTabs.map((tab) => {
               const Icon = tab.icon;
@@ -531,6 +524,20 @@ function OpportunityApp({ sessionEmail, canAdminister, features, initialOperatio
       </div>
     </div>
   );
+}
+
+export function OpportunityRadarBrand() {
+  return <div className="flex items-center gap-3 py-1">
+    <img
+      className="h-11 w-11 shrink-0 rounded-lg object-contain shadow-sm"
+      src={`${import.meta.env.BASE_URL}opportunity-radar-icon-20260830-192.png`}
+      width={44}
+      height={44}
+      alt=""
+      aria-hidden="true"
+    />
+    <div><h1 className="text-lg font-semibold text-white">Opportunity Radar</h1></div>
+  </div>;
 }
 
 export default App;
