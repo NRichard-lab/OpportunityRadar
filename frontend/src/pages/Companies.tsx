@@ -59,9 +59,6 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
   const [query, setQuery] = useState("");
   const [state, setState] = useState("");
   const [industry, setIndustry] = useState("");
-  const [platform, setPlatform] = useState("");
-  const [status, setStatus] = useState("");
-  const [hasVerifiedJobBoard, setHasVerifiedJobBoard] = useState("");
   const [hasActiveJobs, setHasActiveJobs] = useState("");
   const [sortBy, setSortBy] = useState("companyName");
   const [sortDirection, setSortDirection] = useState("asc");
@@ -97,9 +94,6 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
       if (query.trim()) parameters.set("search", query.trim());
       if (state) parameters.set("state", state);
       if (industry) parameters.set("industry", industry);
-      if (platform) parameters.set("jobBoardType", platform);
-      if (status) parameters.set("discoveryStatus", status);
-      if (hasVerifiedJobBoard) parameters.set("hasVerifiedJobBoard", hasVerifiedJobBoard);
       if (hasActiveJobs) parameters.set("hasActiveJobs", hasActiveJobs);
       try {
         const nextResult = await apiJson<unknown>(`/companies-page?${parameters}`, { signal: controller.signal }, "Could not load companies.");
@@ -116,7 +110,7 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
       }
     }, query ? 250 : 0);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [hasActiveJobs, hasVerifiedJobBoard, industry, page, pageSize, platform, query, refreshToken, sortBy, sortDirection, state, status]);
+  }, [hasActiveJobs, industry, page, pageSize, query, refreshToken, sortBy, sortDirection, state]);
 
   const updateFirstPage = (setter: (value: string) => void) => (value: string) => {
     setter(value);
@@ -127,9 +121,6 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
     setQuery("");
     setState("");
     setIndustry("");
-    setPlatform("");
-    setStatus("");
-    setHasVerifiedJobBoard("");
     setHasActiveJobs("");
     setSortBy("companyName");
     setSortDirection("asc");
@@ -230,9 +221,7 @@ export function Companies({ onViewCompanyJobs, onCompaniesChanged, onCompanyRefr
       {notice ? <div className="rounded-md border border-emerald-800 bg-emerald-950/50 px-4 py-3 text-sm text-emerald-300" role="status">{notice}</div> : null}
       <Filters
         query={query} setQuery={updateFirstPage(setQuery)} state={state} setState={updateFirstPage(setState)}
-        industry={industry} setIndustry={updateFirstPage(setIndustry)} platform={platform} setPlatform={updateFirstPage(setPlatform)}
-        status={status} setStatus={updateFirstPage(setStatus)} hasVerifiedJobBoard={hasVerifiedJobBoard}
-        setHasVerifiedJobBoard={updateFirstPage(setHasVerifiedJobBoard)} hasActiveJobs={hasActiveJobs}
+        industry={industry} setIndustry={updateFirstPage(setIndustry)} hasActiveJobs={hasActiveJobs}
         setHasActiveJobs={updateFirstPage(setHasActiveJobs)} sortBy={sortBy} setSortBy={updateFirstPage(setSortBy)}
         sortDirection={sortDirection} setSortDirection={updateFirstPage(setSortDirection)} pageSize={pageSize}
         setPageSize={(value) => { setPageSize(value); setPage(1); }} options={result.options} onClear={clearFilters}
@@ -331,9 +320,6 @@ interface FiltersProps {
   query: string; setQuery: (value: string) => void;
   state: string; setState: (value: string) => void;
   industry: string; setIndustry: (value: string) => void;
-  platform: string; setPlatform: (value: string) => void;
-  status: string; setStatus: (value: string) => void;
-  hasVerifiedJobBoard: string; setHasVerifiedJobBoard: (value: string) => void;
   hasActiveJobs: string; setHasActiveJobs: (value: string) => void;
   sortBy: string; setSortBy: (value: string) => void;
   sortDirection: string; setSortDirection: (value: string) => void;
@@ -342,28 +328,62 @@ interface FiltersProps {
   onClear: () => void;
 }
 
-function Filters(props: FiltersProps) {
-  return <div className="panel grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-4">
-    <input className="field md:col-span-2" aria-label="Search companies" placeholder="Search company, city, state, or website" value={props.query} onChange={(event) => props.setQuery(event.target.value)} />
-    <Select value={props.state} setValue={props.setState} values={props.options.states} label="State" />
-    <Select value={props.industry} setValue={props.setIndustry} values={props.options.industries} label="Industry" />
-    <Select value={props.platform} setValue={props.setPlatform} values={props.options.jobBoardTypes} label="Job Board Type" />
-    <Select value={props.status} setValue={props.setStatus} values={props.options.discoveryStatuses} label="Discovery Status" />
-    <BooleanSelect value={props.hasVerifiedJobBoard} setValue={props.setHasVerifiedJobBoard} label="Has Verified Job Board URL" />
-    <BooleanSelect value={props.hasActiveJobs} setValue={props.setHasActiveJobs} label="Has Active Jobs" />
-    <select className="field" aria-label="Sort By" value={props.sortBy} onChange={(event) => props.setSortBy(event.target.value)}>
+export function Filters(props: FiltersProps) {
+  return <div className="panel grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-12">
+    <input className="field md:col-span-2 xl:col-span-4" aria-label="Search companies" placeholder="Search company, city, state, or website" value={props.query} onChange={(event) => props.setQuery(event.target.value)} />
+    <div className="xl:col-span-2"><StateSelect value={props.state} setValue={props.setState} values={props.options.states} /></div>
+    <div className="xl:col-span-3"><Select value={props.industry} setValue={props.setIndustry} values={props.options.industries} label="Industry" /></div>
+    <div className="xl:col-span-3"><BooleanSelect value={props.hasActiveJobs} setValue={props.setHasActiveJobs} label="Has Active Jobs" /></div>
+    <select className="field xl:col-span-3" aria-label="Sort By" value={props.sortBy} onChange={(event) => props.setSortBy(event.target.value)}>
       <option value="companyName">Company Name</option><option value="city">City</option><option value="state">State</option>
       <option value="jobBoardType">Job Board Type</option><option value="discoveryStatus">Discovery Status</option>
       <option value="jobCount">Job Count</option><option value="lastCollectionDate">Last Collection Date</option>
     </select>
-    <select className="field" aria-label="Sort Direction" value={props.sortDirection} onChange={(event) => props.setSortDirection(event.target.value)}><option value="asc">Ascending</option><option value="desc">Descending</option></select>
-    <select className="field" aria-label="Companies per page" value={props.pageSize} onChange={(event) => props.setPageSize(Number(event.target.value))}><option value={25}>25 per page</option><option value={50}>50 per page</option><option value={100}>100 per page</option></select>
-    <button className="btn" type="button" onClick={props.onClear}>Clear Filters</button>
+    <select className="field xl:col-span-3" aria-label="Sort Direction" value={props.sortDirection} onChange={(event) => props.setSortDirection(event.target.value)}><option value="asc">Ascending</option><option value="desc">Descending</option></select>
+    <select className="field xl:col-span-3" aria-label="Companies per page" value={props.pageSize} onChange={(event) => props.setPageSize(Number(event.target.value))}><option value={25}>25 per page</option><option value={50}>50 per page</option><option value={100}>100 per page</option></select>
+    <button className="btn md:col-span-2 xl:col-span-3" type="button" onClick={props.onClear}>Clear Filters</button>
   </div>;
 }
 
 function Select({ value, setValue, values, label }: { value: string; setValue: (value: string) => void; values: string[]; label: string }) { return <select className="field" value={value} aria-label={label} onChange={(event) => setValue(event.target.value)}><option value="">All {label}</option>{values.map((item) => <option key={item}>{item}</option>)}</select>; }
-function BooleanSelect({ value, setValue, label }: { value: string; setValue: (value: string) => void; label: string }) { const shortLabel = label === "Has Verified Job Board URL" ? "Verified Job Board" : "Has Active Jobs"; return <select className="field" value={value} aria-label={label} title={label} onChange={(event) => setValue(event.target.value)}><option value="">{shortLabel}: All</option><option value="true">{shortLabel}: Yes</option><option value="false">{shortLabel}: No</option></select>; }
+function BooleanSelect({ value, setValue, label }: { value: string; setValue: (value: string) => void; label: string }) { return <select className="field" value={value} aria-label={label} title={label} onChange={(event) => setValue(event.target.value)}><option value="">{label}: All</option><option value="true">{label}: Yes</option><option value="false">{label}: No</option></select>; }
+
+const US_STATE_NAMES: Record<string, string> = {
+  AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado",
+  CT: "Connecticut", DE: "Delaware", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho",
+  IL: "Illinois", IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana",
+  ME: "Maine", MD: "Maryland", MA: "Massachusetts", MI: "Michigan", MN: "Minnesota",
+  MS: "Mississippi", MO: "Missouri", MT: "Montana", NE: "Nebraska", NV: "Nevada",
+  NH: "New Hampshire", NJ: "New Jersey", NM: "New Mexico", NY: "New York", NC: "North Carolina",
+  ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon", PA: "Pennsylvania",
+  RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota", TN: "Tennessee", TX: "Texas",
+  UT: "Utah", VT: "Vermont", VA: "Virginia", WA: "Washington", WV: "West Virginia",
+  WI: "Wisconsin", WY: "Wyoming", DC: "District of Columbia",
+};
+
+const STATE_ABBREVIATIONS_BY_NAME = new Map(
+  Object.entries(US_STATE_NAMES).map(([abbreviation, name]) => [name.toLocaleLowerCase(), abbreviation]),
+);
+
+export function stateOptions(values: string[]): { value: string; label: string; name: string }[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
+    .map((value) => {
+      const abbreviation = US_STATE_NAMES[value.toLocaleUpperCase()]
+        ? value.toLocaleUpperCase()
+        : STATE_ABBREVIATIONS_BY_NAME.get(value.toLocaleLowerCase());
+      const name = abbreviation ? US_STATE_NAMES[abbreviation] : value;
+      return { value, name, label: abbreviation ? `${name} (${abbreviation})` : value };
+    })
+    .sort((left, right) => left.name.localeCompare(right.name) || left.label.localeCompare(right.label));
+}
+
+function StateSelect({ value, setValue, values }: { value: string; setValue: (value: string) => void; values: string[] }) {
+  return <select className="field" value={value} aria-label="State" onChange={(event) => setValue(event.target.value)}>
+    <option value="">All States</option>
+    {stateOptions(values).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+  </select>;
+}
+
 function Pagination({ result, page, setPage }: { result: CompanyPage; page: number; setPage: (page: number) => void }) { return <div className="flex flex-col gap-3 border-t border-slate-800 pt-4 text-sm text-slate-400 sm:flex-row sm:items-center sm:justify-between"><span>{rangeLabel(result)}</span><div className="flex items-center gap-3"><button className="btn" type="button" disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {result.page} of {result.totalPages}</span><button className="btn" type="button" disabled={page >= result.totalPages || result.total === 0} onClick={() => setPage(page + 1)}>Next</button></div></div>; }
 function rangeLabel(result: CompanyPage) { const start = result.total ? (result.page - 1) * result.pageSize + 1 : 0; const end = Math.min(result.page * result.pageSize, result.total); return `Showing ${start}\u2013${end} of ${result.total} companies`; }
 function Empty({ message }: { message: string }) { return <div className="card p-8 text-center text-slate-400">{message}</div>; }

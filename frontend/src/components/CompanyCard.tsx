@@ -63,7 +63,6 @@ export function CompanyCard({ company, appliedCount, jobCount, onViewJobs, onEdi
               Jobs: {jobCount}
             </span>
             <span className="badge border-radar-line text-slate-200">{company.searchStatus}</span>
-            <span className="badge border-radar-line text-slate-200">{company.confidence}% confidence</span>
             <span className="badge border-radar-line text-slate-200">{appliedCount} applied</span>
             {canAdminister ? <><button className="btn px-3 py-2" type="button" title={refreshEnabled ? `Refresh ${company.name}` : "Company refresh is disabled for the initial production release."} aria-label={refreshEnabled ? `Refresh ${company.name}` : `Refresh unavailable for ${company.name}`} disabled={!refreshEnabled || isRefreshing} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onRefresh(company); }}>
               <RefreshCw className={isRefreshing ? "animate-spin" : ""} size={16} />

@@ -66,6 +66,27 @@ describe("Company description management", () => {
     expect(content).toContain(description);
   });
 
+  it("does not display company confidence on the Companies page card", () => {
+    const markup = renderToStaticMarkup(<CompanyCard
+      company={company}
+      appliedCount={0}
+      jobCount={4}
+      onViewJobs={() => undefined}
+      onEdit={() => undefined}
+      onDelete={() => undefined}
+      onRefresh={() => undefined}
+      refreshEnabled
+      canAdminister={false}
+    />);
+
+    const content = text(markup);
+    expect(content).toContain("Jobs: 4");
+    expect(content).toContain("Completed");
+    expect(content).toContain("0 applied");
+    expect(content).not.toContain("confidence");
+    expect(content).not.toContain("100%");
+  });
+
   it("prefills the edit form so saving preserves the existing description", () => {
     const markup = renderToStaticMarkup(<CompanyModal
       company={company}
