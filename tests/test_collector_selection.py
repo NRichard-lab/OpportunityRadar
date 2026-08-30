@@ -33,6 +33,11 @@ class CollectorSelectionTests(unittest.TestCase):
                 "Workday",
                 "ClearCompanyCollector",
             ),
+            (
+                "https://secure7.saashr.com/ta/6202174.careers?lang=en-US",
+                "UKG",
+                "UKGReadyCollector",
+            ),
         ]
         for board_url, stale_platform, expected in cases:
             with self.subTest(board_url=board_url, stale_platform=stale_platform):

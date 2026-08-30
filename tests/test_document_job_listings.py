@@ -162,6 +162,59 @@ class DocumentJobListingTests(unittest.TestCase):
                     context.close.assert_called_once_with()
                 browser.close.assert_called_once_with()
 
+    def test_json_ld_postings_use_matching_ats_links_when_url_is_omitted(self) -> None:
+        html = """
+        <main>
+          <script type="application/ld+json">
+          [
+            {"@type":"JobPosting","title":"Risk Management Specialist","identifier":{"@type":"PropertyValue","name":"ApplicantPro","value":"4143005"},"description":"Current risk opening."},
+            {"@type":"JobPosting","title":"Member Service Specialist","identifier":{"@type":"PropertyValue","name":"ApplicantPro","value":"4179322"},"description":"Current member service opening."}
+          ]
+          </script>
+          <a href="https://example.applicantpro.com/jobs/4143005.html">More Information</a>
+          <a href="https://example.applicantpro.com/jobs/4179322.html">More Information</a>
+        </main>
+        """
+        collector = GenericCollector(delay_seconds=0)
+        jobs = collector.parse_listing_html(self.company, BOARD_URL, BOARD_URL, html, "Job Board URL")
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(
+            [job.sourceUrl for job in jobs],
+            [
+                "https://example.applicantpro.com/jobs/4143005.html",
+                "https://example.applicantpro.com/jobs/4179322.html",
+            ],
+        )
+        self.assertTrue(all(job.rawData["structuredSource"] for job in jobs))
+
+    def test_static_available_positions_are_split_into_real_jobs(self) -> None:
+        html = """
+        <main><div class="wpb_wrapper">
+          <h2>Available Positions</h2>
+          <h2>Full-Time Teller – Broken Arrow Location</h2>
+          <h4>Pay: $15.00 to $16.25 per hour</h4>
+          <p>We have an immediate opening for a full-time teller.</p>
+          <p>Responsibilities include member transactions and service.</p>
+          <h2>Mortgage Lending Coordinator – Broken Arrow Location</h2>
+          <h4>Salary is negotiable</h4>
+          <p>We have an immediate opening for a Mortgage Lending Coordinator.</p>
+          <p>Qualifications include two years of related experience.</p>
+        </div></main>
+        """
+        collector = GenericCollector(delay_seconds=0)
+        jobs = collector.parse_listing_html(self.company, BOARD_URL, BOARD_URL, html, "Job Board URL")
+
+        self.assertEqual(
+            [(job.title, job.location) for job in jobs],
+            [
+                ("Full-Time Teller", "Broken Arrow Location"),
+                ("Mortgage Lending Coordinator", "Broken Arrow Location"),
+            ],
+        )
+        self.assertEqual(len({job.sourceUrl for job in jobs}), 2)
+        self.assertTrue(all("#position-" in job.sourceUrl for job in jobs))
+
 
 if __name__ == "__main__":
     unittest.main()

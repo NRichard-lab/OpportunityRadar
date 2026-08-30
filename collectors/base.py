@@ -156,6 +156,7 @@ def pick_collector(
     from collectors.paycor_collector import PaycorCollector
     from collectors.paycom_collector import PaycomCollector
     from collectors.ukg_collector import UKGCollector
+    from collectors.ukg_ready_collector import UKGReadyCollector
     from collectors.workday_collector import WorkdayCollector
 
     url = str(company.get("Job Board URL") or "").lower()
@@ -191,6 +192,8 @@ def pick_collector(
         return with_reason(PaycorCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Paycor.")
     if "paycom" in platform or "paycomonline.net" in url:
         return with_reason(PaycomCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched Paycom.")
+    if "ukg ready" in platform or "saashr.com" in url:
+        return with_reason(UKGReadyCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched UKG Ready/SaaShr.")
     if "ukg" in platform or "ultipro.com" in url or "ukg.com" in url:
         return with_reason(UKGCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched UKG.")
     return with_reason(GenericCollector(delay_seconds, debug, debug_dir), "No supported platform detected; using generic public page collector.")

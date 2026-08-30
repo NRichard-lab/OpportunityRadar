@@ -25,6 +25,7 @@ PLATFORM_DOMAIN_MAP = {
     "paycomonline.net": "Paycom",
     "recruitingbypaycor.com": "Paycor",
     "applicantpro.com": "ApplicantPro",
+    "saashr.com": "UKG Ready",
     "oraclecloud.com": "Oracle Recruiting",
     "successfactors.com": "SAP SuccessFactors",
     "isolvedhire.com": "isolved Hire",

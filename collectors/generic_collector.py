@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from datetime import datetime
@@ -112,6 +113,10 @@ class GenericCollector(BaseCollector):
         if schema_jobs:
             return schema_jobs
 
+        static_jobs = self.extract_static_heading_jobs(company, final_url, soup, source_type)
+        if static_jobs:
+            return static_jobs
+
         jobs: list[JobRecord] = []
         seen_cards: set[int] = set()
         seen_hrefs: set[str] = set()
@@ -219,7 +224,7 @@ class GenericCollector(BaseCollector):
         jobs: list[JobRecord] = []
         for posting in iter_job_posting_json_ld(soup):
             title = normalize_job_title(str(posting.get("title") or ""))
-            source_url = str(posting.get("url") or page_url)
+            source_url = structured_posting_url(posting, page_url, soup, title)
             self.record_candidate(title, source_url)
             if not is_valid_job_title(title):
                 self.reject_candidate(title, rejection_reason(title), source_url, company=company)
@@ -251,12 +256,79 @@ class GenericCollector(BaseCollector):
                     collectedAt=datetime.now().astimezone().replace(microsecond=0).isoformat(),
                     rawData={
                         "collector": self.__class__.__name__,
+                        "structuredSource": True,
                         "sourceType": source_type,
+                        "identifier": json_ld_identifier(posting.get("identifier")),
                         "hiringOrganization": json_ld_org(posting.get("hiringOrganization")),
                         "validThrough": str(posting.get("validThrough") or ""),
                     },
                 )
             )
+        return jobs
+
+    def extract_static_heading_jobs(
+        self,
+        company: dict[str, Any],
+        page_url: str,
+        soup: BeautifulSoup,
+        source_type: str,
+    ) -> list[JobRecord]:
+        """Extract real postings published inline below an explicit openings heading."""
+
+        jobs: list[JobRecord] = []
+        company_id = str(company.get("Company ID") or stable_company_id(company))
+        for section_heading in static_openings_headings(soup):
+            heading_name = section_heading.name
+            for title_heading, body_nodes in static_posting_groups(section_heading, heading_name):
+                raw_title = normalize_job_title(title_heading.get_text(" ", strip=True))
+                title, location = split_static_title_location(raw_title)
+                body_text = clean_text(" ".join(node.get_text(" ", strip=True) for node in body_nodes))
+                source_url = static_posting_url(page_url, raw_title)
+                self.record_candidate(title or raw_title, source_url)
+                evidence = f"{raw_title} {body_text}".casefold()
+                if not is_valid_job_title(title) or not any(
+                    term in evidence for term in ("opening", "position", "responsibil", "qualification", "pay:", "salary")
+                ):
+                    self.reject_candidate(
+                        title or raw_title,
+                        rejection_reason(title or raw_title),
+                        source_url,
+                        surrounding_text=body_text,
+                        company=company,
+                        job_board_url=page_url,
+                    )
+                    continue
+                pay_info = extract_pay_info(body_text)
+                if pay_info.get("payText"):
+                    self.record_pay_extraction("static careers section", body_text, pay_info)
+                self.save_candidate(title, source_url)
+                jobs.append(
+                    JobRecord(
+                        id=make_job_id(company, title, source_url),
+                        companyId=company_id,
+                        companyName=str(company.get("Company Name") or ""),
+                        title=title,
+                        location=location,
+                        payMin=pay_info.get("payMin"),
+                        payMax=pay_info.get("payMax"),
+                        payText=str(pay_info.get("payText") or ""),
+                        payPeriod=str(pay_info.get("payPeriod") or "unknown"),
+                        payCurrency=str(pay_info.get("payCurrency") or "USD"),
+                        sourceUrl=source_url,
+                        jobPlatform=str(company.get("Job Platform") or "Company Careers Site"),
+                        description=body_text,
+                        descriptionSnippet=body_text[:360],
+                        collectedAt=datetime.now().astimezone().replace(microsecond=0).isoformat(),
+                        rawData={
+                            "collector": self.__class__.__name__,
+                            "sourceType": source_type,
+                            "officialCareersPageListing": True,
+                            "sectionHeading": clean_text(section_heading.get_text(" ", strip=True)),
+                        },
+                    )
+                )
+            if jobs:
+                break
         return jobs
 
     def fetch_detail_page(self, href: str) -> dict[str, str]:
@@ -340,6 +412,71 @@ class GenericCollector(BaseCollector):
             return {}
         finally:
             page.close()
+
+
+def structured_posting_url(posting: dict[str, Any], page_url: str, soup: BeautifulSoup, title: str) -> str:
+    explicit_url = clean_text(str(posting.get("url") or ""))
+    if explicit_url:
+        return urljoin(page_url, explicit_url)
+    identifier = json_ld_identifier(posting.get("identifier"))
+    if identifier:
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href") or "")
+            if re.search(rf"/jobs/{re.escape(identifier)}(?:[./?]|$)", href, flags=re.IGNORECASE):
+                return urljoin(page_url, href)
+    fragment_basis = identifier or hashlib.sha256(title.casefold().encode("utf-8")).hexdigest()[:16]
+    fragment = re.sub(r"[^A-Za-z0-9_-]+", "-", fragment_basis).strip("-")
+    return f"{page_url.split('#', 1)[0]}#job-{fragment}"
+
+
+def json_ld_identifier(value: Any) -> str:
+    if isinstance(value, dict):
+        return clean_text(str(value.get("value") or value.get("name") or ""))
+    return clean_text(str(value or ""))
+
+
+def static_openings_headings(soup: BeautifulSoup) -> list[Tag]:
+    matches: list[Tag] = []
+    pattern = re.compile(
+        r"^(?:available|current|open)\s+(?:job\s+)?(?:positions|openings|opportunities)$|^employment\s+opportunities$",
+        flags=re.IGNORECASE,
+    )
+    for heading in soup.select("h1, h2, h3, h4, h5, h6"):
+        if isinstance(heading, Tag) and pattern.fullmatch(clean_text(heading.get_text(" ", strip=True))):
+            matches.append(heading)
+    return matches
+
+
+def static_posting_groups(section_heading: Tag, heading_name: str) -> list[tuple[Tag, list[Tag]]]:
+    groups: list[tuple[Tag, list[Tag]]] = []
+    current_heading: Tag | None = None
+    current_body: list[Tag] = []
+    for sibling in section_heading.next_siblings:
+        if not isinstance(sibling, Tag):
+            continue
+        if sibling.name == heading_name:
+            if current_heading is not None:
+                groups.append((current_heading, current_body))
+            current_heading = sibling
+            current_body = []
+            continue
+        if current_heading is not None:
+            current_body.append(sibling)
+    if current_heading is not None:
+        groups.append((current_heading, current_body))
+    return groups
+
+
+def split_static_title_location(raw_title: str) -> tuple[str, str]:
+    match = re.match(r"^(.*?)\s+[\-\u2013\u2014]\s+(.+?\s+Location)$", raw_title, flags=re.IGNORECASE)
+    if not match:
+        return raw_title, ""
+    return normalize_job_title(match.group(1)), clean_text(match.group(2))
+
+
+def static_posting_url(page_url: str, title: str) -> str:
+    digest = hashlib.sha256(title.casefold().encode("utf-8")).hexdigest()[:16]
+    return f"{page_url.split('#', 1)[0]}#position-{digest}"
 
 
 def likely_job_cards(soup: BeautifulSoup) -> list[Tag]:
