@@ -11,6 +11,8 @@ import {
 } from "../types/Maintenance";
 import {
   CompanyInfoFinalReport,
+  CompanyInfoLogModal,
+  filterCompanyInfoResults,
   HistoryModal,
   MaintenanceCard,
   ProgressPanel,
@@ -145,7 +147,7 @@ describe("Refresh Missing Company Info utility", () => {
     expect(text(renderToStaticMarkup(<ProgressPanel run={maintenanceRun()} cancelling onCancel={async () => undefined} />))).toContain("Cancelling...");
   });
 
-  it("retains the final summary and detailed per-company outcome messages", () => {
+  it("keeps the completed summary visible without rendering company results inline", () => {
     const completed = maintenanceRun({
       status: "Completed",
       running: false,
@@ -160,10 +162,46 @@ describe("Refresh Missing Company Info utility", () => {
     expect(content).toContain("Refresh Missing Company Info Result");
     expect(content).toContain("Refresh complete: 1 updated");
     expect(content).toContain("Duplicates skipped 2");
+    expect(content).toContain("View Log");
+    expect(content).not.toContain("Updated Bank");
+    expect(content).not.toContain("Quiet Credit Union");
+    expect(content).not.toContain("Unavailable Financial");
+  });
+
+  it("shows the run details, existing statuses, and company results in the log modal", () => {
+    const completed = maintenanceRun({
+      status: "Completed",
+      running: false,
+      completedAt: "2026-08-28T12:00:15-06:00",
+      runtimeSeconds: 15,
+    });
+    const markup = renderToStaticMarkup(<CompanyInfoLogModal run={completed} summary={companySummary} onClose={() => undefined} />);
+    const content = text(markup);
+
+    expect(content).toContain("Company Information Refresh Log");
+    expect(content).toContain("Runtime 15s");
+    expect(content).toContain("Processed 3");
+    expect(content).toContain("Updated 1");
+    expect(content).toContain("Failed 1");
+    expect(content).toContain("No information found 1");
+    expect(content).toContain("All Results (3)");
+    expect(content).toContain("Updated (1)");
+    expect(content).toContain("Failed (1)");
+    expect(content).toContain("No Information Found (1)");
+    expect(content).not.toContain("Unchanged (0)");
     expect(content).toContain("Updated Bank Updated");
     expect(content).toContain("Quiet Credit Union No information found");
     expect(content).toContain("Unavailable Financial Failed");
     expect(content).toContain("Updated: Careers Page URL");
+    expect(markup).toContain('placeholder="Search company..."');
+    expect(markup).toContain("overflow-y-auto");
+    expect(content).toContain("Close");
+  });
+
+  it("filters the already-loaded log results by status and company name", () => {
+    expect(filterCompanyInfoResults(companySummary.companyResults, "failed", "unavailable").map((result) => result.companyName)).toEqual(["Unavailable Financial"]);
+    expect(filterCompanyInfoResults(companySummary.companyResults, "updated", "credit union")).toEqual([]);
+    expect(filterCompanyInfoResults(companySummary.companyResults, "all", "quiet").map((result) => result.companyName)).toEqual(["Quiet Credit Union"]);
   });
 
   it("keeps the latest completed report visible on the Utilities refresh page", () => {
@@ -184,11 +222,26 @@ describe("Refresh Missing Company Info utility", () => {
       const content = text(markup);
       expect(content).toContain("Refresh Missing Company Info");
       expect(content).toContain("Refresh Missing Company Info Result");
-      expect(content).toContain("Updated Bank");
+      expect(content).toContain("View Log");
+      expect(content).not.toContain("Updated Bank");
     } finally {
       if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
       else Reflect.deleteProperty(globalThis, "window");
     }
+  });
+
+  it("does not show View Log when a completed run has no detailed results", () => {
+    const completed = maintenanceRun({
+      status: "Completed",
+      running: false,
+      completedAt: "2026-08-28T12:00:15-06:00",
+      summary: { ...companySummary, companyResults: [] },
+      resultSummary: { ...companySummary, companyResults: [] },
+    });
+
+    const content = text(renderToStaticMarkup(<CompanyInfoFinalReport run={completed} />));
+    expect(content).not.toContain("View Log");
+    expect(content).toContain("No detailed company results were recorded for this run.");
   });
 
   it("includes the same final results in maintenance history", () => {

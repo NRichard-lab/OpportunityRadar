@@ -311,17 +311,23 @@ export function ProgressPanel({ run, cancelling = false, onCancel }: { run: Main
 }
 
 export function CompanyInfoFinalReport({ run }: { run: MaintenanceRun }) {
+  const [logOpen, setLogOpen] = useState(false);
+  const summary = companyInfoSummary(run);
+  const hasDetailedResults = Boolean(summary?.companyResults.length);
   return <section className="panel p-5" aria-live="polite">
     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
       <div><p className="text-xs font-semibold uppercase text-radar-highlight">Latest company information refresh</p><h2 className="mt-2 text-lg font-semibold text-white">Refresh Missing Company Info Result</h2><p className="mt-2 text-sm text-slate-300">Finished: {formatTimestamp(run.completedAt || run.updatedAt)} · Runtime: {formatDuration(run.runtimeSeconds)}</p></div>
       <RunStatusBadge status={run.status} />
     </div>
     {run.message ? <p className="mt-4 rounded-md border border-radar-line bg-radar-bg/60 px-4 py-3 text-sm text-slate-200">{run.message}</p> : null}
-    <CompanyInfoRunDetails run={run} />
+    <CompanyInfoRunDetails run={run} showResults={false} />
+    {hasDetailedResults ? <button className="btn mt-4" type="button" onClick={() => setLogOpen(true)}><History size={17} />View Log</button> : null}
+    {summary && !hasDetailedResults ? <p className="mt-4 text-sm text-slate-400">No detailed company results were recorded for this run.</p> : null}
+    {logOpen && summary ? <CompanyInfoLogModal run={run} summary={summary} onClose={() => setLogOpen(false)} /> : null}
   </section>;
 }
 
-export function CompanyInfoRunDetails({ run, showCurrentCompany = false, compact = false }: { run: MaintenanceRun; showCurrentCompany?: boolean; compact?: boolean }) {
+export function CompanyInfoRunDetails({ run, showCurrentCompany = false, compact = false, showResults = true }: { run: MaintenanceRun; showCurrentCompany?: boolean; compact?: boolean; showResults?: boolean }) {
   const summary = companyInfoSummary(run);
   const totals = summary || fallbackCompanyInfoSummary(run);
   return <div className={compact ? "mt-3" : "mt-4"}>
@@ -336,12 +342,63 @@ export function CompanyInfoRunDetails({ run, showCurrentCompany = false, compact
       <Stat label="Duplicates skipped" value={String(totals.duplicateRecordsSkipped)} />
     </dl>
     {!summary && !run.running ? <p className="mt-3 text-sm text-slate-400">Detailed company results were not available for this run.</p> : null}
-    {totals.companyResults.length ? <CompanyResultList results={totals.companyResults} heading={run.running ? "Latest company result" : "Company results"} /> : null}
+    {showResults && totals.companyResults.length ? <CompanyResultList results={totals.companyResults} heading={run.running ? "Latest company result" : "Company results"} /> : null}
   </div>;
 }
 
-function CompanyResultList({ results, heading }: { results: CompanyInfoRefreshResult[]; heading: string }) {
-  return <div className="mt-4"><h3 className="text-sm font-semibold text-white">{heading}</h3><ul className="mt-2 space-y-2">{results.map((result, index) => <CompanyResultRow key={`${result.companyId}-${index}`} result={result} />)}</ul></div>;
+export type CompanyInfoResultFilter = "all" | CompanyInfoRefreshOutcome;
+
+const resultFilterLabels: Record<CompanyInfoResultFilter, string> = {
+  all: "All Results",
+  updated: "Updated",
+  failed: "Failed",
+  no_information_found: "No Information Found",
+  unchanged: "Unchanged",
+};
+
+const resultFilterOrder: CompanyInfoRefreshOutcome[] = ["updated", "failed", "no_information_found", "unchanged"];
+
+export function CompanyInfoLogModal({ run, summary, onClose }: { run: MaintenanceRun; summary: CompanyInfoRefreshSummary; onClose: () => void }) {
+  const [selectedFilter, setSelectedFilter] = useState<CompanyInfoResultFilter>("all");
+  const [companyQuery, setCompanyQuery] = useState("");
+  const availableOutcomes = useMemo(() => new Set(summary.companyResults.map((result) => result.outcome)), [summary.companyResults]);
+  const filterOptions: CompanyInfoResultFilter[] = ["all", ...resultFilterOrder.filter((outcome) => availableOutcomes.has(outcome))];
+  const activeFilter = filterOptions.includes(selectedFilter) ? selectedFilter : "all";
+  const visibleResults = filterCompanyInfoResults(summary.companyResults, activeFilter, companyQuery);
+
+  return <Modal title="Company Information Refresh Log" onClose={onClose} wide contentClassName="flex min-h-0 flex-1 flex-col">
+    <dl className="grid shrink-0 grid-cols-2 gap-x-5 gap-y-4 rounded-md border border-radar-line bg-radar-bg/40 p-4 sm:grid-cols-3 lg:grid-cols-6">
+      <Stat label="Finished" value={formatTimestamp(run.completedAt || run.updatedAt)} />
+      <Stat label="Runtime" value={formatDuration(run.runtimeSeconds)} />
+      <Stat label="Processed" value={String(summary.processedCount)} />
+      <Stat label="Updated" value={String(summary.updatedCount)} />
+      <Stat label="Failed" value={String(summary.failedCount)} />
+      <Stat label="No information found" value={String(summary.noInformationFoundCount)} />
+    </dl>
+    <div className="mt-4 shrink-0 space-y-3">
+      <input className="field w-full sm:max-w-sm" type="search" aria-label="Search company refresh log" placeholder="Search company..." value={companyQuery} onChange={(event) => setCompanyQuery(event.target.value)} />
+      <div className="flex flex-wrap gap-2" aria-label="Filter refresh log by status">
+        {filterOptions.map((filter) => {
+          const count = filter === "all" ? summary.companyResults.length : summary.companyResults.filter((result) => result.outcome === filter).length;
+          return <button className={`btn px-3 py-2 text-xs ${activeFilter === filter ? "border-radar-highlight text-white" : ""}`} type="button" key={filter} aria-pressed={activeFilter === filter} onClick={() => setSelectedFilter(filter)}>{resultFilterLabels[filter]} ({count})</button>;
+        })}
+      </div>
+    </div>
+    <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1" data-testid="company-refresh-log-results">
+      <CompanyResultList results={visibleResults} heading={`${resultFilterLabels[activeFilter]} (${visibleResults.length})`} emptyMessage="No company results match the selected filter and search." />
+    </div>
+    <div className="mt-4 flex shrink-0 justify-end border-t border-radar-line pt-4"><button className="btn" type="button" onClick={onClose}>Close</button></div>
+  </Modal>;
+}
+
+export function filterCompanyInfoResults(results: CompanyInfoRefreshResult[], filter: CompanyInfoResultFilter, query: string): CompanyInfoRefreshResult[] {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  return results.filter((result) => (filter === "all" || result.outcome === filter)
+    && (!normalizedQuery || result.companyName.toLocaleLowerCase().includes(normalizedQuery)));
+}
+
+function CompanyResultList({ results, heading, emptyMessage = "No company results are available." }: { results: CompanyInfoRefreshResult[]; heading: string; emptyMessage?: string }) {
+  return <div className="mt-4"><h3 className="text-sm font-semibold text-white">{heading}</h3>{results.length ? <ul className="mt-2 space-y-2">{results.map((result, index) => <CompanyResultRow key={`${result.companyId}-${index}`} result={result} />)}</ul> : <p className="mt-3 rounded-md border border-radar-line bg-radar-bg/40 px-4 py-5 text-sm text-slate-400">{emptyMessage}</p>}</div>;
 }
 
 function CompanyResultRow({ result }: { result: CompanyInfoRefreshResult }) {
@@ -396,7 +453,14 @@ function ConfirmationModal({ action, job, file, error, starting, onFileChange, o
   return <Modal title={job?.taskName || "Run Maintenance"} onClose={onCancel}><p className="text-sm leading-6 text-slate-300">{action.confirmation}</p>{action.key === "import-data" ? <label className="mt-4 block text-sm text-slate-300">Import file<input className="field mt-1" type="file" accept=".json,.xlsx,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={onFileChange} /></label> : null}{file ? <p className="mt-2 text-sm text-slate-400">Selected: {file.name}</p> : null}{error ? <Alert message={error} /> : null}<div className="mt-5 flex justify-end gap-3"><button className="btn" type="button" disabled={starting} onClick={onCancel}>Cancel</button><button className="btn btn-primary" type="button" disabled={starting || (action.key === "import-data" && !file)} onClick={() => void onConfirm()}>{starting ? "Starting..." : utilityActionLabel(action.key)}</button></div></Modal>;
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) { return <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="panel w-full max-w-2xl p-5" role="dialog" aria-modal="true" aria-label={title}><header className="mb-4 flex items-center justify-between gap-4"><h2 className="text-xl font-semibold text-white">{title}</h2><button className="icon-btn" type="button" onClick={onClose} title="Close" aria-label="Close"><X size={18} /></button></header>{children}</section></div>; }
+function Modal({ title, onClose, children, wide = false, contentClassName = "min-h-0 overflow-y-auto" }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean; contentClassName?: string }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`panel flex max-h-[calc(100vh-2rem)] w-full flex-col overflow-hidden p-5 ${wide ? "max-w-5xl" : "max-w-2xl"}`} role="dialog" aria-modal="true" aria-label={title}><header className="mb-4 flex shrink-0 items-center justify-between gap-4"><h2 className="text-xl font-semibold text-white">{title}</h2><button className="icon-btn" type="button" onClick={onClose} title="Close" aria-label="Close"><X size={18} /></button></header><div className={contentClassName}>{children}</div></section></div>;
+}
 function Stat({ label, value }: { label: string; value: string }) { return <div><dt className="text-xs uppercase text-slate-500">{label}</dt><dd className="mt-1 text-sm text-slate-200">{value}</dd></div>; }
 function Alert({ message }: { message: string }) { return <div className="mt-4 rounded-md border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-300" role="alert">{message}</div>; }
 function ResultBadge({ result }: { result: MaintenanceJobState["lastResult"] }) { const colors = result === "Success" ? "border-emerald-800 text-emerald-300" : result === "Failed" ? "border-red-900 text-red-300" : result === "Running" ? "border-blue-800 text-blue-300" : "border-slate-700 text-slate-400"; return <span className={`badge shrink-0 ${colors}`}>{result}</span>; }
