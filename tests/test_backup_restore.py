@@ -53,7 +53,7 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
                 writer.close()
 
             self.assertEqual(result["status"], "success")
-            self.assertEqual(result["schemaVersion"], 6)
+            self.assertEqual(result["schemaVersion"], 7)
             self.assertEqual(result["tableCounts"]["companies"], 1)
             self.assertEqual(result["tableCounts"]["jobs"], 2)
             artifact = Path(result["backupDirectory"])
@@ -68,7 +68,7 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
             self.assertEqual(manifest["database"]["sha256"], result["sha256"])
             self.assertEqual(manifest["validation"]["integrityCheck"], "ok")
             self.assertEqual(manifest["validation"]["foreignKeyViolations"], 0)
-            self.assertEqual(manifest["validation"]["schemaVersion"], 6)
+            self.assertEqual(manifest["validation"]["schemaVersion"], 7)
             self.assertEqual(manifest["deploymentVersion"], "a" * 40)
             self.assertNotIn("Synthetic resume-derived content", manifest_text)
             self.assertNotIn("Synthetic application note", manifest_text)
@@ -161,7 +161,7 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
             self.assertEqual(restored["writesStoppedGuard"], "operator-confirmed")
             self.assertEqual(restored["tableCounts"]["jobs"], 1)
             self.assertEqual(count_rows(database, "jobs"), 1)
-            self.assertEqual(inspect_sqlite_database(database, immutable=False)["schemaVersion"], 6)
+            self.assertEqual(inspect_sqlite_database(database, immutable=False)["schemaVersion"], 7)
             self.assertEqual(sha256_file(Path(baseline["databaseFile"])), source_hash_before)
             self.assertEqual(sha256_file(database), source_hash_before)
 
@@ -235,7 +235,7 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
                 database, backup_root, deployment_version="schema-6", retention_count=7
             )
             with closing(sqlite3.connect(database)) as connection:
-                connection.execute("PRAGMA user_version = 7")
+                connection.execute("PRAGMA user_version = 8")
                 connection.commit()
 
             with self.assertRaisesRegex(BackupRestoreError, "schema versions differ"):
@@ -245,11 +245,11 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
                     backup_root,
                     deployment_version="schema-7-current",
                     writes_stopped=True,
-                    expected_schema_version=6,
+                    expected_schema_version=7,
                 )
 
             with closing(sqlite3.connect(database)) as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_corrupt_backup_is_retained_and_never_replaces_current_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -397,7 +397,7 @@ class SQLiteBackupRestoreTests(unittest.TestCase):
                     )
 
             self.assertEqual(read_job_title(database), "Synthetic current state")
-            self.assertEqual(inspect_sqlite_database(database, immutable=False)["schemaVersion"], 6)
+            self.assertEqual(inspect_sqlite_database(database, immutable=False)["schemaVersion"], 7)
 
     def test_manifest_count_tampering_fails_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

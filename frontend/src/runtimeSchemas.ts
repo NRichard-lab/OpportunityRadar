@@ -153,34 +153,54 @@ export interface EmailSettingsPayload {
   fromEmail: string;
   fromName: string;
   replyToEmail: string;
-  dailyEnabled: boolean;
-  recipientEmail: string;
-  sendAfterRefresh: boolean;
-  sendWhenEmpty: boolean;
+  enabled: boolean;
+  recipients: string[];
+  scheduleDays: Array<"monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday">;
+  scheduleTime: string;
+  scheduleTimezone: string;
   hasSmtpPassword: boolean;
   trackingStartedAt: string;
+  checkpointEstablishedAt: string;
+  lastSuccessfulAt: string;
+  lastScheduledDate: string;
+  updatedAt: string;
   configured: boolean;
 }
+
+export type EmailDigestStatus = "Sending" | "Sent" | "Failed" | "Skipped - No Changes" | "Baseline Established";
 
 export interface EmailDigestPayload {
   id: string;
   startedAt: string;
   completedAt: string;
   recipient: string;
+  recipients: string[];
   jobCount: number;
-  status: "Sending" | "Success" | "Failed" | "Skipped - No New Jobs";
+  addedCount: number;
+  removedCount: number;
+  status: EmailDigestStatus;
   error: string;
   triggerType: "manual" | "scheduled";
+  scheduledFor: string;
 }
 
 export interface EmailStatusPayload {
   configured: boolean;
-  dailyEnabled: boolean;
-  recipientEmail: string;
+  enabled: boolean;
+  scheduleDays: EmailSettingsPayload["scheduleDays"];
+  scheduleTime: string;
+  scheduleTimezone: string;
+  recipients: string[];
+  schedulerRunning: boolean;
   lastEmail: EmailDigestPayload | null;
-  scheduledRefreshEnabled: boolean;
-  scheduledRefreshTime: string;
-  scheduledRefreshTimezone: string;
+  lastRunAt: string;
+  lastSuccessfulEmail: EmailDigestPayload | null;
+  lastSuccessfulSentAt: string;
+  lastStatus: string;
+  lastError: string;
+  lastAddedCount: number;
+  lastRemovedCount: number;
+  checkpointEstablishedAt: string;
 }
 
 export interface EmailHistoryPayload {
@@ -189,8 +209,10 @@ export interface EmailHistoryPayload {
 
 export interface EmailDigestMutationResponse {
   id: string;
-  status: "Success" | "Skipped - No New Jobs";
+  status: "Sent" | "Skipped - No Changes" | "Baseline Established";
   jobCount: number;
+  addedCount: number;
+  removedCount: number;
 }
 
 const MAINTENANCE_STATUSES: readonly MaintenanceStatus[] = [
@@ -623,36 +645,48 @@ export function isEmailSettingsPayload(value: unknown): value is EmailSettingsPa
   if (!isRecord(value)) return false;
   return hasStringFields(value, [
     "smtpHost", "smtpUsername", "fromEmail", "fromName", "replyToEmail",
-    "recipientEmail", "trackingStartedAt",
+    "scheduleTime", "scheduleTimezone", "trackingStartedAt", "checkpointEstablishedAt",
+    "lastSuccessfulAt", "lastScheduledDate", "updatedAt",
   ])
     && isNonNegativeInteger(value.smtpPort)
     && value.smtpPort >= 1
     && value.smtpPort <= 65535
     && isOneOf(value.security, ["ssl_tls", "starttls", "none"] as const)
-    && typeof value.dailyEnabled === "boolean"
-    && typeof value.sendAfterRefresh === "boolean"
-    && typeof value.sendWhenEmpty === "boolean"
+    && typeof value.enabled === "boolean"
+    && Array.isArray(value.recipients)
+    && value.recipients.every((recipient) => typeof recipient === "string")
+    && Array.isArray(value.scheduleDays)
+    && value.scheduleDays.every((day) => isOneOf(day, ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] as const))
     && typeof value.hasSmtpPassword === "boolean"
     && typeof value.configured === "boolean";
 }
 
 export function isEmailDigestPayload(value: unknown): value is EmailDigestPayload {
   if (!isRecord(value)) return false;
-  return hasStringFields(value, ["id", "startedAt", "completedAt", "recipient", "error"])
+  return hasStringFields(value, ["id", "startedAt", "completedAt", "recipient", "error", "scheduledFor"])
+    && Array.isArray(value.recipients)
+    && value.recipients.every((recipient) => typeof recipient === "string")
     && isNonNegativeInteger(value.jobCount)
-    && isOneOf(value.status, ["Sending", "Success", "Failed", "Skipped - No New Jobs"] as const)
+    && isNonNegativeInteger(value.addedCount)
+    && isNonNegativeInteger(value.removedCount)
+    && isOneOf(value.status, ["Sending", "Sent", "Failed", "Skipped - No Changes", "Baseline Established"] as const)
     && isOneOf(value.triggerType, ["manual", "scheduled"] as const);
 }
 
 export function isEmailStatusPayload(value: unknown): value is EmailStatusPayload {
   if (!isRecord(value)) return false;
   return typeof value.configured === "boolean"
-    && typeof value.dailyEnabled === "boolean"
-    && typeof value.recipientEmail === "string"
+    && typeof value.enabled === "boolean"
+    && Array.isArray(value.recipients)
+    && value.recipients.every((recipient) => typeof recipient === "string")
+    && Array.isArray(value.scheduleDays)
+    && value.scheduleDays.every((day) => typeof day === "string")
+    && hasStringFields(value, ["scheduleTime", "scheduleTimezone", "lastRunAt", "lastSuccessfulSentAt", "lastStatus", "lastError", "checkpointEstablishedAt"])
+    && typeof value.schedulerRunning === "boolean"
     && (value.lastEmail === null || isEmailDigestPayload(value.lastEmail))
-    && typeof value.scheduledRefreshEnabled === "boolean"
-    && typeof value.scheduledRefreshTime === "string"
-    && typeof value.scheduledRefreshTimezone === "string";
+    && (value.lastSuccessfulEmail === null || isEmailDigestPayload(value.lastSuccessfulEmail))
+    && isNonNegativeInteger(value.lastAddedCount)
+    && isNonNegativeInteger(value.lastRemovedCount);
 }
 
 export function isEmailHistoryPayload(value: unknown): value is EmailHistoryPayload {
@@ -664,6 +698,8 @@ export function isEmailHistoryPayload(value: unknown): value is EmailHistoryPayl
 export function isEmailDigestMutationResponse(value: unknown): value is EmailDigestMutationResponse {
   if (!isRecord(value)) return false;
   return typeof value.id === "string"
-    && isOneOf(value.status, ["Success", "Skipped - No New Jobs"] as const)
-    && isNonNegativeInteger(value.jobCount);
+    && isOneOf(value.status, ["Sent", "Skipped - No Changes", "Baseline Established"] as const)
+    && isNonNegativeInteger(value.jobCount)
+    && isNonNegativeInteger(value.addedCount)
+    && isNonNegativeInteger(value.removedCount);
 }

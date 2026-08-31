@@ -45,6 +45,7 @@ from backend.blueash_auth import (
     validate_auth_configuration,
 )
 from backend.email_service import EmailConfigurationError, EmailDeliveryError, EmailService
+from backend.email_scheduler import EmailScheduler
 from backend.migration import excel_company_to_api
 from backend.maintenance_scheduler import DEFAULT_TIMEZONE, MaintenanceScheduler
 from backend.operation_gate import GLOBAL_MUTATION_GATE, OperationConflictError
@@ -109,6 +110,7 @@ app = FastAPI(
 )
 _utility_run_manager: UtilityRunManager | None = None
 _maintenance_scheduler: MaintenanceScheduler | None = None
+_email_scheduler: EmailScheduler | None = None
 _service_initialization_lock = RLock()
 _health_readiness_cache = ReadinessCache()
 _portal_auth_client = PortalHandoffClient()
@@ -339,10 +341,15 @@ class EmailSettingsRequest(BaseModel):
     fromEmail: str = Field(default="", max_length=320)
     fromName: str = Field(default="Opportunity Radar", max_length=200)
     replyToEmail: str = Field(default="", max_length=320)
-    dailyEnabled: bool = False
-    recipientEmail: str = Field(default="", max_length=320)
-    sendAfterRefresh: bool = True
-    sendWhenEmpty: bool = False
+    enabled: bool = False
+    recipients: list[str] = Field(default_factory=list, max_length=50)
+    scheduleDays: list[
+        Literal[
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+        ]
+    ] = Field(default_factory=lambda: ["monday", "tuesday", "wednesday", "thursday", "friday"], max_length=7)
+    scheduleTime: str = Field(default="07:00", min_length=5, max_length=5)
+    scheduleTimezone: str = Field(default=DEFAULT_TIMEZONE, min_length=1, max_length=100)
 
 
 class TestEmailRequest(BaseModel):
@@ -995,7 +1002,9 @@ def test_email_endpoint(request: TestEmailRequest) -> dict[str, Any]:
     dependencies=[Depends(require_administrator), Depends(require_utilities_enabled)],
 )
 def email_status_endpoint() -> dict[str, Any]:
-    return email_service().status()
+    return email_service().status(
+        scheduler_running=bool(APP_ENABLE_SCHEDULES and email_scheduler().is_running())
+    )
 
 
 @app.get(
@@ -1007,17 +1016,17 @@ def email_history_endpoint(limit: int = Query(default=20, ge=1, le=100)) -> dict
 
 
 @app.post(
-    "/api/email/send-new-jobs",
+    "/api/email/send-digest",
     dependencies=[Depends(require_administrator), Depends(require_utilities_enabled)],
 )
-def send_new_jobs_endpoint() -> dict[str, Any]:
-    with api_mutation("send-new-jobs-email"):
+def send_job_digest_endpoint() -> dict[str, Any]:
+    with api_mutation("send-job-digest-email"):
         try:
-            result = email_service().send_new_jobs_digest(trigger_type="manual")
+            result = email_service().send_job_digest(trigger_type="manual")
         except EmailConfigurationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         if result.get("status") == "Failed":
-            raise HTTPException(status_code=502, detail=result.get("error") or "The daily job email could not be sent.")
+            raise HTTPException(status_code=502, detail=result.get("error") or "The job digest could not be sent.")
     return result
 
 
@@ -1223,6 +1232,14 @@ def email_service() -> EmailService:
     return EmailService(repository())
 
 
+def email_scheduler() -> EmailScheduler:
+    global _email_scheduler
+    with _service_initialization_lock:
+        if _email_scheduler is None:
+            _email_scheduler = EmailScheduler(email_service)
+    return _email_scheduler
+
+
 def run_readonly_company_adapter(action: Callable[[], Any]) -> Any:
     exporter().export_companies(include_excel=True)
     return action()
@@ -1423,7 +1440,6 @@ def user_utility_definitions() -> dict[str, dict[str, Any]]:
                 f"{summary.get('jobs_saved', 0)} jobs saved, and {summary.get('errors', 0)} companies could not be reached."
             ),
             "description": "Automatically checks every configured company for current job openings.",
-            "after_scheduled_success": lambda summary: email_service().send_new_jobs_digest(trigger_type="scheduled"),
         },
         "reprocess-saved-jobs": {
             "task_name": "Reprocess Saved Jobs", "progress_verb": "Processing",
@@ -1597,6 +1613,7 @@ def start_maintenance_scheduler() -> None:
         email_service().bootstrap_from_environment()
     if APP_ENABLE_SCHEDULES:
         scheduler().start()
+        email_scheduler().start()
 
 
 @app.on_event("shutdown")
@@ -1604,5 +1621,7 @@ def stop_maintenance_scheduler() -> None:
     GLOBAL_MUTATION_GATE.stop_accepting()
     if _maintenance_scheduler is not None:
         _maintenance_scheduler.stop()
+    if _email_scheduler is not None:
+        _email_scheduler.stop()
     if _utility_run_manager is not None:
         _utility_run_manager.shutdown()

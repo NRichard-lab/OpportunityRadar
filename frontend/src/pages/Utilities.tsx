@@ -169,12 +169,14 @@ export function Utilities({ maintenance, onMaintenanceRefresh, features }: Utili
   </div>;
 }
 
-const emptyEmailSettings: EmailSettingsPayload = { smtpHost: "", smtpPort: 465, security: "ssl_tls", smtpUsername: "", fromEmail: "", fromName: "Opportunity Radar", replyToEmail: "", dailyEnabled: false, recipientEmail: "", sendAfterRefresh: true, sendWhenEmpty: false, hasSmtpPassword: false, trackingStartedAt: "", configured: false };
+const digestDays: EmailSettingsPayload["scheduleDays"] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+const emptyEmailSettings: EmailSettingsPayload = { smtpHost: "", smtpPort: 465, security: "ssl_tls", smtpUsername: "", fromEmail: "", fromName: "Opportunity Radar", replyToEmail: "", enabled: false, recipients: [], scheduleDays: ["monday", "tuesday", "wednesday", "thursday", "friday"], scheduleTime: "07:00", scheduleTimezone: "America/Denver", hasSmtpPassword: false, trackingStartedAt: "", checkpointEstablishedAt: "", lastSuccessfulAt: "", lastScheduledDate: "", updatedAt: "", configured: false };
 
 function EmailTab() {
   const [settings, setSettings] = useState<EmailSettingsPayload>(emptyEmailSettings);
   const [password, setPassword] = useState("");
   const [testRecipient, setTestRecipient] = useState("");
+  const [recipientDraft, setRecipientDraft] = useState("");
   const [status, setStatus] = useState<EmailStatusPayload | null>(null);
   const [history, setHistory] = useState<EmailDigestPayload[]>([]);
   const [selectedDigest, setSelectedDigest] = useState<string | null>(null);
@@ -194,7 +196,7 @@ function EmailTab() {
       throw new ApiError("Email settings could not be loaded. The server returned an invalid response.");
     }
     setSettings(loadedSettings); setStatus(loadedStatus); setHistory(loadedHistory.history);
-    setTestRecipient((current) => current || loadedSettings.recipientEmail);
+    setTestRecipient((current) => current || loadedSettings.recipients[0] || "");
     setError("");
   };
 
@@ -225,7 +227,7 @@ function EmailTab() {
   const runEmailAction = async (action: "test" | "digest") => {
     setBusy(action); setError(""); setMessage("");
     try {
-      const result = await apiJson<unknown>(action === "test" ? "/settings/email/test" : "/email/send-new-jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: action === "test" ? JSON.stringify({ recipient: testRecipient }) : undefined }, "The email could not be sent.");
+      const result = await apiJson<unknown>(action === "test" ? "/settings/email/test" : "/email/send-digest", { method: "POST", headers: { "Content-Type": "application/json" }, body: action === "test" ? JSON.stringify({ recipient: testRecipient }) : undefined }, "The email could not be sent.");
       if (action === "test") {
         if (!isMessageResponse(result)) throw new ApiError("The test email response was invalid.");
         setMessage(result.message || "Test email sent.");
@@ -233,7 +235,9 @@ function EmailTab() {
         if (!isEmailDigestMutationResponse(result)) {
           throw new ApiError("The daily email response was invalid.");
         }
-        setMessage(result.status === "Skipped - No New Jobs" ? "No email was sent because there are no new jobs." : `Daily job email sent with ${result.jobCount} new jobs.`);
+        if (result.status === "Baseline Established") setMessage("Baseline established. Future digests will report jobs added and removed from this point forward.");
+        else if (result.status === "Skipped - No Changes") setMessage("The digest check ran, but no email was sent because there were no job changes.");
+        else setMessage(`Job digest sent with ${result.addedCount} added and ${result.removedCount} removed.`);
       }
       try { await load(); }
       catch (reloadError) {
@@ -245,6 +249,20 @@ function EmailTab() {
   };
 
   const update = <K extends keyof EmailSettingsPayload>(key: K, value: EmailSettingsPayload[K]) => setSettings((current) => ({ ...current, [key]: value }));
+  const addRecipient = () => {
+    const normalized = recipientDraft.trim().toLowerCase();
+    setError("");
+    if (!normalized) { setError("Enter an email address before adding a recipient."); return; }
+    if (!isBasicEmail(normalized)) { setError("Enter a valid recipient email address."); return; }
+    if (settings.recipients.some((recipient) => recipient.toLowerCase() === normalized)) { setError("That recipient is already configured."); return; }
+    update("recipients", [...settings.recipients, normalized]);
+    setTestRecipient((current) => current || normalized);
+    setRecipientDraft("");
+  };
+  const toggleDigestDay = (day: EmailSettingsPayload["scheduleDays"][number]) => {
+    const selected = settings.scheduleDays.includes(day);
+    update("scheduleDays", selected ? settings.scheduleDays.filter((item) => item !== day) : digestDays.filter((item) => item === day || settings.scheduleDays.includes(item)));
+  };
   if (loading) return <p className="text-sm text-slate-400" role="status">Loading email settings...</p>;
   if (error && !status) return <div className="panel p-6 text-center" role="alert"><p className="text-sm text-red-300">{error}</p><button className="btn mt-4" type="button" onClick={() => void loadVisible()}>Retry</button></div>;
   return <div className="space-y-6">
@@ -266,28 +284,34 @@ function EmailTab() {
     </section>
 
     <section className="panel p-5">
-      <h2 className="font-semibold text-white">Daily Job Email</h2>
-      <div className="mt-4 space-y-4">
-        <ToggleRow label="Enable Daily Job Email" checked={settings.dailyEnabled} onChange={(value) => update("dailyEnabled", value)} />
-        <EmailField label="Recipient Email"><input className="field mt-1 max-w-xl" type="email" value={settings.recipientEmail} onChange={(event) => update("recipientEmail", event.target.value)} /></EmailField>
-        <ToggleRow label="Send After Daily Refresh" checked={settings.sendAfterRefresh} onChange={(value) => update("sendAfterRefresh", value)} />
-        <ToggleRow label="Send email when no new jobs are found" checked={settings.sendWhenEmpty} onChange={(value) => update("sendWhenEmpty", value)} />
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"><div><h2 className="font-semibold text-white">Job Digest Schedule</h2><p className="mt-1 text-sm text-slate-400">Runs on its own calendar and waits for an active job refresh to finish.</p></div><ToggleRow label="Email enabled" checked={settings.enabled} onChange={(value) => update("enabled", value)} /></div>
+      <div className="mt-5 grid gap-5 lg:grid-cols-2">
+        <div><p className="text-sm font-medium text-slate-200">Scheduled days</p><div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2 xl:grid-cols-4">{digestDays.map((day) => <label className="flex cursor-pointer items-center gap-2 rounded-md border border-radar-line bg-radar-bg px-3 py-2 text-sm text-slate-300" key={day}><input type="checkbox" checked={settings.scheduleDays.includes(day)} onChange={() => toggleDigestDay(day)} /><span>{day.slice(0, 1).toUpperCase() + day.slice(1)}</span></label>)}</div></div>
+        <div className="space-y-4"><EmailField label="Send Time"><input className="field mt-1 max-w-xs" type="time" value={settings.scheduleTime} onChange={(event) => update("scheduleTime", event.target.value)} /></EmailField><div><p className="text-sm text-slate-300">Timezone</p><p className="mt-1 rounded-md border border-radar-line bg-radar-bg px-3 py-2 text-sm text-slate-200">{settings.scheduleTimezone}</p><p className="mt-1 text-xs text-slate-500">Uses the application scheduler timezone.</p></div></div>
       </div>
-      {settings.dailyEnabled && !status?.scheduledRefreshEnabled ? <p className="mt-4 rounded-md border border-amber-800 bg-amber-950/30 p-3 text-sm text-amber-200">Daily job emails require an enabled scheduled job refresh in the Refresh tab.</p> : null}
-      <div className="mt-5 flex justify-end"><button className="btn btn-primary" type="button" disabled={Boolean(busy)} onClick={() => void save()}><Save size={16} />Save Daily Email</button></div>
+      <div className="mt-6 border-t border-radar-line pt-5"><h3 className="text-sm font-semibold text-white">Recipients</h3><div className="mt-3 flex flex-col gap-2 sm:flex-row"><input className="field" type="email" value={recipientDraft} placeholder="name@example.com" onChange={(event) => setRecipientDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addRecipient(); } }} /><button className="btn shrink-0" type="button" onClick={addRecipient}>Add Recipient</button></div>{settings.recipients.length ? <ul className="mt-3 flex flex-wrap gap-2">{settings.recipients.map((recipient) => <li className="flex items-center gap-2 rounded-full border border-radar-line bg-radar-bg px-3 py-1.5 text-sm text-slate-200" key={recipient}><span>{recipient}</span><button className="text-slate-400 hover:text-white" type="button" aria-label={`Remove ${recipient}`} onClick={() => update("recipients", settings.recipients.filter((item) => item !== recipient))}><X size={14} /></button></li>)}</ul> : <p className="mt-3 text-sm text-slate-500">No recipients configured.</p>}</div>
+      <div className="mt-5 flex justify-end"><button className="btn btn-primary" type="button" disabled={Boolean(busy)} onClick={() => void save()}><Save size={16} />Save Digest Schedule</button></div>
     </section>
 
     <section className="grid gap-4 lg:grid-cols-2">
-      <div className="panel p-5"><h2 className="font-semibold text-white">Test Email</h2><EmailField label="Test Recipient"><input className="field mt-3" type="email" value={testRecipient} onChange={(event) => setTestRecipient(event.target.value)} /></EmailField><button className="btn btn-primary mt-4" type="button" disabled={Boolean(busy) || !testRecipient} onClick={() => void runEmailAction("test")}><Send size={16} />{busy === "test" ? "Sending..." : "Send Test Email"}</button></div>
-      <div className="panel p-5"><h2 className="font-semibold text-white">Email Service</h2><dl className="mt-4 grid grid-cols-2 gap-4"><Stat label="Configured" value={status?.configured ? "Yes" : "No"} /><Stat label="Daily Digest" value={status?.dailyEnabled ? "Enabled" : "Disabled"} /><Stat label="Recipient" value={status?.recipientEmail || "Not Set"} /><Stat label="Last Email" value={status?.lastEmail ? formatTimestamp(status.lastEmail.completedAt || status.lastEmail.startedAt) : "Never"} /><Stat label="Last Result" value={status?.lastEmail?.status || "Never Sent"} /><Stat label="New Jobs Sent" value={String(status?.lastEmail?.jobCount ?? 0)} /><Stat label="Next Digest" value={status?.scheduledRefreshEnabled ? `After the scheduled ${formatClockTime(status.scheduledRefreshTime)} refresh` : "Scheduled refresh is off"} /></dl><button className="btn mt-5" type="button" disabled={Boolean(busy) || !settings.configured} onClick={() => void runEmailAction("digest")}><Send size={16} />{busy === "digest" ? "Sending..." : "Send New Jobs Now"}</button></div>
+      <div className="panel p-5"><h2 className="font-semibold text-white">SMTP / Test Email</h2><p className="mt-1 text-sm text-slate-400">Sends a simple message without changing the job checkpoint.</p><EmailField label="Test Recipient"><input className="field mt-3" type="email" value={testRecipient} onChange={(event) => setTestRecipient(event.target.value)} /></EmailField><button className="btn btn-primary mt-4" type="button" disabled={Boolean(busy) || !testRecipient} onClick={() => void runEmailAction("test")}><Send size={16} />{busy === "test" ? "Sending..." : "Send Test Email"}</button></div>
+      <div className="panel p-5"><h2 className="font-semibold text-white">Send Job Digest Now</h2><p className="mt-1 text-sm text-slate-400">Runs the real added/removed comparison. The checkpoint advances only after successful delivery.</p><button className="btn btn-primary mt-4" type="button" disabled={Boolean(busy) || !settings.configured || !settings.recipients.length} onClick={() => void runEmailAction("digest")}><Send size={16} />{busy === "digest" ? "Comparing and sending..." : "Send Job Digest Now"}</button></div>
     </section>
 
-    <section className="panel overflow-hidden"><header className="border-b border-radar-line p-5"><h2 className="font-semibold text-white">Email History</h2></header>{history.length ? <div className="overflow-x-auto"><div className="min-w-[38rem]"><div className="grid grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-xs font-semibold uppercase text-slate-500"><span>Date</span><span>New Jobs</span><span>Result</span><span>Trigger</span></div>{history.map((digest) => <button className="grid w-full grid-cols-[1fr_6rem_8rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-left text-sm text-slate-300 last:border-0 hover:bg-radar-bg/50" type="button" key={digest.id} onClick={() => setSelectedDigest(selectedDigest === digest.id ? null : digest.id)}><span>{formatTimestamp(digest.startedAt)}</span><span>{digest.jobCount}</span><span className={digest.status === "Success" ? "text-emerald-300" : digest.status === "Failed" ? "text-red-300" : "text-slate-400"}>{digest.status}</span><span className="capitalize">{digest.triggerType}</span>{selectedDigest === digest.id && digest.error ? <span className="col-span-4 text-red-300">This email attempt failed. Check the email configuration and try again.</span> : null}</button>)}</div></div> : <p className="p-5 text-sm text-slate-400">No daily job emails have been attempted yet.</p>}</section>
+    <section className="panel p-5">
+      <h2 className="font-semibold text-white">Email Service Status</h2>
+      <dl className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4"><Stat label="Email" value={status?.enabled ? "Enabled" : "Disabled"} /><Stat label="Scheduler" value={status?.schedulerRunning ? "Running" : "Stopped"} /><Stat label="Scheduled Days" value={status?.scheduleDays.length ? status.scheduleDays.map((day) => day.slice(0, 3).toUpperCase()).join(", ") : "None"} /><Stat label="Scheduled Time" value={status ? `${formatClockTime(status.scheduleTime)} (${status.scheduleTimezone})` : "—"} /><Stat label="Recipients" value={String(status?.recipients.length ?? 0)} /><Stat label="Last Email Run" value={status?.lastRunAt ? formatTimestamp(status.lastRunAt) : "Never"} /><Stat label="Last Successful Email" value={status?.lastSuccessfulSentAt ? formatTimestamp(status.lastSuccessfulSentAt) : "Never"} /><Stat label="Last Status" value={status?.lastStatus || "Never Run"} /><Stat label="Jobs Added" value={String(status?.lastAddedCount ?? 0)} /><Stat label="Jobs Removed" value={String(status?.lastRemovedCount ?? 0)} /><Stat label="Baseline" value={status?.checkpointEstablishedAt ? formatTimestamp(status.checkpointEstablishedAt) : "Not Established"} /><Stat label="SMTP" value={status?.configured ? "Configured" : "Incomplete"} /></dl>
+      {status?.lastError ? <p className="mt-4 rounded-md border border-red-900 bg-red-950/30 p-3 text-sm text-red-200">{status.lastError}</p> : null}
+      {status?.recipients.length ? <div className="mt-4 border-t border-radar-line pt-4"><p className="text-xs font-semibold uppercase text-slate-500">Configured recipients</p><p className="mt-2 break-words text-sm text-slate-300">{status.recipients.join(", ")}</p></div> : null}
+    </section>
+
+    <section className="panel overflow-hidden"><header className="border-b border-radar-line p-5"><h2 className="font-semibold text-white">Email History</h2></header>{history.length ? <div className="overflow-x-auto"><div className="min-w-[48rem]"><div className="grid grid-cols-[1fr_5rem_5rem_11rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-xs font-semibold uppercase text-slate-500"><span>Date</span><span>Added</span><span>Removed</span><span>Result</span><span>Trigger</span></div>{history.map((digest) => <button className="grid w-full grid-cols-[1fr_5rem_5rem_11rem_6rem] gap-3 border-b border-radar-line px-5 py-3 text-left text-sm text-slate-300 last:border-0 hover:bg-radar-bg/50" type="button" key={digest.id} onClick={() => setSelectedDigest(selectedDigest === digest.id ? null : digest.id)}><span>{formatTimestamp(digest.startedAt)}</span><span>{digest.addedCount}</span><span>{digest.removedCount}</span><span className={digest.status === "Sent" ? "text-emerald-300" : digest.status === "Failed" ? "text-red-300" : "text-slate-400"}>{digest.status}</span><span className="capitalize">{digest.triggerType}</span>{selectedDigest === digest.id && digest.error ? <span className="col-span-5 text-red-300">{digest.error}</span> : null}</button>)}</div></div> : <p className="p-5 text-sm text-slate-400">No job digest runs have been recorded yet.</p>}</section>
   </div>;
 }
 
+function isBasicEmail(value: string): boolean { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
 function EmailField({ label, children }: { label: string; children: ReactNode }) { return <label className="block text-sm text-slate-300">{label}{children}</label>; }
-function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="flex items-center justify-between gap-4 border-b border-radar-line pb-4"><span className="text-sm font-medium text-slate-200">{label}</span><button className={`relative h-6 w-11 rounded-full transition ${checked ? "bg-radar-accent" : "bg-slate-700"}`} type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span className={`absolute top-1 size-4 rounded-full bg-white transition-all ${checked ? "left-6" : "left-1"}`} /></button></div>; }
+function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="flex min-w-56 items-center justify-between gap-4"><span className="text-sm font-medium text-slate-200">{label}</span><button className={`relative h-6 w-11 rounded-full transition ${checked ? "bg-radar-accent" : "bg-slate-700"}`} type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span className={`absolute top-1 size-4 rounded-full bg-white transition-all ${checked ? "left-6" : "left-1"}`} /></button></div>; }
 
 export function MaintenanceCard({ action, job, enabled, schedulesEnabled, onRun, onToggle, onEditSchedule, onHistory }: { action: UtilityPresentation; job: MaintenanceJobState; enabled: boolean; schedulesEnabled: boolean; onRun: () => void; onToggle: () => void; onEditSchedule: () => void; onHistory: () => void; }) {
   const Icon = action.icon;

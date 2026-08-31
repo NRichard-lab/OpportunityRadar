@@ -15,7 +15,7 @@ from uuid import uuid4
 
 
 SERVICE_NAME = "opportunity-radar"
-MINIMUM_SCHEMA_VERSION = 6
+MINIMUM_SCHEMA_VERSION = 7
 REQUIRED_CORE_COLUMNS = {
     "applications": frozenset(
         {

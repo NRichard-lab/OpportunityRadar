@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -202,6 +203,13 @@ CREATE TABLE IF NOT EXISTS email_settings (
     send_after_refresh INTEGER NOT NULL DEFAULT 1 CHECK (send_after_refresh IN (0, 1)),
     send_when_empty INTEGER NOT NULL DEFAULT 0 CHECK (send_when_empty IN (0, 1)),
     tracking_started_at TEXT NOT NULL DEFAULT '',
+    schedule_days_json TEXT NOT NULL DEFAULT '["monday","tuesday","wednesday","thursday","friday"]',
+    schedule_time TEXT NOT NULL DEFAULT '07:00',
+    schedule_timezone TEXT NOT NULL DEFAULT 'America/Denver',
+    recipients_json TEXT NOT NULL DEFAULT '[]',
+    last_scheduled_date TEXT NOT NULL DEFAULT '',
+    checkpoint_established_at TEXT NOT NULL DEFAULT '',
+    last_successful_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
 
@@ -210,12 +218,38 @@ CREATE TABLE IF NOT EXISTS email_digests (
     started_at TEXT NOT NULL,
     completed_at TEXT NOT NULL DEFAULT '',
     recipient TEXT NOT NULL DEFAULT '',
+    recipients_json TEXT NOT NULL DEFAULT '[]',
     job_count INTEGER NOT NULL DEFAULT 0,
+    added_count INTEGER NOT NULL DEFAULT 0,
+    removed_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     error TEXT NOT NULL DEFAULT '',
-    trigger_type TEXT NOT NULL DEFAULT 'manual'
+    trigger_type TEXT NOT NULL DEFAULT 'manual',
+    scheduled_for TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_email_digests_started ON email_digests(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS email_snapshot_jobs (
+    identity_key TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    pay_display TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    snapshot_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS email_digest_job_changes (
+    digest_id TEXT NOT NULL REFERENCES email_digests(id) ON DELETE CASCADE,
+    identity_key TEXT NOT NULL,
+    change_type TEXT NOT NULL CHECK (change_type IN ('added', 'removed')),
+    job_id TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    pay_display TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (digest_id, identity_key, change_type)
+);
 
 CREATE TABLE IF NOT EXISTS email_digest_jobs (
     digest_id TEXT NOT NULL REFERENCES email_digests(id) ON DELETE CASCADE,
@@ -331,7 +365,61 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO settings (key,value_json,updated_at) VALUES ('scheduler_timezone','\"America/Denver\"',?)",
             (now,),
         )
-        connection.execute("PRAGMA user_version = 6")
+        email_columns = {row[1] for row in connection.execute("PRAGMA table_info(email_settings)")}
+        for column, definition in (
+            ("schedule_days_json", "TEXT NOT NULL DEFAULT '[\"monday\",\"tuesday\",\"wednesday\",\"thursday\",\"friday\"]'"),
+            ("schedule_time", "TEXT NOT NULL DEFAULT '07:00'"),
+            ("schedule_timezone", "TEXT NOT NULL DEFAULT 'America/Denver'"),
+            ("recipients_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("last_scheduled_date", "TEXT NOT NULL DEFAULT ''"),
+            ("checkpoint_established_at", "TEXT NOT NULL DEFAULT ''"),
+            ("last_successful_at", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in email_columns:
+                connection.execute(f"ALTER TABLE email_settings ADD COLUMN {column} {definition}")
+        for row in connection.execute(
+            "SELECT id,recipient_email,recipients_json FROM email_settings"
+        ).fetchall():
+            try:
+                recipients = json.loads(str(row["recipients_json"] or "[]"))
+            except json.JSONDecodeError:
+                recipients = []
+            legacy_recipient = str(row["recipient_email"] or "").strip().lower()
+            if not recipients and legacy_recipient:
+                connection.execute(
+                    "UPDATE email_settings SET recipients_json=? WHERE id=?",
+                    (json.dumps([legacy_recipient]), row["id"]),
+                )
+        timezone_row = connection.execute(
+            "SELECT value_json FROM settings WHERE key='scheduler_timezone'"
+        ).fetchone()
+        if timezone_row:
+            try:
+                scheduler_timezone = str(json.loads(timezone_row["value_json"]))
+            except (json.JSONDecodeError, TypeError):
+                scheduler_timezone = "America/Denver"
+            connection.execute(
+                "UPDATE email_settings SET schedule_timezone=? WHERE schedule_timezone='' OR schedule_timezone='America/Denver'",
+                (scheduler_timezone,),
+            )
+        connection.execute("UPDATE email_settings SET send_after_refresh=0,send_when_empty=0")
+        digest_columns = {row[1] for row in connection.execute("PRAGMA table_info(email_digests)")}
+        for column, definition in (
+            ("recipients_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("added_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("removed_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("scheduled_for", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in digest_columns:
+                connection.execute(f"ALTER TABLE email_digests ADD COLUMN {column} {definition}")
+        connection.execute(
+            "UPDATE email_digests SET added_count=job_count WHERE added_count=0 AND job_count>0"
+        )
+        connection.execute("UPDATE email_digests SET status='Sent' WHERE status='Success'")
+        connection.execute(
+            "UPDATE email_digests SET status='Skipped - No Changes' WHERE status='Skipped - No New Jobs'"
+        )
+        connection.execute("PRAGMA user_version = 7")
         connection.commit()
     except BaseException:
         connection.rollback()

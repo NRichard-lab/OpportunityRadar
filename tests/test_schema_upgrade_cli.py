@@ -13,6 +13,44 @@ from backend.db import connect, initialize_schema
 
 
 class SchemaUpgradeCliTests(unittest.TestCase):
+    def test_email_upgrade_preserves_and_converts_legacy_recipient(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "opportunity_radar.db"
+            with closing(connect(database)) as connection:
+                initialize_schema(connection)
+                connection.execute(
+                    """INSERT INTO email_settings
+                    (id,recipient_email,daily_enabled,send_after_refresh,tracking_started_at,updated_at)
+                    VALUES ('default','legacy@example.test',1,1,'2026-08-01','2026-08-01')"""
+                )
+                connection.execute("DROP TABLE email_digest_job_changes")
+                connection.execute("DROP TABLE email_snapshot_jobs")
+                for column in (
+                    "schedule_days_json", "schedule_time", "schedule_timezone", "recipients_json",
+                    "last_scheduled_date", "checkpoint_established_at", "last_successful_at",
+                ):
+                    connection.execute(f"ALTER TABLE email_settings DROP COLUMN {column}")
+                for column in ("recipients_json", "added_count", "removed_count", "scheduled_for"):
+                    connection.execute(f"ALTER TABLE email_digests DROP COLUMN {column}")
+                connection.execute("PRAGMA user_version = 6")
+                connection.commit()
+
+            code, report = run_cli("upgrade-schema", "--database", str(database))
+            self.assertEqual(code, 0)
+            self.assertEqual(report, {"status": "completed", "schemaVersion": 7})
+            with closing(connect(database, readonly=True)) as connection:
+                row = connection.execute(
+                    "SELECT recipients_json,send_after_refresh FROM email_settings WHERE id='default'"
+                ).fetchone()
+                tables = {
+                    item[0] for item in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            self.assertEqual(json.loads(row["recipients_json"]), ["legacy@example.test"])
+            self.assertEqual(row["send_after_refresh"], 0)
+            self.assertTrue({"email_snapshot_jobs", "email_digest_job_changes"}.issubset(tables))
+
     def test_upgrade_is_transactional_idempotent_and_preserves_existing_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "opportunity_radar.db"
@@ -44,7 +82,7 @@ class SchemaUpgradeCliTests(unittest.TestCase):
 
             code, report = run_cli("upgrade-schema", "--database", str(database))
             self.assertEqual(code, 0)
-            self.assertEqual(report, {"status": "completed", "schemaVersion": 6})
+            self.assertEqual(report, {"status": "completed", "schemaVersion": 7})
             with closing(connect(database, readonly=True)) as connection:
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
                 stored = connection.execute(

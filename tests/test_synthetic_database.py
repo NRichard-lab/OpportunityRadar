@@ -19,7 +19,7 @@ class SyntheticDatabaseTests(unittest.TestCase):
             self.assertEqual(result["status"], "created")
             self.assertTrue(result["synthetic"])
             self.assertEqual(result["integrityCheck"], "ok")
-            self.assertEqual(result["schemaVersion"], 6)
+            self.assertEqual(result["schemaVersion"], 7)
             self.assertEqual(
                 result["counts"],
                 {"companies": 2, "jobs": 2, "applications": 1, "resumes": 1, "settings": 2},

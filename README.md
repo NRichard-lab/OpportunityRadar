@@ -318,7 +318,12 @@ The Resume Fit Score estimates how well the resume appears to match visible job 
 
 ## Email Service
 
-SMTP provider and daily digest settings are managed under `Utilities > Email`. Passwords are encrypted before SQLite storage and are never returned by the API.
+SMTP provider and job-digest settings are managed under `Utilities > Email`. The digest has its own
+calendar schedule, uses the application scheduler timezone, supports a persistent recipient list,
+and waits for active refresh work before comparing jobs. Its SQLite snapshot advances only after a
+successful multipart email; zero-change runs are recorded without sending, and the first run creates
+a baseline rather than treating every existing job as new. Passwords are encrypted before SQLite
+storage and are never returned by the API.
 
 For a hosted deployment, set a stable secret before starting the backend:
 

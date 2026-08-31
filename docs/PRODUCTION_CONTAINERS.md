@@ -208,6 +208,20 @@ and does not prune pre-restore preservation artifacts. Published and preservatio
 mode 0700 and their database, metadata, and auxiliary files use mode 0600. Offsite upload is
 intentionally not included.
 
+Before starting an image that requires a newer schema, keep the backend stopped and run the
+transactional, idempotent schema upgrade with that exact image:
+
+```sh
+docker compose -f compose.production.yaml stop -t 60 opportunity-radar-backend
+docker compose -f compose.production.yaml run --rm --no-deps opportunity-radar-backend \
+  python -m backend.cli upgrade-schema
+docker compose -f compose.production.yaml up -d opportunity-radar-backend
+```
+
+The application does not migrate production SQLite during normal startup. Always create and
+validate the online backup first, and never run the schema command while another process can write
+the database.
+
 ## Offline restore
 
 Never restore over a live database. Stop the backend and wait for its 60-second graceful shutdown;
