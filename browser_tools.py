@@ -100,7 +100,7 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
 def _discover_with_launched_browser(browser, careers_url: str, playwright_timeout_error) -> dict[str, str | None]:
     context = browser.new_context(
         user_agent=(
-            "FinancialJobsRadar/1.0 "
+            "OpportunityRadar/1.0 "
             "(public job board URL discovery; no applications or form submissions)"
         ),
         service_workers="block",

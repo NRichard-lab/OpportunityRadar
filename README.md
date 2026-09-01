@@ -2,6 +2,9 @@
 
 Opportunity Radar tracks companies, discovered job openings, resume/job fit, and applications.
 
+The canonical repository and immutable production release chain are documented in
+[Repository and deployment source](docs/REPOSITORY_AND_DEPLOYMENT.md).
+
 Production authentication uses a one-time Blue Ash Portal authorization-code handoff and an
 app-scoped Radar token. See [docs/BLUEASH_AUTH_INTEGRATION.md](docs/BLUEASH_AUTH_INTEGRATION.md).
 

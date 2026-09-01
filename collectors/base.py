@@ -27,7 +27,7 @@ class BaseCollector:
         self.final_url_after_redirect = ""
         self.last_pay_extraction: dict[str, Any] = {}
         self.session = SSRFProtectedSession()
-        self.session.headers.update({"User-Agent": "FinancialJobsRadar/1.0 public job listing collector"})
+        self.session.headers.update({"User-Agent": "OpportunityRadar/1.0 public job listing collector"})
 
     def collect(self, company: dict[str, Any]):
         raise NotImplementedError
