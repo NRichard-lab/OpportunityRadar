@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
-from job_tools import JobRecord, make_job_id
+from job_tools import CollectionNotAuthoritative, JobRecord, make_job_id
 from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
 
 
@@ -33,78 +33,86 @@ class PaycorCollector(BaseCollector):
         jobs: list[JobRecord] = []
         with sync_playwright() as playwright:
             browser = launch_playwright_chromium(playwright, headless=True)
-            context = browser.new_context(service_workers="block")
-            install_playwright_url_guard(context)
-            page = context.new_page()
+            # Releasing this leased browser is mandatory on every exit path so the
+            # single-Chromium launch lease is never stranded by a mid-scrape error.
             try:
-                safe_page_goto(page, source_url, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeoutError:
-                pass
-
-            frame = find_paycor_frame(page)
-            if frame is None:
-                self.reject_candidate(source_url, "Paycor iframe/listing frame not found", source_url)
-                self.flush_debug(company)
-                browser.close()
-                return []
-
-            links = frame.locator("a[href*='JobIntroduction.action']")
-            link_count = links.count()
-            listing_rows: list[dict[str, str]] = []
-            for index in range(link_count):
-                link = links.nth(index)
+                context = browser.new_context(service_workers="block")
+                install_playwright_url_guard(context)
+                page = context.new_page()
                 try:
-                    title = normalize_job_title(link.inner_text(timeout=2000))
-                    href = link.get_attribute("href") or ""
-                    detail_url = urljoin(frame.url, href)
-                except Exception:
-                    continue
-                self.record_candidate(title, detail_url)
-                if not is_valid_job_title(title):
-                    self.reject_candidate(title, rejection_reason(title), detail_url)
-                    continue
-                listing_rows.append({"title": title, "url": detail_url})
+                    safe_page_goto(page, source_url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except PlaywrightTimeoutError:
+                    pass
 
-            seen_urls: set[str] = set()
-            for listing in listing_rows:
-                if listing["url"] in seen_urls:
-                    self.reject_candidate(listing["title"], "duplicate job URL", listing["url"])
-                    continue
-                detail = fetch_paycor_detail(page, source_url, listing["url"])
-                description = detail.get("description") or listing["title"]
-                title = normalize_job_title(listing["title"])
-                if not is_valid_job_title(title):
-                    self.reject_candidate(title, rejection_reason(title), listing["url"])
-                    continue
-                location = detail.get("location") or extract_location(description)
-                pay_text = extract_pay_text(description)
-                pay_min, pay_max = parse_pay(pay_text)
-                work_type = extract_work_type(" ".join([location, description]))
-                job = JobRecord(
-                    id=make_job_id(company, title, listing["url"]),
-                    companyId=str(company.get("Company ID") or stable_company_id(company)),
-                    companyName=str(company.get("Company Name") or ""),
-                    title=title,
-                    location=location or "Not listed",
-                    workType=work_type,
-                    payMin=pay_min,
-                    payMax=pay_max,
-                    payText=pay_text,
-                    postedDate=detail.get("postedDate", ""),
-                    sourceUrl=listing["url"],
-                    jobPlatform="Paycor",
-                    description=description,
-                    descriptionSnippet=description[:360].strip(),
-                    collectedAt=datetime.now(timezone.utc).isoformat(),
-                    rawData={"collector": self.__class__.__name__, "sourceType": source_type},
-                )
-                jobs.append(job)
-                seen_urls.add(listing["url"])
-                self.save_candidate(title, listing["url"])
+                frame = find_paycor_frame(page)
+                if frame is None:
+                    self.reject_candidate(source_url, "Paycor iframe/listing frame not found", source_url)
+                    self.flush_debug(company)
+                    # The Paycor board did not render its listing frame. Treat this
+                    # as a blocked/incomplete refresh, not a confirmed zero, so
+                    # existing jobs for this company are retained.
+                    raise CollectionNotAuthoritative(
+                        f"Paycor listing frame did not render for {source_url}."
+                    )
 
-            self.flush_debug(company)
-            browser.close()
+                links = frame.locator("a[href*='JobIntroduction.action']")
+                link_count = links.count()
+                listing_rows: list[dict[str, str]] = []
+                for index in range(link_count):
+                    link = links.nth(index)
+                    try:
+                        title = normalize_job_title(link.inner_text(timeout=2000))
+                        href = link.get_attribute("href") or ""
+                        detail_url = urljoin(frame.url, href)
+                    except Exception:
+                        continue
+                    self.record_candidate(title, detail_url)
+                    if not is_valid_job_title(title):
+                        self.reject_candidate(title, rejection_reason(title), detail_url)
+                        continue
+                    listing_rows.append({"title": title, "url": detail_url})
+
+                seen_urls: set[str] = set()
+                for listing in listing_rows:
+                    if listing["url"] in seen_urls:
+                        self.reject_candidate(listing["title"], "duplicate job URL", listing["url"])
+                        continue
+                    detail = fetch_paycor_detail(page, source_url, listing["url"])
+                    description = detail.get("description") or listing["title"]
+                    title = normalize_job_title(listing["title"])
+                    if not is_valid_job_title(title):
+                        self.reject_candidate(title, rejection_reason(title), listing["url"])
+                        continue
+                    location = detail.get("location") or extract_location(description)
+                    pay_text = extract_pay_text(description)
+                    pay_min, pay_max = parse_pay(pay_text)
+                    work_type = extract_work_type(" ".join([location, description]))
+                    job = JobRecord(
+                        id=make_job_id(company, title, listing["url"]),
+                        companyId=str(company.get("Company ID") or stable_company_id(company)),
+                        companyName=str(company.get("Company Name") or ""),
+                        title=title,
+                        location=location or "Not listed",
+                        workType=work_type,
+                        payMin=pay_min,
+                        payMax=pay_max,
+                        payText=pay_text,
+                        postedDate=detail.get("postedDate", ""),
+                        sourceUrl=listing["url"],
+                        jobPlatform="Paycor",
+                        description=description,
+                        descriptionSnippet=description[:360].strip(),
+                        collectedAt=datetime.now(timezone.utc).isoformat(),
+                        rawData={"collector": self.__class__.__name__, "sourceType": source_type},
+                    )
+                    jobs.append(job)
+                    seen_urls.add(listing["url"])
+                    self.save_candidate(title, listing["url"])
+
+                self.flush_debug(company)
+            finally:
+                browser.close()
         return jobs
 
 

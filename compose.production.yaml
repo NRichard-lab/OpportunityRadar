@@ -16,7 +16,12 @@ services:
       - "seccomp:${OPPORTUNITY_RADAR_SECCOMP_PROFILE:-./docker/backend/seccomp_profile.json}"
     pids_limit: 256
     cpus: "1.00"
-    mem_limit: 768m
+    # The no-browser baseline is ~640 MiB; one headless Chromium tree adds
+    # ~300-500 MiB, so 768 MiB caused the OOM killer to take Chromium mid-run
+    # (oom_score_adj 300). 1536 MiB covers "baseline + one Chromium" with margin.
+    # Still one backend replica, one Uvicorn worker (image CMD --workers 1), one
+    # browser (APP_MAX_BROWSER_WORKERS=1); no security restriction changes.
+    mem_limit: 1536m
     env_file:
       - path: "${OPPORTUNITY_RADAR_ENV_FILE:-./deploy/opportunity-radar.env.example}"
         required: true

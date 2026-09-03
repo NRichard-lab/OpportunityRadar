@@ -193,6 +193,10 @@ class ProtectedBrowserLaunchTests(unittest.TestCase):
         environment = {
             "APP_ENV": "production",
             "APP_BROWSER_EGRESS_MODE": BROWSER_EGRESS_MODE,
+            # Fail fast instead of waiting out the bounded contention window; the
+            # first browser is a mock with no real process tree, so the leaked-
+            # lease reclaim path is deliberately not eligible here.
+            "OPPORTUNITY_RADAR_BROWSER_LEASE_WAIT_SECONDS": "0",
         }
         with (
             patch.dict(os.environ, environment, clear=True),

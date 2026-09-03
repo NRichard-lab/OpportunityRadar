@@ -16,7 +16,12 @@ from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_enrichment import extract_json_ld_pay_info, extract_pay_info
 from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
-from job_tools import JobRecord, make_job_id
+from job_tools import CollectionNotAuthoritative, JobRecord, make_job_id
+
+
+# Ceiling for Playwright context actions that do not pass an explicit timeout=
+# (e.g. page.content()). Generous enough never to bite a healthy slow page.
+BROWSER_ACTION_TIMEOUT_MS = 60000
 
 
 ACTION_LABELS = {
@@ -54,9 +59,23 @@ class GenericCollector(BaseCollector):
             return []
         try:
             return self.collect_with_browser(company, url, source_type)
+        except CollectionNotAuthoritative:
+            # Browser reached the page but it did not render (SPA shell). The
+            # static fallback would only fetch the same shell, so do not retry
+            # it -- propagate the non-authoritative result and retain existing jobs.
+            raise
         except Exception as exc:
             self.reject_candidate(url, f"browser render failed; falling back to HTTP: {exc}", url, company=company)
-            return self.collect_with_http(company, url, source_type)
+            # The browser did NOT complete. Anything the static fallback scrapes
+            # is incomplete by construction and is never authoritative -- even if
+            # it finds some postings. Hand any partial finds back for additive
+            # retention and report the refresh as incomplete.
+            partial_jobs = self.collect_with_http(company, url, source_type)
+            raise CollectionNotAuthoritative(
+                f"Browser render failed for {url}; static fallback is incomplete "
+                f"({len(partial_jobs)} partial listing(s)).",
+                partial_jobs=partial_jobs,
+            ) from exc
 
     def collect_with_browser(self, company: dict[str, Any], url: str, source_type: str) -> list[JobRecord]:
         local_browser_path = Path(__file__).resolve().parents[1] / ".playwright-browsers"
@@ -71,6 +90,12 @@ class GenericCollector(BaseCollector):
             context = None
             try:
                 context = browser.new_context(service_workers="block")
+                # Give every context action a ceiling so a call without an
+                # explicit timeout= (notably page.content()) cannot hang the
+                # owning maintenance thread if the renderer wedges. Calls that
+                # pass their own timeout= still override this.
+                context.set_default_timeout(BROWSER_ACTION_TIMEOUT_MS)
+                context.set_default_navigation_timeout(BROWSER_ACTION_TIMEOUT_MS)
                 install_playwright_url_guard(context)
                 self._detail_context = context
                 page = context.new_page()
@@ -81,7 +106,17 @@ class GenericCollector(BaseCollector):
                     pass
                 self.final_url_after_redirect = page.url
                 html = page.content()
+                try:
+                    visible_text = clean_text(page.locator("body").inner_text(timeout=5000))
+                except Exception:
+                    visible_text = ""
                 jobs = self.parse_listing_html(company, url, self.final_url_after_redirect or url, html, source_type)
+                if not jobs and not page_states_no_openings(visible_text) and looks_like_unrendered_spa(html, visible_text):
+                    raise CollectionNotAuthoritative(
+                        f"{self.final_url_after_redirect or url} loaded but rendered no listing "
+                        f"content (single-page-app shell); refusing to record an authoritative "
+                        f"zero-job result."
+                    )
             finally:
                 self._detail_context = None
                 if context is not None:
@@ -685,6 +720,75 @@ def looks_like_job_link(text: str, href: str) -> bool:
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+# Deliberately specific: a match here green-lights treating "zero jobs" as an
+# authoritative result (existing jobs may be pruned), so generic phrases like
+# "no results found" or a bare "check back" are excluded -- they also appear on
+# unrendered search-UI shells.
+_EXPLICIT_NO_OPENINGS = (
+    "no current openings",
+    "no current job openings",
+    "no open positions",
+    "no open positions at this time",
+    "no openings at this time",
+    "no job openings at this time",
+    "no positions available at this time",
+    "there are currently no openings",
+    "there are no open positions",
+    "we do not have any openings",
+    "we don't have any openings",
+    "no vacancies at this time",
+    "0 jobs found",
+    "0 open positions",
+)
+
+_SPA_SHELL_MARKERS = (
+    "${",  # unrendered JS template interpolation (e.g. Phenom "${pageStateData...}")
+    "{{",  # unrendered mustache/angular/vue interpolation
+    "pagestatedata",  # Phenom People client bundle
+    "please enable javascript",
+    "enable javascript to run this app",
+    "you need to enable javascript",
+    "we're sorry but",  # common Vue "doesn't work properly without JavaScript" shell
+    "doesn't work properly without javascript",
+    "this application requires javascript",
+)
+
+_EMPTY_FRAMEWORK_ROOT = re.compile(
+    r'<div[^>]+id=["\'](?:root|app|__next|main|react-root|ember-app)["\'][^>]*>\s*</div>',
+    re.IGNORECASE,
+)
+
+
+def page_states_no_openings(visible_text: str) -> bool:
+    """True when the rendered page explicitly says there are no openings.
+
+    That IS an authoritative zero -- the page rendered and told us so.
+    """
+    low = clean_text(visible_text or "").lower()
+    return any(phrase in low for phrase in _EXPLICIT_NO_OPENINGS)
+
+
+def looks_like_unrendered_spa(html: str, visible_text: str = "") -> bool:
+    """Heuristic: the document loaded but its client framework never rendered.
+
+    Only consulted when zero listings were parsed AND the page did not state an
+    explicit "no openings" message, so a genuine empty-but-rendered careers page
+    is still treated as an authoritative zero.
+    """
+    low = (html or "").lower()
+    if any(marker in low for marker in _SPA_SHELL_MARKERS):
+        return True
+    script_count = low.count("<script")
+    stripped = clean_text(re.sub(r"<[^>]+>", " ", low))
+    if _EMPTY_FRAMEWORK_ROOT.search(low) and script_count >= 2:
+        return True
+    # Almost no human-visible text but a heavy script payload.
+    text_sample = visible_text if visible_text else stripped
+    if script_count >= 3 and len(clean_text(text_sample)) < 400:
+        return True
+    return False
 
 
 def dedupe_jobs(jobs: list[JobRecord]) -> list[JobRecord]:

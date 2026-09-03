@@ -110,6 +110,37 @@ class CollectionRetentionTests(unittest.TestCase):
         failed = next(item for item in summary["collection_results"] if item["companyName"] == "Alpha Bank")
         self.assertEqual(failed["dataDisposition"], "retained")
 
+    def test_non_authoritative_failure_retains_last_known_jobs(self) -> None:
+        from job_tools import CollectionNotAuthoritative
+
+        self.write_existing()
+        summary = self.run_collection({
+            "company-a": CollectionNotAuthoritative(
+                "browser render unavailable and static fallback found no job listings"
+            ),
+            "company-b": [self.job("new-b", "company-b", "Beta Bank", "Senior Cloud Engineer")],
+        })
+        # A blocked / incomplete refresh must never prune existing jobs.
+        self.assertEqual(self.loaded_ids(), {"old-a", "new-b"})
+        self.assertEqual(summary["outcome_counts"]["failed"], 1)
+        retained = next(item for item in summary["collection_results"] if item["companyName"] == "Alpha Bank")
+        self.assertEqual(retained["dataDisposition"], "retained")
+
+    def test_partial_discovery_is_added_while_existing_is_retained(self) -> None:
+        from job_tools import CollectionNotAuthoritative
+
+        self.write_existing()
+        partial = self.job("partial-a", "company-a", "Alpha Bank", "Incident Response Analyst")
+        summary = self.run_collection({
+            "company-a": CollectionNotAuthoritative("browser failed; HTTP fallback incomplete", partial_jobs=[partial]),
+            "company-b": [self.job("new-b", "company-b", "Beta Bank", "Senior Cloud Engineer")],
+        })
+        # Prior job kept AND the partial find added; nothing pruned.
+        self.assertEqual(self.loaded_ids(), {"old-a", "partial-a", "new-b"})
+        self.assertEqual(summary["outcome_counts"].get("partial"), 1)
+        alpha = next(item for item in summary["collection_results"] if item["companyName"] == "Alpha Bank")
+        self.assertEqual(alpha["dataDisposition"], "retained")
+
     def test_timeout_retains_last_known_jobs(self) -> None:
         self.write_existing()
         summary = self.run_collection({

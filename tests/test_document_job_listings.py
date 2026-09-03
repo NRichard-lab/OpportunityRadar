@@ -76,6 +76,10 @@ class DocumentJobListingTests(unittest.TestCase):
         self.assertEqual(collector.rejected_count, 0)
 
     def test_complete_flow_falls_back_to_http_deduplicates_and_persists(self) -> None:
+        # A browser failure makes the run non-authoritative: the HTTP fallback's
+        # finds are still captured, deduplicated and persisted (additively), but
+        # the refresh is reported as incomplete/partial and counted as an error
+        # so a later authoritative run -- not this one -- decides removals.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             jobs_json = root / "jobs.json"
@@ -104,7 +108,7 @@ class DocumentJobListingTests(unittest.TestCase):
             )
             self.assertEqual(
                 (summary["jobs_found"], summary["jobs_saved"], summary["errors"]),
-                (3, 3, 0),
+                (3, 3, 1),
                 (summary, diagnostics),
             )
             self.assertEqual((len(payload), len({job["sourceUrl"] for job in payload})), (3, 3))
@@ -115,8 +119,9 @@ class DocumentJobListingTests(unittest.TestCase):
                     diagnostics[0]["validJobsSaved"],
                     diagnostics[0]["status"],
                     diagnostics[0]["outcome"],
+                    diagnostics[0]["dataDisposition"],
                 ),
-                ("GenericCollector", 3, "Jobs Collected", "success"),
+                ("GenericCollector", 3, "Collector Failed", "partial", "retained"),
             )
 
             repository = OpportunityRepository(root / "radar.db", initialize=True)

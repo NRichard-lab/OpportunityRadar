@@ -28,6 +28,23 @@ from job_platforms import detect_job_platform
 logger = logging.getLogger(__name__)
 
 
+class CollectionNotAuthoritative(RuntimeError):
+    """A collector could not obtain an authoritative view of a company's jobs.
+
+    Raised when a refresh is blocked, incomplete, or uncertain -- e.g. the
+    browser could not render the board, an SPA shell loaded but nothing rendered,
+    or the static fallback is inherently incomplete. ``run_collection_group``
+    treats it as a collector failure: the company's existing jobs are retained
+    (never pruned as a confirmed zero), the run is reported as incomplete, and
+    any ``partial_jobs`` are merged additively without making the result
+    authoritative.
+    """
+
+    def __init__(self, message: str, *, partial_jobs: "list | None" = None) -> None:
+        super().__init__(message)
+        self.partial_jobs = list(partial_jobs or [])
+
+
 JOB_COLUMNS = [
     "id",
     "companyId",
@@ -338,15 +355,33 @@ def run_collection_group(
                 results.append((company, jobs, False, diagnostic, list(getattr(collector, "rejected_candidates", []))))
             except Exception as exc:
                 logger.exception("Collector failed.")
-                outcome = "timed-out" if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold() else "failed"
+                # A CollectionNotAuthoritative may carry partial finds. They are
+                # merged additively (existing jobs are still retained because the
+                # company is NOT counted as successful), and the run is reported
+                # as incomplete rather than as a confirmed zero.
+                partial_jobs = list(getattr(exc, "partial_jobs", []) or [])
+                try:
+                    partial_jobs = [enrich_job_record(job) for job in partial_jobs]
+                    partial_jobs = [job for job in partial_jobs if is_valid_job_record(job)]
+                except Exception:
+                    # Never let a malformed partial break the run; dropping them
+                    # still means "retain existing jobs", the safe outcome.
+                    logger.exception("Discarding partial jobs from a non-authoritative result.")
+                    partial_jobs = []
+                if partial_jobs:
+                    outcome = "partial"
+                elif isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold():
+                    outcome = "timed-out"
+                else:
+                    outcome = "failed"
                 diagnostic = build_diagnostic(
-                    company, collector, collector.candidate_count, 0, safe_collection_error(exc), started,
-                    outcome=outcome,
+                    company, collector, collector.candidate_count, len(partial_jobs),
+                    safe_collection_error(exc), started, outcome=outcome,
                 )
                 update_progress_diagnostic(diagnostic, total_attempted, completed_counter, overall_started)
                 log_collection_progress(diagnostic, worker_type, total_attempted, completed_counter["count"])
                 log_diagnostic(diagnostic)
-                results.append((company, [], True, diagnostic, list(getattr(collector, "rejected_candidates", []))))
+                results.append((company, partial_jobs, True, diagnostic, list(getattr(collector, "rejected_candidates", []))))
             if progress_callback:
                 progress_callback(completed_counter["count"], total_attempted, str(company.get("Company Name") or ""))
     return results

@@ -12,8 +12,31 @@ from backend.operation_gate import MutationGate
 from backend.repository import OpportunityRepository
 
 
+class _FrozenDateTime(datetime):
+    """``datetime`` whose ``now()`` is fixed to a deterministic instant.
+
+    ``EmailService.save_settings`` seeds ``last_scheduled_date`` with the real
+    wall-clock date when a digest is enabled *after* its send time on a scheduled
+    day today (so it does not fire retroactively). That is correct production
+    behaviour, but it makes this test's hard-coded ``due_time`` flaky: it fails
+    only when the real date/time happens to land on the same scheduled slot
+    (e.g. a Wednesday after 07:00 America/Denver on 2026-09-02). Freezing "now"
+    to a non-scheduled instant (Tuesday) removes that coupling without changing
+    what the test exercises.
+    """
+
+    _FIXED_UTC = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: D401 - matches datetime.now signature
+        return cls._FIXED_UTC.astimezone(tz) if tz is not None else cls._FIXED_UTC.replace(tzinfo=None)
+
+
 class EmailSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
+        clock_patch = patch("backend.email_service.datetime", _FrozenDateTime)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.repository = OpportunityRepository(
             Path(self.temporary.name) / "opportunity_radar.db", initialize=True

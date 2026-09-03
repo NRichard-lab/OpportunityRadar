@@ -5,9 +5,11 @@ import functools
 import ipaddress
 import importlib.metadata
 import json
+import logging
 import os
 import platform
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -48,6 +50,8 @@ _NAT64_NETWORKS = (
 )
 
 Resolver = Callable[..., list[tuple[Any, ...]]]
+
+logger = logging.getLogger(__name__)
 
 
 class OutboundSecurityError(ValueError):
@@ -634,6 +638,12 @@ def install_playwright_url_guard(
 
 
 _browser_launch_lease = threading.Lock()
+# Tracks the single browser currently permitted by ``_browser_launch_lease`` so a
+# later launch can distinguish a genuinely busy owner from a lease that leaked
+# because its Chromium was killed (for example by the OOM killer) before the
+# owning thread released it.
+_browser_lease_state_lock = threading.Lock()
+_current_leased_browser: "_LeasedBrowser | None" = None
 _browser_boundary_lock = threading.Lock()
 _browser_proxy_process: subprocess.Popen[bytes] | None = None
 _browser_boundary_directory: Path | None = None
@@ -701,8 +711,7 @@ def _launch_protected_playwright_chromium(playwright: Any, supplied: Mapping[str
 
     runtime = validate_browser_runtime_boundary()
     _require_browser_proxy_ready(runtime)
-    if not _browser_launch_lease.acquire(blocking=False):
-        raise BrowserEgressConfigurationError("Only one Chromium process may run at a time.")
+    _acquire_browser_launch_lease(runtime)
     try:
         launch_options.update({
             "args": [*arguments, *_PROTECTED_BROWSER_ARGUMENTS],
@@ -712,36 +721,505 @@ def _launch_protected_playwright_chromium(playwright: Any, supplied: Mapping[str
         })
         browser = playwright.chromium.launch(**launch_options)
     except BaseException:
-        _browser_launch_lease.release()
+        _release_browser_launch_lease_locked()
         raise
-    return _LeasedBrowser(browser, _browser_launch_lease)
+    leased = _LeasedBrowser(browser, _browser_launch_lease, runtime)
+    with _browser_lease_state_lock:
+        globals()["_current_leased_browser"] = leased
+    return leased
+
+
+def _positive_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _browser_lease_wait_seconds() -> float:
+    """Seconds a new browser launch waits for a busy lease before failing/reclaiming."""
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_LEASE_WAIT_SECONDS", 30.0)
+
+
+def _browser_chromium_grace_seconds() -> float:
+    """Seconds ``close()`` may run before the guard force-kills the Chromium tree."""
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_CLOSE_GRACE_SECONDS", 12.0)
+
+
+def _browser_driver_grace_seconds() -> float:
+    """Extra seconds after the Chromium tree is gone before the guard kills the
+    wedged Playwright node driver so a blocked ``close()`` can return."""
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_DRIVER_GRACE_SECONDS", 6.0)
+
+
+def _browser_kill_grace_seconds() -> float:
+    """Seconds to wait after each escalation signal (SIGTERM, then SIGKILL)."""
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_KILL_GRACE_SECONDS", 5.0)
+
+
+def _release_browser_launch_lease_locked() -> None:
+    """Release the launch lease held by the current thread and clear the holder."""
+    with _browser_lease_state_lock:
+        globals()["_current_leased_browser"] = None
+        try:
+            _browser_launch_lease.release()
+        except RuntimeError:
+            pass
+
+
+def _acquire_browser_launch_lease(runtime: "BrowserRuntimeBoundary") -> None:
+    """Take the one-Chromium launch lease.
+
+    Order of preference:
+      1. Acquire the lease within the configured bounded wait.
+      2. Otherwise reclaim it *only* if the previous browser's recorded process
+         tree is provably gone (every recorded ``(pid, start_time)`` is dead) and
+         no approved Chromium process is running anywhere -- so admitting a
+         browser still honours "one Chromium at a time".
+      3. Otherwise fail closed with the historical error.
+
+    A bounded wait alone is intentionally NOT the fix: it is paired with the
+    positive process-tree-termination check here and with the close-path guard on
+    :class:`_LeasedBrowser` (which also kills a wedged Playwright driver) so a
+    hung or OOM-killed browser cannot strand the lease for the worker's life.
+    """
+    wait_seconds = _browser_lease_wait_seconds()
+    if wait_seconds <= 0:
+        acquired = _browser_launch_lease.acquire(blocking=False)
+    else:
+        acquired = _browser_launch_lease.acquire(timeout=wait_seconds)
+    if acquired:
+        return
+    if _try_reclaim_leaked_browser_lease(runtime) and _browser_launch_lease.acquire(
+        timeout=max(1.0, wait_seconds)
+    ):
+        return
+    raise BrowserEgressConfigurationError("Only one Chromium process may run at a time.")
+
+
+def _try_reclaim_leaked_browser_lease(runtime: "BrowserRuntimeBoundary") -> bool:
+    """Return True (and free the lease) only if the previous browser is provably gone.
+
+    Never force-releases based on lease age, owning-thread liveness, or
+    ``browser.is_connected()``. Reclaim requires: every recorded root process of
+    the previous browser is dead *by PID + start-time identity*, AND no approved
+    Chromium process exists anywhere in this container.
+    """
+    with _browser_lease_state_lock:
+        holder = globals().get("_current_leased_browser")
+        recorded = dict(getattr(holder, "_procs", {})) if holder is not None else {}
+    if holder is None or not recorded:
+        return False
+    if _live_recorded_procs(recorded):
+        return False
+    if _any_approved_chromium_alive(runtime.chromium_executable):
+        return False
+    logger.warning(
+        "Reclaiming a leaked Chromium launch lease: the previous browser process "
+        "tree (%s) is fully terminated (PID + start-time verified) and no approved "
+        "Chromium process is running. The one-browser boundary is preserved.",
+        sorted(recorded),
+    )
+    holder._release()
+    return True
+
+
+# ``SIGKILL`` is absent on Windows (dev/test hosts); fall back so attribute access
+# never raises. The production browser boundary only runs on Linux, where both are
+# real.
+_SIGTERM = getattr(signal, "SIGTERM", 15)
+_SIGKILL = getattr(signal, "SIGKILL", _SIGTERM)
+
+
+def _is_proc_filesystem_available() -> bool:
+    return platform.system() == "Linux" and os.path.isdir("/proc")
+
+
+def _iter_proc_pids() -> list[int]:
+    try:
+        return [int(entry) for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return []
+
+
+def _read_proc_stat(pid: int) -> tuple[int, int, str] | None:
+    """Return ``(ppid, starttime_ticks, state)`` from ``/proc/<pid>/stat`` or None.
+
+    ``comm`` (field 2) may itself contain spaces and parentheses, so fields are
+    parsed after the final ``)``.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    close_paren = data.rfind(b")")
+    if close_paren == -1:
+        return None
+    rest = data[close_paren + 1 :].split()
+    # rest[0] = state; rest[1] = ppid; ... rest[19] = starttime
+    if len(rest) < 20:
+        return None
+    try:
+        return int(rest[1]), int(rest[19]), rest[0].decode("ascii", "replace")
+    except ValueError:
+        return None
+
+
+def _proc_start_time(pid: int) -> int | None:
+    stat = _read_proc_stat(pid)
+    return None if stat is None else stat[1]
+
+
+def _proc_alive(pid: int, start_time: int) -> bool:
+    """True iff ``pid`` is a live, same-identity, *non-terminated* process.
+
+    A zombie (state ``Z``) or dead (``X``/``x``) task has terminated -- it just
+    has not been reaped by its parent yet -- so it must count as gone, otherwise
+    "the process tree terminated" could never become true when orphaned tasks are
+    reparented to a container without an ``init`` reaper.
+    """
+    stat = _read_proc_stat(pid)
+    if stat is None:
+        return False
+    _ppid, current_start, state = stat
+    if current_start != start_time:
+        return False
+    return state not in {"Z", "X", "x"}
+
+
+def _live_recorded_procs(recorded: Mapping[int, int]) -> set[int]:
+    return {pid for pid, start_time in recorded.items() if _proc_alive(pid, start_time)}
+
+
+def _proc_is_approved_chromium(pid: int, executable_real: str, revision_marker: str) -> bool:
+    try:
+        if os.path.realpath(f"/proc/{pid}/exe") == executable_real:
+            return True
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return (bool(executable_real) and executable_real in cmdline) or (revision_marker in cmdline)
+
+
+def _descendant_pids(root_pids: set[int]) -> set[int]:
+    """Live PIDs whose parent chain reaches one of ``root_pids`` (roots included)."""
+    parents: dict[int, int] = {}
+    for pid in _iter_proc_pids():
+        stat = _read_proc_stat(pid)
+        if stat is not None:
+            parents[pid] = stat[0]
+    result = {pid for pid in root_pids if pid in parents}
+    result |= set(root_pids)
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid in parents.items():
+            if pid not in result and ppid in result:
+                result.add(pid)
+                changed = True
+    return result
+
+
+def _capture_browser_procs(chromium_executable: str) -> dict[int, int]:
+    """``pid -> start_time`` for the approved-Chromium tree launched by THIS process.
+
+    Restricted to approved-Chromium processes that are descendants of the current
+    process, so cleanup can never target an unrelated Chromium. Empty off Linux.
+    """
+    if not _is_proc_filesystem_available():
+        return {}
+    try:
+        executable_real = os.path.realpath(chromium_executable)
+    except OSError:
+        executable_real = str(chromium_executable)
+    revision_marker = f"chromium-{BROWSER_CHROMIUM_REVISION}"
+    my_pid = os.getpid()
+    procs: dict[int, int] = {}
+    for pid in _descendant_pids({my_pid}):
+        if pid == my_pid:
+            continue
+        if _proc_is_approved_chromium(pid, executable_real, revision_marker):
+            start_time = _proc_start_time(pid)
+            if start_time is not None:
+                procs[pid] = start_time
+    return procs
+
+
+def _find_playwright_driver_proc() -> tuple[int, int] | None:
+    """``(pid, start_time)`` of the node Playwright driver child of this process."""
+    if not _is_proc_filesystem_available():
+        return None
+    my_pid = os.getpid()
+    for pid in _descendant_pids({my_pid}):
+        if pid == my_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace").lower()
+        except OSError:
+            continue
+        if "playwright" in cmdline and ("cli.js" in cmdline or "run-driver" in cmdline or "/driver/node" in cmdline):
+            start_time = _proc_start_time(pid)
+            if start_time is not None:
+                return pid, start_time
+    return None
+
+
+def _any_approved_chromium_alive(chromium_executable: str) -> bool:
+    """Read-only check: is any approved Chromium process running in this container."""
+    if not _is_proc_filesystem_available():
+        return False
+    try:
+        executable_real = os.path.realpath(chromium_executable)
+    except OSError:
+        executable_real = str(chromium_executable)
+    revision_marker = f"chromium-{BROWSER_CHROMIUM_REVISION}"
+    for pid in _iter_proc_pids():
+        if _proc_is_approved_chromium(pid, executable_real, revision_marker):
+            return True
+    return False
+
+
+def _signal_pids(pids: Iterable[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            continue
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _live_tree(recorded: Mapping[int, int]) -> set[int]:
+    """PIDs to signal: descendants of still-alive recorded roots, plus the roots.
+
+    Only computed while at least one recorded root is still that exact process,
+    so this can never expand to an unrelated process tree.
+    """
+    live_roots = _live_recorded_procs(recorded)
+    if not live_roots:
+        return set()
+    tree = {pid for pid in _descendant_pids(live_roots) if pid != os.getpid()}
+    return tree | live_roots
+
+
+def _reap_browser_process_tree(recorded: Mapping[int, int]) -> bool:
+    """Bounded, identity-checked teardown of the recorded browser tree.
+
+    Returns True iff every recorded root process is confirmed gone. Signal-only,
+    safe from any thread. On a host without ``/proc`` it returns False so the
+    caller fails closed rather than assuming termination.
+    """
+    if not recorded:
+        return True
+    if not _is_proc_filesystem_available():
+        return False
+    recorded = dict(recorded)
+
+    def roots_gone() -> bool:
+        return not _live_recorded_procs(recorded)
+
+    if _wait_until(roots_gone, _browser_kill_grace_seconds()):
+        return True
+    term_targets = _live_tree(recorded)
+    if term_targets:
+        logger.warning("Browser tree %s alive after close(); sending SIGTERM.", sorted(term_targets))
+        _signal_pids(term_targets, _SIGTERM)
+    if _wait_until(roots_gone, _browser_kill_grace_seconds()):
+        return True
+    kill_targets = _live_tree(recorded)
+    if kill_targets:
+        logger.warning("Browser tree %s survived SIGTERM; sending SIGKILL.", sorted(kill_targets))
+        _signal_pids(kill_targets, _SIGKILL)
+    return _wait_until(roots_gone, _browser_kill_grace_seconds())
+
+
+class _CloseGuard:
+    """Bounds ``_LeasedBrowser.close()`` without touching Playwright objects.
+
+    A dedicated thread per close: it only sends OS signals, so it never violates
+    Playwright's single-thread ownership rule. Escalation:
+
+      1. If ``close()`` has not returned after ``chromium_grace`` -> SIGKILL the
+         recorded Chromium process tree.
+      2. If ``close()`` is *still* blocked ``driver_grace`` after that (Chromium
+         is gone but the node Playwright driver is wedged) -> SIGKILL the driver
+         process, which makes the owning thread's blocked pipe read return.
+
+    ``finish()`` is called by ``close()`` and joins this thread, so the guard is
+    always fully wound down before the lease can be released / the next browser
+    admitted.
+    """
+
+    def __init__(
+        self,
+        recorded_procs: Mapping[int, int],
+        driver_proc: tuple[int, int] | None,
+        chromium_grace: float,
+        driver_grace: float,
+    ) -> None:
+        self._procs = dict(recorded_procs)
+        self._driver_proc = driver_proc
+        self._chromium_grace = chromium_grace
+        self._driver_grace = driver_grace
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.killed_chromium = False
+        self.killed_driver = False
+
+    def start(self) -> None:
+        if not self._procs or not _is_proc_filesystem_available():
+            return
+        self._thread = threading.Thread(target=self._run, name="browser-close-guard", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        if self._done.wait(self._chromium_grace):
+            return
+        targets = _live_tree(self._procs)
+        if targets:
+            logger.warning("Close guard: close() overdue; SIGKILL Chromium tree %s.", sorted(targets))
+            _signal_pids(targets, _SIGKILL)
+            self.killed_chromium = True
+        if self._done.wait(self._driver_grace):
+            return
+        if self._driver_proc is not None:
+            driver_pid, driver_start = self._driver_proc
+            if _proc_alive(driver_pid, driver_start):
+                logger.error(
+                    "Close guard: close() still blocked after the Chromium tree exited; "
+                    "the Playwright driver (pid=%s) is wedged -- sending SIGKILL to unblock it.",
+                    driver_pid,
+                )
+                _signal_pids({driver_pid}, _SIGKILL)
+                self.killed_driver = True
+
+    def finish(self, timeout: float) -> bool:
+        self._done.set()
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=max(0.1, timeout))
+        return not thread.is_alive()
 
 
 class _LeasedBrowser:
-    def __init__(self, browser: Any, lease: threading.Lock) -> None:
+    def __init__(
+        self, browser: Any, lease: threading.Lock, runtime: "BrowserRuntimeBoundary | None" = None
+    ) -> None:
         self._browser = browser
         self._lease = lease
+        self._runtime = runtime
         self._release_lock = threading.Lock()
         self._released = False
+        self._chromium_grace = _browser_chromium_grace_seconds()
+        self._driver_grace = _browser_driver_grace_seconds()
+        # pid -> start_time for the Chromium tree this launch created. Only these
+        # are ever signalled, only their identity-verified exit permits reclaim.
+        self._procs: dict[int, int] = {}
+        self._driver_proc: tuple[int, int] | None = None
+        self._identify_process_tree()
         on = getattr(browser, "on", None)
         if callable(on):
             on("disconnected", self._on_disconnected)
+
+    # Back-compat / introspection helpers.
+    @property
+    def _pids(self) -> set[int]:
+        return set(self._procs)
+
+    @property
+    def _process_confirmed(self) -> bool:
+        return bool(self._procs)
+
+    def _identify_process_tree(self) -> None:
+        executable = getattr(self._runtime, "chromium_executable", "") if self._runtime else ""
+        if not executable:
+            return
+        try:
+            self._procs = _capture_browser_procs(executable)
+            self._driver_proc = _find_playwright_driver_proc()
+        except Exception:  # pragma: no cover - defensive
+            self._procs = {}
 
     def _on_disconnected(self, *_args: Any) -> None:
         self._release()
 
     def _release(self) -> None:
+        """Release the lease, but only if THIS browser is still the active holder.
+
+        The ``_released`` flag makes this idempotent; the identity check stops a
+        late ``disconnected``/``close`` callback from a superseded browser from
+        releasing a lease that a newer browser now owns.
+        """
         with self._release_lock:
             if self._released:
                 return
             self._released = True
-            self._lease.release()
+        with _browser_lease_state_lock:
+            if globals().get("_current_leased_browser") is self:
+                globals()["_current_leased_browser"] = None
+                try:
+                    self._lease.release()
+                except RuntimeError:
+                    pass
 
     def close(self, *args: Any, **kwargs: Any) -> Any:
+        guard = _CloseGuard(
+            self._procs,
+            self._driver_proc,
+            self._chromium_grace,
+            self._driver_grace,
+        )
+        guard.start()
+        result: Any = None
+        close_error: BaseException | None = None
         try:
-            return self._browser.close(*args, **kwargs)
+            result = self._browser.close(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - a dead/hung browser is expected here
+            close_error = exc
+            logger.warning(
+                "Leased browser close() raised; proceeding to bounded process reap.",
+                exc_info=True,
+            )
         finally:
-            self._release()
+            guard_finished = guard.finish(
+                self._chromium_grace
+                + self._driver_grace
+                + 3 * _browser_kill_grace_seconds()
+                + 5.0
+            )
+            terminated = _reap_browser_process_tree(self._procs)
+            if terminated and guard_finished:
+                self._release()
+            else:
+                # Termination not proven -> fail closed: keep the lease held. A
+                # later launch reclaims it only once these exact processes die.
+                logger.critical(
+                    "Browser cleanup could not confirm process-tree termination "
+                    "(procs=%s guard_finished=%s close_error=%r). Holding the "
+                    "one-Chromium launch lease (fail-closed) until the recorded "
+                    "processes are gone.",
+                    sorted(self._procs),
+                    guard_finished,
+                    close_error,
+                )
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._browser, name)
