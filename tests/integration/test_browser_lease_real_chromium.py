@@ -166,3 +166,54 @@ def test_reap_reports_termination_truthfully(runtime, playwright):
     _wait_clean(runtime)
     # After a real close the recorded roots are gone; reap confirms termination.
     assert ob._reap_browser_process_tree(roots) is True
+
+
+def test_open_file_limit_preflight_is_enforced(runtime):
+    """The runtime boundary refuses a soft RLIMIT_NOFILE below the Chromium floor
+    and accepts one at or above it. Below the floor a heavier career page
+    exhausts descriptors mid-load and Chromium self-aborts ("Page crashed")."""
+    import resource
+
+    floor = ob.MINIMUM_BROWSER_OPEN_FILE_LIMIT
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    assert soft == resource.RLIM_INFINITY or soft >= floor, (
+        f"the production-equivalent container must grant >= {floor} open files; got {soft}"
+    )
+    try:
+        # A soft limit under the floor that also can't be raised back up must fail closed.
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+        with pytest.raises(ob.BrowserEgressConfigurationError):
+            ob._require_browser_open_file_headroom()
+        # A low soft limit under a high hard ceiling is lifted, not rejected.
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+        ob._require_browser_open_file_headroom()
+        lifted, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        assert lifted == resource.RLIM_INFINITY or lifted >= floor
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_content_heavy_page_renders_without_a_page_crash(runtime, playwright):
+    """A JS/content-heavy public page renders to a usable DOM through the full
+    protected path (netns wrapper + DNS-pinned proxy + URL guard) without the
+    renderer self-aborting. Regression for the intermittent "Page crashed"."""
+    leased = ob.launch_playwright_chromium(playwright, headless=True)
+    try:
+        context = leased.new_context()
+        ob.install_playwright_url_guard(context)
+        page = context.new_page()
+        crashed = {"v": False}
+        page.on("crash", lambda *_: crashed.__setitem__("v", True))
+        for _ in range(3):
+            ob.safe_page_goto(
+                page, "https://en.wikipedia.org/wiki/Bank",
+                wait_until="domcontentloaded", timeout=60000,
+            )
+            body_len = page.evaluate("() => document.body ? document.body.innerText.length : -1")
+            assert not crashed["v"], "renderer crashed on a heavy page"
+            assert isinstance(body_len, int) and body_len > 2000
+        context.close()
+    finally:
+        leased.close()
+        _reset_lease_state()
+        _wait_clean(runtime)

@@ -75,12 +75,34 @@ class ContainerArtifactTests(unittest.TestCase):
         self.assertIn("/dev/shm:rw,nosuid,nodev,size=256m", compose)
         self.assertNotIn("SYS_ADMIN", compose)
         self.assertIn("/srv/opportunity-radar", compose)
+        # A headless Chromium tree exhausts the default 1024 soft open-file limit
+        # on heavier pages and self-aborts ("Page crashed"); the backend raises it.
+        self.assertRegex(compose, r"ulimits:\s*\n\s*nofile:\s*\n\s*soft: 65535\s*\n\s*hard: 65535")
+        self.assertIn("pids_limit: 512", compose)
+        self.assertNotIn("pids_limit: 256", compose)
+
+    def test_smoke_backend_matches_production_runtime_ceilings(self) -> None:
+        smoke = (ROOT / "compose.smoke.yaml").read_text(encoding="utf-8")
+        self.assertRegex(smoke, r"nofile:\s*\n\s*soft: 65535\s*\n\s*hard: 65535")
+        self.assertIn("pids_limit: 512", smoke)
+        self.assertNotIn("pids_limit: 256", smoke)
 
     def test_browser_seccomp_profile_is_fail_closed_and_namespace_scoped(self) -> None:
         profile = json.loads(
             (ROOT / "docker" / "backend" / "seccomp_profile.json").read_text(encoding="utf-8")
         )
         self.assertEqual(profile["defaultAction"], "SCMP_ACT_ERRNO")
+        # clone3 must return ENOSYS (38), not the fail-closed default EPERM, so
+        # glibc pthread_create falls back to the argument-filtered clone() rules.
+        # Without this a Chromium worker thread fails to start and the renderer
+        # self-aborts mid-navigation (Playwright "Page crashed").
+        clone3_rules = [
+            rule for rule in profile["syscalls"] if "clone3" in rule.get("names", [])
+        ]
+        self.assertEqual(len(clone3_rules), 1)
+        self.assertEqual(clone3_rules[0]["action"], "SCMP_ACT_ERRNO")
+        self.assertEqual(clone3_rules[0]["errnoRet"], 38)
+        self.assertEqual(clone3_rules[0].get("args", []), [])
         unconditional_namespace_allows = [
             rule
             for rule in profile["syscalls"]

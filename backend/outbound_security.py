@@ -35,6 +35,13 @@ BROWSER_PLAYWRIGHT_VERSION = "1.62.0"
 BROWSER_CHROMIUM_REVISION = "1234"
 BROWSER_CHROMIUM_VERSION = "151.0.7922.34"
 BROWSER_PROXY_PORT = 17654
+# A headless Chromium tree run --disable-dev-shm-usage (Playwright's default)
+# backs every shared-memory region with a file descriptor, on top of the proxied
+# sockets and mojo pipes. The 1024 soft RLIMIT_NOFILE a container gets by default
+# is exhausted by heavier career pages: Chromium hits EMFILE and self-aborts
+# (SIGTRAP, surfaced as "Page crashed"). Refuse to launch below this floor so a
+# mis-sized deployment fails loudly here instead of as intermittent page crashes.
+MINIMUM_BROWSER_OPEN_FILE_LIMIT = 8192
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _CROSS_ORIGIN_SECRET_HEADERS = {
     "authorization",
@@ -1225,6 +1232,49 @@ class _LeasedBrowser:
         return getattr(self._browser, name)
 
 
+def _require_browser_open_file_headroom() -> None:
+    """Fail closed if the process file-descriptor ceiling is too low for Chromium.
+
+    A headless Chromium tree opens hundreds of descriptors (one per shared memory
+    region under ``--disable-dev-shm-usage``, plus proxied sockets and mojo
+    pipes). Below ``MINIMUM_BROWSER_OPEN_FILE_LIMIT`` a heavier page exhausts the
+    limit mid-load and Chromium self-aborts, which Playwright reports as
+    ``Page crashed``. Surfacing it here turns a mis-sized container into a clear
+    startup error instead of an intermittent, load-dependent crash.
+    """
+
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - POSIX only; boundary already requires Linux
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:  # pragma: no cover - getrlimit failure is unexpected
+        raise BrowserEgressConfigurationError(
+            "The browser runtime could not read its open-file limit."
+        ) from exc
+    if soft != resource.RLIM_INFINITY and soft < MINIMUM_BROWSER_OPEN_FILE_LIMIT:
+        # Try to lift the soft limit toward the hard ceiling before giving up so a
+        # host that grants a high hard limit but a low default soft limit still
+        # starts. Only the soft limit is adjustable without privilege.
+        target = MINIMUM_BROWSER_OPEN_FILE_LIMIT
+        if hard != resource.RLIM_INFINITY:
+            target = min(target, hard)
+        if target > soft:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+                soft = target
+            except (OSError, ValueError):
+                pass
+        if soft != resource.RLIM_INFINITY and soft < MINIMUM_BROWSER_OPEN_FILE_LIMIT:
+            raise BrowserEgressConfigurationError(
+                "The browser runtime needs a soft open-file limit (RLIMIT_NOFILE) of at "
+                f"least {MINIMUM_BROWSER_OPEN_FILE_LIMIT}; the current limit is {soft}. "
+                "Raise it on the container (compose 'ulimits.nofile') before enabling "
+                "browser jobs."
+            )
+
+
 @functools.lru_cache(maxsize=1)
 def validate_browser_runtime_boundary() -> BrowserRuntimeBoundary:
     """Fail closed unless the exact browser runtime and netns proxy are ready."""
@@ -1237,6 +1287,7 @@ def validate_browser_runtime_boundary() -> BrowserRuntimeBoundary:
         raise BrowserEgressConfigurationError("The protected browser boundary requires Linux.")
     if os.geteuid() == 0:
         raise BrowserEgressConfigurationError("The protected browser runtime must run as a non-root user.")
+    _require_browser_open_file_headroom()
     try:
         playwright_version = importlib.metadata.version("playwright")
     except importlib.metadata.PackageNotFoundError as exc:

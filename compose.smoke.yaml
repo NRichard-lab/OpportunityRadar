@@ -18,7 +18,15 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 256
+    # Mirror the production backend runtime ceilings so the smoke image is
+    # validated under the same resource envelope. Browser jobs are disabled here
+    # (APP_ENABLE_BROWSER_JOBS=false), so these only matter for parity, but the
+    # container-artifact tests assert prod and smoke stay in step.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    pids_limit: 512
     mem_limit: 768m
     environment:
       APP_ENV: development

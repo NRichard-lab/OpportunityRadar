@@ -128,6 +128,14 @@ change. Read at call time.
 `collectors/generic_collector.py` also sets `BROWSER_ACTION_TIMEOUT_MS = 60000` as
 the Playwright context default timeout (see "What the guard covers" above).
 
+> A separate failure mode — Chromium **`Page crashed`** on heavier career pages,
+> caused by the container's file-descriptor and fork ceilings being sized for an
+> idle service rather than a running headless browser — is diagnosed and fixed in
+> [`BROWSER_PAGE_CRASH.md`](BROWSER_PAGE_CRASH.md) (Release 3: `ulimits.nofile`,
+> seccomp `clone3` -> `ENOSYS`, `pids_limit` headroom, a fail-closed
+> `RLIMIT_NOFILE` preflight). Lease recovery already keeps those crashes
+> non-authoritative; Release 3 lets the pages actually render.
+
 ## Production memory limit
 
 `compose.production.yaml` raises the backend `mem_limit` from `768m` to `1536m`.

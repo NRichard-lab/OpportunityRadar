@@ -52,6 +52,17 @@
   "syscalls": [
     {
       "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38,
+      "args": [],
+      "comment": "Return ENOSYS, not the profile-default EPERM, so glibc >= 2.34 pthread_create falls back to the argument-filtered clone() rules below. A bare EPERM is not a fallback trigger: glibc propagates it and Chromium turns the failed worker-thread creation into an IMMEDIATE_CRASH() mid-navigation (SIGTRAP, surfaced by Playwright as 'Page crashed'). This mirrors the upstream Docker/Playwright default seccomp clone3 stanza and grants no new capability -- clone3 stays unavailable, only its error code changes.",
+      "includes": {},
+      "excludes": {}
+    },
+    {
+      "names": [
         "chroot"
       ],
       "action": "SCMP_ACT_ALLOW",

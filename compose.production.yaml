@@ -14,7 +14,23 @@ services:
     security_opt:
       - no-new-privileges:true
       - "seccomp:${OPPORTUNITY_RADAR_SECCOMP_PROFILE:-./docker/backend/seccomp_profile.json}"
-    pids_limit: 256
+    # A headless Chromium tree opens hundreds of file descriptors (one per shared
+    # memory region because Playwright runs it --disable-dev-shm-usage, plus the
+    # proxied sockets and mojo pipes). The 1024 soft RLIMIT_NOFILE that Docker
+    # hands a container is far too low: heavier career pages exhaust it mid-load,
+    # Chromium hits EMFILE and self-aborts (SIGTRAP -> Playwright "Page crashed").
+    # 65535 is the value Chromium and Playwright expect; it is a resource ceiling,
+    # not an isolation control, and every other restriction is unchanged.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    # One clean Chromium tree peaks near 175 tasks; 256 leaves almost no room for
+    # a second tree that has not finished reaping (discovery -> collection) or a
+    # slow lease release, and clone()/clone3() then fail with EAGAIN and Chromium
+    # aborts the same way. 512 is headroom for one tree plus transients while
+    # staying a tight fork-bomb bound for one Uvicorn worker + one browser.
+    pids_limit: 512
     cpus: "1.00"
     # The no-browser baseline is ~640 MiB; one headless Chromium tree adds
     # ~300-500 MiB, so 768 MiB caused the OOM killer to take Chromium mid-run
