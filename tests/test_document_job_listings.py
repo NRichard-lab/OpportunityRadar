@@ -193,6 +193,47 @@ class DocumentJobListingTests(unittest.TestCase):
         )
         self.assertTrue(all(job.rawData["structuredSource"] for job in jobs))
 
+    def test_current_openings_link_list_with_email_apply_is_collected(self) -> None:
+        # Small-employer pattern: a bare list of links (each to a PDF job
+        # description) under a "Current Openings" heading, apply by email.
+        html = """
+        <main><div class="content">
+          <p>*We only accept resumes for positions that we are actively recruiting.</p>
+          <h4>Current Openings</h4>
+          <p><em><a href="/wp-content/uploads/Branch-Manager-Main-Office.pdf">Branch Manager – Main Office Branch</a></em></p>
+          <p><em><a href="/wp-content/uploads/Teller-Pocomoke.pdf">Teller – Pocomoke City Branch</a></em></p>
+          <p><em><a href="/wp-content/uploads/Rotating-Teller-Ocean-Pines.pdf">Rotating Teller – Ocean Pines Branch</a></em></p>
+          <p>To apply, please forward your resume and cover letter to
+             <a href="mailto:HRops@example.com">HRops@example.com</a>.</p>
+          <p>First Shore Federal is proud to be an Equal Opportunity Employer.</p>
+        </div></main>
+        """
+        collector = GenericCollector(delay_seconds=0)
+        jobs = collector.parse_listing_html(self.company, BOARD_URL, BOARD_URL, html, "Job Board URL")
+        self.assertEqual(
+            [job.title for job in jobs],
+            [
+                "Branch Manager – Main Office Branch",
+                "Teller – Pocomoke City Branch",
+                "Rotating Teller – Ocean Pines Branch",
+            ],
+        )
+        self.assertTrue(all(job.sourceUrl.lower().endswith(".pdf") for job in jobs))
+        self.assertTrue(all(job.rawData["officialJobDocument"] for job in jobs))
+        self.assertTrue(all(job.rawData["sectionHeading"] == "Current Openings" for job in jobs))
+        self.assertEqual(collector.saved_count, 3)
+
+    def test_openings_heading_without_apply_signal_is_not_collected(self) -> None:
+        html = """
+        <main><div><h3>Open Positions</h3>
+          <p><a href="/about/team">Meet the team</a></p>
+          <p><a href="/branches">Our branches</a></p>
+        </div></main>
+        """
+        collector = GenericCollector(delay_seconds=0)
+        jobs = collector.parse_listing_html(self.company, BOARD_URL, BOARD_URL, html, "Job Board URL")
+        self.assertEqual(jobs, [])
+
     def test_static_available_positions_are_split_into_real_jobs(self) -> None:
         html = """
         <main><div class="wpb_wrapper">

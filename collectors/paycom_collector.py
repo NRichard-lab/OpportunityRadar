@@ -5,7 +5,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -20,10 +20,20 @@ PAYCOM_PAGE_SIZE = 50
 PAYCOM_MAX_PAGES = 20
 PAYCOM_MAX_POSTINGS = PAYCOM_PAGE_SIZE * PAYCOM_MAX_PAGES
 PAYCOM_HOST = "www.paycomonline.net"
+PAYCOM_HOSTS = ("www.paycomonline.net", "paycomonline.net")
 PAYCOM_BOARD_PATH = re.compile(
     r"^/v4/ats/web\.php/portal/(?P<tenant>[0-9A-Fa-f]{32})/career-page/?$",
     flags=re.IGNORECASE,
 )
+# Legacy Paycom career links still in the wild:
+#   https://[www.]paycomonline.net/v4/ats/web.php/jobs?clientkey=<32-hex tenant>&jpt=
+#   https://[www.]paycomonline.net/v4/ats/web.php/jobs/<32-hex tenant>
+# Both address the same tenant as the modern /portal/<tenant>/career-page URL.
+PAYCOM_LEGACY_PATH = re.compile(
+    r"^/v4/ats/web\.php/jobs(?:/(?P<tenant>[0-9A-Fa-f]{32}))?/?$",
+    flags=re.IGNORECASE,
+)
+PAYCOM_TENANT = re.compile(r"^[0-9A-Fa-f]{32}$")
 PAYCOM_CONFIG = re.compile(
     r"var\s+configsFromHost\s*=\s*(\{.*?\});\s*var\s+Mountable",
     flags=re.DOTALL,
@@ -225,15 +235,30 @@ class PaycomCollector(BaseCollector):
 def normalize_paycom_board_url(board_url: str) -> str:
     parsed = urlsplit(str(board_url or "").strip())
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or host != PAYCOM_HOST:
-        raise ValueError("Paycom collector requires an HTTPS www.paycomonline.net board URL")
-    match = PAYCOM_BOARD_PATH.fullmatch(parsed.path)
-    if not match:
-        raise ValueError("Paycom collector requires a career-page URL with a tenant key")
+    if parsed.scheme != "https" or host not in PAYCOM_HOSTS:
+        raise ValueError("Paycom collector requires an HTTPS paycomonline.net board URL")
     if parsed.username is not None or parsed.password is not None or parsed.port not in {None, 443}:
         raise ValueError("Paycom board URL contains unsupported authority components")
-    path = f"/v4/ats/web.php/portal/{match.group('tenant')}/career-page"
+
+    tenant = ""
+    modern = PAYCOM_BOARD_PATH.fullmatch(parsed.path)
+    if modern:
+        tenant = modern.group("tenant")
+    else:
+        legacy = PAYCOM_LEGACY_PATH.fullmatch(parsed.path)
+        if legacy:
+            tenant = legacy.group("tenant") or _paycom_clientkey(parsed.query)
+    if not tenant or not PAYCOM_TENANT.fullmatch(tenant):
+        raise ValueError("Paycom collector requires a career-page or /jobs URL with a 32-character tenant key")
+    path = f"/v4/ats/web.php/portal/{tenant.lower()}/career-page"
     return urlunsplit(("https", PAYCOM_HOST, path, "", ""))
+
+
+def _paycom_clientkey(query: str) -> str:
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key.lower() in {"clientkey", "clientkeys", "ck"} and PAYCOM_TENANT.fullmatch(value.strip()):
+            return value.strip()
+    return ""
 
 
 def parse_paycom_bootstrap(html: str) -> tuple[str, str]:

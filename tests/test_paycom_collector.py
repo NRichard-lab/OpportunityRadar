@@ -177,6 +177,22 @@ class PaycomCollectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported API origin"):
             parse_paycom_bootstrap(poisoned)
 
+    def test_legacy_clientkey_urls_are_normalised_to_the_portal_url(self) -> None:
+        tenant = "e426e81a21036f064e1806295bd2db4a"
+        for legacy in (
+            f"https://paycomonline.net/v4/ats/web.php/jobs?clientkey={tenant.upper()}&jpt=",
+            f"https://www.paycomonline.net/v4/ats/web.php/jobs?clientkey={tenant}",
+            f"https://www.paycomonline.net/v4/ats/web.php/jobs/{tenant.upper()}",
+        ):
+            self.assertEqual(normalize_paycom_board_url(legacy), BOARD_URL)
+        for bad in (
+            f"http://www.paycomonline.net/v4/ats/web.php/jobs?clientkey={tenant}",
+            "https://www.paycomonline.net/v4/ats/web.php/jobs?clientkey=tooshort",
+            "https://www.paycomonline.net/v4/ats/web.php/jobs",
+        ):
+            with self.assertRaises(ValueError):
+                normalize_paycom_board_url(bad)
+
     def test_complete_flow_persists_deduplicated_jobs_and_diagnostics(self) -> None:
         pages = {
             0: {"jobPostingPreviewsCount": 4, "jobPostingPreviews": self.records[:2]},

@@ -314,6 +314,7 @@ class GenericCollector(BaseCollector):
         company_id = str(company.get("Company ID") or stable_company_id(company))
         for section_heading in static_openings_headings(soup):
             heading_name = section_heading.name
+            before = len(jobs)
             for title_heading, body_nodes in static_posting_groups(section_heading, heading_name):
                 raw_title = normalize_job_title(title_heading.get_text(" ", strip=True))
                 title, location = split_static_title_location(raw_title)
@@ -362,8 +363,66 @@ class GenericCollector(BaseCollector):
                         },
                     )
                 )
+            if len(jobs) == before:
+                # No <hN>-structured postings under this heading. Many small
+                # employers instead publish a bare list of links (often to a PDF
+                # job description) with an email/"to apply" instruction.
+                jobs.extend(
+                    self.extract_static_openings_link_rows(company, page_url, section_heading, source_type)
+                )
             if jobs:
                 break
+        return jobs
+
+    def extract_static_openings_link_rows(
+        self,
+        company: dict[str, Any],
+        page_url: str,
+        section_heading: Tag,
+        source_type: str,
+    ) -> list[JobRecord]:
+        rows, section_text = static_openings_link_rows(section_heading)
+        if not rows or not section_has_apply_signal(section_text):
+            return []
+        company_id = str(company.get("Company ID") or stable_company_id(company))
+        jobs: list[JobRecord] = []
+        seen: set[str] = set()
+        for anchor_text, href in rows:
+            raw_title = normalize_job_title(anchor_text)
+            title, location = split_static_title_location(raw_title)
+            title = title or raw_title
+            destination = urljoin(page_url, href) if href else static_posting_url(page_url, raw_title)
+            self.record_candidate(title, destination)
+            if not is_valid_job_title(title) or destination in seen:
+                self.reject_candidate(
+                    title, rejection_reason(title), destination,
+                    surrounding_text=section_text[:400], company=company, job_board_url=page_url,
+                )
+                continue
+            is_document = is_job_document_url(destination)
+            seen.add(destination)
+            self.save_candidate(title, destination)
+            jobs.append(
+                JobRecord(
+                    id=make_job_id(company, title, destination),
+                    companyId=company_id,
+                    companyName=str(company.get("Company Name") or ""),
+                    title=title,
+                    location=location,
+                    sourceUrl=destination,
+                    jobPlatform=str(company.get("Job Platform") or "Company Careers Site"),
+                    description=f"Listed under “{clean_text(section_heading.get_text(' ', strip=True))}” on the official careers page.",
+                    descriptionSnippet="",
+                    collectedAt=datetime.now().astimezone().replace(microsecond=0).isoformat(),
+                    rawData={
+                        "collector": self.__class__.__name__,
+                        "sourceType": source_type,
+                        "officialCareersPageListing": True,
+                        "officialJobDocument": is_document,
+                        "sectionHeading": clean_text(section_heading.get_text(" ", strip=True)),
+                    },
+                )
+            )
         return jobs
 
     def fetch_detail_page(self, href: str) -> dict[str, str]:
@@ -480,6 +539,54 @@ def static_openings_headings(soup: BeautifulSoup) -> list[Tag]:
         if isinstance(heading, Tag) and pattern.fullmatch(clean_text(heading.get_text(" ", strip=True))):
             matches.append(heading)
     return matches
+
+
+_HEADING_RANK = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+_APPLY_SIGNALS = (
+    "to apply",
+    "how to apply",
+    "forward your resume",
+    "submit your resume",
+    "send your resume",
+    "email your resume",
+    "send us your resume",
+    "apply in person",
+    "apply now",
+    "apply online",
+    "application",
+    "resume and cover letter",
+    "mailto:",
+    "we are hiring",
+    "now hiring",
+    "career opportunit",
+)
+
+
+def section_has_apply_signal(section_text: str) -> bool:
+    low = clean_text(section_text or "").casefold()
+    return any(signal in low for signal in _APPLY_SIGNALS)
+
+
+def static_openings_link_rows(section_heading: Tag) -> tuple[list[tuple[str, str]], str]:
+    """Anchor ``(text, href)`` rows that follow an openings heading, until the next
+    same-or-higher heading, plus the collected text for an apply-signal check."""
+
+    rank = _HEADING_RANK.get(str(section_heading.name or "").lower(), 6)
+    rows: list[tuple[str, str]] = []
+    text_parts: list[str] = []
+    for sibling in section_heading.next_siblings:
+        if not isinstance(sibling, Tag):
+            continue
+        if _HEADING_RANK.get(sibling.name or "", 99) <= rank:
+            break
+        text_parts.append(sibling.get_text(" ", strip=True))
+        for anchor in sibling.find_all("a"):
+            href = str(anchor.get("href") or "").strip()
+            label = clean_text(anchor.get_text(" ", strip=True))
+            if not label or href.lower().startswith(("mailto:", "tel:", "#", "javascript:")):
+                continue
+            rows.append((label, href))
+    return rows, " ".join(part for part in text_parts if part)
 
 
 def static_posting_groups(section_heading: Tag, heading_name: str) -> list[tuple[Tag, list[Tag]]]:
