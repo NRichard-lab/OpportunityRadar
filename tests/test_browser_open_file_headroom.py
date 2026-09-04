@@ -11,6 +11,9 @@ instead of as intermittent, load-dependent crashes.
 from __future__ import annotations
 
 import inspect
+import subprocess
+import sys
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -20,6 +23,8 @@ except ImportError:  # pragma: no cover - Windows dev boxes
     resource = None
 
 from backend import outbound_security as ob
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class BoundaryWiresThePreflightTests(unittest.TestCase):
@@ -49,12 +54,62 @@ class BrowserOpenFileHeadroomTests(unittest.TestCase):
         self._saved = resource.getrlimit(resource.RLIMIT_NOFILE)
 
     def tearDown(self) -> None:
+        # Only the soft limit is ever lowered in this process, so restoring the
+        # saved pair always succeeds. The hard-ceiling case cannot be undone by
+        # an unprivileged process and therefore runs in a subprocess instead.
         resource.setrlimit(resource.RLIMIT_NOFILE, self._saved)
 
     def test_soft_limit_below_floor_and_unraisable_fails_closed(self) -> None:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
-        with self.assertRaises(ob.BrowserEgressConfigurationError):
-            ob._require_browser_open_file_headroom()
+        # Lowering the *hard* limit is irreversible without privilege, so this
+        # case runs in a throwaway interpreter. Doing it in-process would pin the
+        # whole test run's ceiling at 1024 and break every later test that needs
+        # real file-descriptor headroom.
+        script = textwrap.dedent(
+            f"""
+            import resource
+            import sys
+
+            sys.path.insert(0, {str(REPO_ROOT)!r})
+            from backend import outbound_security as ob
+
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+            try:
+                ob._require_browser_open_file_headroom()
+            except ob.BrowserEgressConfigurationError as exc:
+                assert str(ob.MINIMUM_BROWSER_OPEN_FILE_LIMIT) in str(exc), str(exc)
+                assert "RLIMIT_NOFILE" in str(exc), str(exc)
+                print("RAISED")
+            else:
+                print("NOT_RAISED")
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"subprocess failed ({completed.returncode}): {completed.stderr}",
+        )
+        self.assertEqual(completed.stdout.strip().splitlines()[-1], "RAISED")
+
+    def test_the_hard_limit_case_never_cripples_this_process(self) -> None:
+        # Guards the fix itself. If the case above is ever moved back in-process,
+        # this process's hard ceiling collapses to 1024 and the failure surfaces
+        # as unrelated tests breaking.
+        source = inspect.getsource(
+            type(self).test_soft_limit_below_floor_and_unraisable_fails_closed
+        )
+        self.assertIn("subprocess.run", source)
+        _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.assertTrue(
+            hard == resource.RLIM_INFINITY or hard >= ob.MINIMUM_BROWSER_OPEN_FILE_LIMIT,
+            f"the process hard RLIMIT_NOFILE was lowered to {hard}",
+        )
 
     def test_low_soft_limit_under_high_hard_ceiling_is_lifted_not_rejected(self) -> None:
         _soft, hard = self._saved

@@ -417,7 +417,28 @@ class RedirectValidationTests(unittest.TestCase):
             adapter.get_connection("https://public.example/")
 
 
+def protected_browser_boundary_is_active() -> bool:
+    """Whether this process has the real protected browser runtime.
+
+    Inside the production-equivalent container the boundary validates, and
+    ``launch_playwright_chromium`` then returns a lease wrapper rather than the
+    browser it was handed. Assertions about the unwrapped return value only hold
+    on a development host where the boundary is absent.
+    """
+    import backend.outbound_security as ob
+
+    try:
+        ob.validate_browser_runtime_boundary()
+    except Exception:
+        return False
+    return True
+
+
 class PlaywrightGuardTests(unittest.TestCase):
+    @unittest.skipIf(
+        protected_browser_boundary_is_active(),
+        "the protected boundary wraps the browser in a launch lease",
+    )
     def test_chromium_launch_disables_automatic_proxy_use(self) -> None:
         playwright = Mock()
         browser = Mock()
@@ -434,6 +455,19 @@ class PlaywrightGuardTests(unittest.TestCase):
             args=["--disable-background-networking", "--no-proxy-server"],
             headless=True,
         )
+
+    def test_caller_supplied_proxy_controls_are_refused_under_the_boundary(self) -> None:
+        # Where the unprotected launcher adds "--no-proxy-server", the protected
+        # launcher forces the namespace wrapper and its own proxy instead. What
+        # must hold in both is that a caller can never steer the proxy itself.
+        import backend.outbound_security as ob
+
+        if not protected_browser_boundary_is_active():
+            self.skipTest("no protected boundary on this host")
+        for option in ("proxy", "executable_path", "chromium_sandbox", "env"):
+            with self.subTest(option=option):
+                with self.assertRaises(ob.BrowserEgressConfigurationError):
+                    launch_playwright_chromium(Mock(), headless=True, **{option: object()})
 
     def test_context_guard_allows_public_requests_and_blocks_private_requests(self) -> None:
         context = FakeContext()

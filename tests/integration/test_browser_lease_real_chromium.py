@@ -173,24 +173,54 @@ def test_open_file_limit_preflight_is_enforced(runtime):
     and accepts one at or above it. Below the floor a heavier career page
     exhausts descriptors mid-load and Chromium self-aborts ("Page crashed")."""
     import resource
+    import subprocess
+    import sys
+    import textwrap
 
     floor = ob.MINIMUM_BROWSER_OPEN_FILE_LIMIT
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     assert soft == resource.RLIM_INFINITY or soft >= floor, (
         f"the production-equivalent container must grant >= {floor} open files; got {soft}"
     )
-    try:
-        # A soft limit under the floor that also can't be raised back up must fail closed.
+
+    # Lowering the *hard* limit is irreversible without privilege, so the
+    # fail-closed case runs in a throwaway interpreter. In-process it would pin
+    # this container's ceiling at 1024 and break every later browser test.
+    script = textwrap.dedent(
+        """
+        import resource
+        from backend import outbound_security as ob
+
         resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
-        with pytest.raises(ob.BrowserEgressConfigurationError):
+        try:
             ob._require_browser_open_file_headroom()
-        # A low soft limit under a high hard ceiling is lifted, not rejected.
+        except ob.BrowserEgressConfigurationError as exc:
+            assert str(ob.MINIMUM_BROWSER_OPEN_FILE_LIMIT) in str(exc), str(exc)
+            print("RAISED")
+        else:
+            print("NOT_RAISED")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120, cwd="/app"
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().splitlines()[-1] == "RAISED"
+
+    # A low soft limit under a high hard ceiling is lifted, not rejected. Only the
+    # soft limit changes here, so it is restorable in this process.
+    try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
         ob._require_browser_open_file_headroom()
         lifted, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
         assert lifted == resource.RLIM_INFINITY or lifted >= floor
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    restored_soft, restored_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    assert (restored_soft, restored_hard) == (soft, hard), (
+        "the preflight check must leave this container's file-descriptor limits intact"
+    )
 
 
 def test_content_heavy_page_renders_without_a_page_crash(runtime, playwright):

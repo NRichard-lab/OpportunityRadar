@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 from collectors.generic_collector import GenericCollector
 from job_evidence import (
     careers_page_context_reason,
+    descriptive_job_slug_in_url,
     evaluate_generic_candidate,
     job_identifier_in_url,
     navigation_chrome_reason,
@@ -301,6 +302,125 @@ class PositiveEvidenceTests(unittest.TestCase):
             "<nav class='job-nav-list'><a href='/careers'>Careers</a></nav>", "html.parser"
         )
         self.assertEqual(page_job_list_structure_reason(soup), "")
+
+
+class DescriptiveSlugIsNotAnIdentifierTests(unittest.TestCase):
+    """A digit-free careers-section slug must not admit a job on its own.
+
+    ``/careers/employee-benefits`` and ``/careers/commercial-lender`` have the
+    same URL shape, so the slug alone cannot separate an ordinary careers-section
+    page from a posting. Treating it as a requisition identifier readmitted
+    exactly the class of row this gate exists to keep out.
+    """
+
+    CAREERS_SECTION_PAGES = (
+        "https://www.example.invalid/careers/employee-benefits",
+        "https://www.example.invalid/careers/how-to-apply",
+        "https://www.example.invalid/careers/open-positions",
+        "https://www.example.invalid/jobs/why-work-here",
+        "https://www.example.invalid/careers/our-team",
+        "https://www.example.invalid/careers/equal-opportunity-employer",
+    )
+
+    def test_a_digit_free_slug_is_not_a_requisition_identifier(self) -> None:
+        for url in self.CAREERS_SECTION_PAGES:
+            with self.subTest(url=url):
+                self.assertEqual(job_identifier_in_url(url), "")
+                self.assertNotEqual(descriptive_job_slug_in_url(url), "")
+
+    def test_a_numbered_slug_is_still_a_requisition_identifier(self) -> None:
+        self.assertEqual(
+            job_identifier_in_url("https://www.example.invalid/careers/universal-banker-1042"),
+            "universal-banker-1042",
+        )
+        self.assertEqual(
+            descriptive_job_slug_in_url(
+                "https://www.example.invalid/careers/universal-banker-1042"
+            ),
+            "",
+        )
+
+    def test_careers_section_pages_are_refused_without_corroboration(self) -> None:
+        for url in self.CAREERS_SECTION_PAGES:
+            with self.subTest(url=url):
+                soup = BeautifulSoup(
+                    f"<div class='content'><a href='{url}'>Learn About This</a></div>",
+                    "html.parser",
+                )
+                verdict = evaluate_generic_candidate(
+                    title="Learn About This",
+                    href=url,
+                    node=soup.select_one("a"),
+                    text="Learn About This",
+                    page_url=BOARD_URL,
+                    careers_context=True,
+                )
+                self.assertFalse(verdict.accepted, f"{url} -> {verdict.signals}")
+
+    def test_a_slug_inside_a_verified_job_list_is_accepted(self) -> None:
+        soup = BeautifulSoup(
+            "<ul class='job-listings'><li><a href='/careers/part-time-teller'>Teller</a></li></ul>",
+            "html.parser",
+        )
+        verdict = evaluate_generic_candidate(
+            title="Teller",
+            href="https://www.example.invalid/careers/part-time-teller",
+            node=soup.select_one("li"),
+            text="Location: Dayton, OH | Part-Time",
+            page_url=BOARD_URL,
+            careers_context=True,
+        )
+        self.assertTrue(verdict.accepted)
+
+    def test_a_slug_with_no_structure_and_no_metadata_is_refused(self) -> None:
+        soup = BeautifulSoup(
+            "<div class='content'><a href='/careers/part-time-teller'>Teller</a></div>",
+            "html.parser",
+        )
+        verdict = evaluate_generic_candidate(
+            title="Teller",
+            href="https://www.example.invalid/careers/part-time-teller",
+            node=soup.select_one("a"),
+            text="Teller",
+            page_url=BOARD_URL,
+            careers_context=True,
+        )
+        self.assertFalse(verdict.accepted)
+
+
+class PhraseMatchingIsWholeWordTests(unittest.TestCase):
+    """Substring phrase matching rejected real postings.
+
+    "oops" is inside "Troops" and "Coops", so a genuine posting title was
+    reported as error copy and a page carrying it was demoted to
+    non-authoritative -- silently dropping a company's real openings.
+    """
+
+    def test_words_that_merely_contain_a_phrase_are_not_rejected(self) -> None:
+        for title in [
+            "Troops Support Specialist",
+            "Coops Program Manager",
+            "Ambassador, Community Hoops Program",
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(non_job_text_reason(title), "", title)
+
+    def test_the_phrases_themselves_still_match(self) -> None:
+        self.assertTrue(non_job_text_reason("Oops. We're still building this path"))
+        self.assertTrue(non_job_text_reason("Page Not Found"))
+        self.assertTrue(non_job_text_reason("Open an Account"))
+
+    def test_a_page_is_not_a_soft_404_because_a_word_contains_oops(self) -> None:
+        self.assertEqual(
+            page_looks_like_soft_404("Current Openings: Troops Support Specialist"), ""
+        )
+
+    def test_the_most_specific_placeholder_phrase_is_reported(self) -> None:
+        # Leftmost alternation would report the useless "oops" instead.
+        self.assertEqual(
+            page_looks_like_soft_404("Oops. We're still building this path"),
+            "still building this path",
+        )
 
 
 class CareersContextTests(unittest.TestCase):

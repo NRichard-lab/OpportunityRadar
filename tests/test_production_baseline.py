@@ -19,6 +19,24 @@ import job_tools
 import server
 
 
+def browser_runtime_is_verified() -> bool:
+    """Whether this host actually has the protected browser runtime.
+
+    The "unverified runtime is rejected" case can only be staged where the
+    runtime is genuinely absent. Inside the production-equivalent container it is
+    present and validation correctly succeeds, so the scenario does not exist
+    there. The neighbouring case -- browser jobs enabled without the egress mode
+    -- still runs everywhere.
+    """
+    from backend import outbound_security as ob
+
+    try:
+        ob.validate_browser_runtime_boundary()
+    except Exception:
+        return False
+    return True
+
+
 CONFIG_KEYS = {
     "APP_ENV", "DEPLOYMENT_VERSION", "AUTH_MODE", "APP_BASE_PATH", "APP_PUBLIC_URL", "APP_TRUSTED_ADMIN_USER_ID",
     "BLUEASH_PORTAL_PUBLIC_URL", "BLUEASH_PORTAL_API_URL", "BLUEASH_AUTH_CLIENT_ID",
@@ -181,6 +199,10 @@ class ProductionConfigurationTests(unittest.TestCase):
         self.assertIn("APP_ENABLE_BROWSER_JOBS", result.stderr)
         self.assertIn("egress boundary", result.stderr)
 
+    @unittest.skipIf(
+        browser_runtime_is_verified(),
+        "this host has the verified browser runtime, so 'unverified' cannot be staged here",
+    )
     def test_production_rejects_unverified_browser_runtime_even_when_mode_is_claimed(self) -> None:
         values = valid_production_environment()
         values["APP_ENABLE_BROWSER_JOBS"] = "true"

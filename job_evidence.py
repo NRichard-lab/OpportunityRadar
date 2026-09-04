@@ -428,24 +428,58 @@ _PHONE_ONLY = re.compile(r"^[-+().\s\d]{7,}$")
 _URL_ONLY = re.compile(r"^(?:https?://|www\.)\S+$", flags=re.IGNORECASE)
 
 
+def _phrase_pattern(phrases: Iterable[str]) -> re.Pattern[str]:
+    """Compile ``phrases`` as whole-word alternatives.
+
+    Plain substring matching turns short phrases into traps: "oops" is inside
+    "Troops" and "Coops", so a real posting title was rejected as error copy and
+    a page listing it was demoted to non-authoritative. Word boundaries are only
+    added where the phrase actually starts or ends on a word character, so
+    punctuated phrases such as "404 error" still match.
+    """
+    alternatives = []
+    for phrase in sorted(set(phrases), key=len, reverse=True):
+        escaped = re.escape(phrase)
+        prefix = r"\b" if phrase[:1].isalnum() else ""
+        suffix = r"\b" if phrase[-1:].isalnum() else ""
+        alternatives.append(f"{prefix}{escaped}{suffix}")
+    return re.compile("|".join(alternatives), flags=re.IGNORECASE)
+
+
+_SOFT_404_PATTERN = _phrase_pattern(SOFT_404_PHRASES)
+_NON_JOB_TEXT_PATTERN = _phrase_pattern(NON_JOB_TEXT_PHRASES)
+
+
+def _matched_phrase(pattern: re.Pattern[str], value: str) -> str:
+    """Return the most specific phrase ``pattern`` finds in ``value``.
+
+    Regex alternation returns the leftmost match, which on "Oops. We're still
+    building this path" is the near-useless "oops". The phrase is quoted back to
+    an operator as the reason a page was rejected, so prefer the longest match.
+    """
+    matches = [match.group(0) for match in pattern.finditer(value)]
+    if not matches:
+        return ""
+    return max(matches, key=len).casefold()
+
+
 def non_job_text_reason(text: str) -> str:
     """Return why ``text`` is page furniture rather than a posting title."""
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     if not value:
         return ""
-    lowered = value.casefold()
     if _EMAIL_ONLY.match(value):
         return "email address, not a job title"
     if _URL_ONLY.match(value):
         return "bare URL, not a job title"
     if _PHONE_ONLY.match(value) and any(char.isdigit() for char in value):
         return "phone number, not a job title"
-    for phrase in SOFT_404_PHRASES:
-        if phrase in lowered:
-            return f"error/placeholder page text (\"{phrase}\")"
-    for phrase in NON_JOB_TEXT_PHRASES:
-        if phrase in lowered:
-            return f"marketing call to action (\"{phrase}\")"
+    soft_404 = _matched_phrase(_SOFT_404_PATTERN, value)
+    if soft_404:
+        return f"error/placeholder page text (\"{soft_404}\")"
+    marketing = _matched_phrase(_NON_JOB_TEXT_PATTERN, value)
+    if marketing:
+        return f"marketing call to action (\"{marketing}\")"
     if _SENTENCE_SHAPE.search(value):
         return "marketing sentence, not a job title"
     return ""
@@ -453,16 +487,12 @@ def non_job_text_reason(text: str) -> str:
 
 def page_looks_like_soft_404(visible_text: str) -> str:
     """Return the soft-404 phrase a rendered page shows, or an empty string."""
-    lowered = re.sub(r"\s+", " ", str(visible_text or "")).strip().casefold()
-    if not lowered:
+    normalized = re.sub(r"\s+", " ", str(visible_text or "")).strip()
+    if not normalized:
         return ""
     # Only the leading copy: a long careers page that happens to mention
     # "coming soon" further down is not a soft 404.
-    head = lowered[:800]
-    for phrase in SOFT_404_PHRASES:
-        if phrase in head:
-            return phrase
-    return ""
+    return _matched_phrase(_SOFT_404_PATTERN, normalized[:800])
 
 
 # ---------------------------------------------------------------------------
@@ -554,26 +584,59 @@ def ats_job_detail_reason(url: str) -> str:
     return ""
 
 
+def _segments_after_a_job_anchor(url: str) -> list[str]:
+    """Path segments that directly follow a job/careers anchor segment."""
+    segments = _path_segments(urlsplit(str(url or "").strip()).path)
+    following: list[str] = []
+    for index, segment in enumerate(segments[:-1]):
+        if segment not in JOB_PATH_ANCHORS:
+            continue
+        candidate = segments[index + 1]
+        if candidate in JOB_PATH_ANCHORS or candidate in CAREERS_SEGMENTS:
+            continue
+        following.append(candidate)
+    return following
+
+
 def job_identifier_in_url(url: str) -> str:
-    """Return a requisition identifier carried by ``url``, or an empty string."""
+    """Return a requisition identifier carried by ``url``, or an empty string.
+
+    Only a *numbered* identifier counts -- a requisition query parameter, or a
+    digit-bearing segment after a job anchor such as ``/careers/teller-1042``.
+    A digit-free slug is deliberately excluded: ``/careers/employee-benefits``
+    and ``/careers/how-to-apply`` have exactly the same shape as a real posting
+    slug, so treating one as an identifier would readmit ordinary careers-section
+    links as jobs. Those go through :func:`descriptive_job_slug_in_url`, which
+    only corroborates other evidence.
+    """
     parsed = urlsplit(str(url or "").strip())
-    query = parse_qs(parsed.query)
-    lowered_query = {key.lower(): values for key, values in query.items()}
+    lowered_query = {key.lower(): values for key, values in parse_qs(parsed.query).items()}
     for key in JOB_ID_QUERY_KEYS:
         for value in lowered_query.get(key, []):
             candidate = str(value or "").strip()
             if candidate:
                 return candidate
 
-    segments = _path_segments(parsed.path)
-    for index, segment in enumerate(segments[:-1]):
-        if segment not in JOB_PATH_ANCHORS:
+    for segment in _segments_after_a_job_anchor(url):
+        if _IDENTIFIER_SEGMENT.match(segment):
+            return segment
+    return ""
+
+
+def descriptive_job_slug_in_url(url: str) -> str:
+    """Return a digit-free posting-shaped slug after a job anchor, or "".
+
+    ``/careers/commercial-lender`` is plausibly a posting and ``/careers/
+    employee-benefits`` plausibly is not, and the URL alone cannot tell them
+    apart. This is therefore weak evidence: it is only accepted alongside a
+    verified job-list structure, or published job metadata on a confirmed
+    careers page.
+    """
+    for segment in _segments_after_a_job_anchor(url):
+        if _IDENTIFIER_SEGMENT.match(segment):
             continue
-        following = segments[index + 1]
-        if following in JOB_PATH_ANCHORS or following in CAREERS_SEGMENTS:
-            continue
-        if _IDENTIFIER_SEGMENT.match(following) or _SLUG_SEGMENT.match(following):
-            return following
+        if _SLUG_SEGMENT.match(segment):
+            return segment
     return ""
 
 
@@ -737,6 +800,23 @@ def evaluate_generic_candidate(
     metadata = job_metadata_signals(text)
     if list_reason and metadata:
         return EvidenceVerdict(True, "job-list structure with published metadata", (list_reason, *metadata))
+
+    # A digit-free posting-shaped slug is only worth anything with corroboration:
+    # on its own it cannot be told apart from "/careers/employee-benefits".
+    slug = descriptive_job_slug_in_url(href)
+    if slug:
+        if list_reason:
+            return EvidenceVerdict(
+                True,
+                "posting slug inside a verified job list",
+                (f"posting-shaped URL slug (\"{slug}\")", list_reason, *metadata),
+            )
+        if metadata and careers_context:
+            return EvidenceVerdict(
+                True,
+                "posting slug with published metadata on a careers page",
+                (f"posting-shaped URL slug (\"{slug}\")", *metadata),
+            )
 
     # An employer that publishes each opening as a job-description document is
     # still publishing a posting, provided the link sits in a job-list
