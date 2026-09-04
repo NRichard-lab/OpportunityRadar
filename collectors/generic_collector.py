@@ -15,6 +15,15 @@ from backend.outbound_security import install_playwright_url_guard, launch_playw
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_enrichment import extract_json_ld_pay_info, extract_pay_info
+from job_evidence import (
+    careers_page_context_reason,
+    evaluate_generic_candidate,
+    navigation_chrome_reason,
+    non_job_destination_reason,
+    non_job_text_reason,
+    page_job_list_structure_reason,
+    page_looks_like_soft_404,
+)
 from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
 from job_tools import CollectionNotAuthoritative, JobRecord, make_job_id
 
@@ -111,12 +120,11 @@ class GenericCollector(BaseCollector):
                 except Exception:
                     visible_text = ""
                 jobs = self.parse_listing_html(company, url, self.final_url_after_redirect or url, html, source_type)
-                if not jobs and not page_states_no_openings(visible_text) and looks_like_unrendered_spa(html, visible_text):
-                    raise CollectionNotAuthoritative(
-                        f"{self.final_url_after_redirect or url} loaded but rendered no listing "
-                        f"content (single-page-app shell); refusing to record an authoritative "
-                        f"zero-job result."
-                    )
+                if not jobs:
+                    landing = self.final_url_after_redirect or url
+                    uncertain = self.zero_result_uncertainty(landing, html, visible_text)
+                    if uncertain:
+                        raise CollectionNotAuthoritative(uncertain)
             finally:
                 self._detail_context = None
                 if context is not None:
@@ -128,6 +136,37 @@ class GenericCollector(BaseCollector):
 
         self.flush_debug(company)
         return dedupe_jobs(jobs)
+
+    def zero_result_uncertainty(self, landing_url: str, html: str, visible_text: str) -> str:
+        """Explain why an empty generic parse must not be treated as a real zero.
+
+        A generic page that yields nothing is only an authoritative "no
+        openings" when the page says so outright, or when it rendered a job
+        list that is genuinely empty. An error page, an unrendered app shell,
+        or a page we simply did not understand is uncertain, and an uncertain
+        parse must never prune a company's existing jobs.
+        """
+        soft_404 = page_looks_like_soft_404(visible_text)
+        if soft_404:
+            return (
+                f"{landing_url} returned an error/placeholder page (\"{soft_404}\"); "
+                f"refusing to record an authoritative zero-job result."
+            )
+        if page_states_no_openings(visible_text):
+            return ""
+        if looks_like_unrendered_spa(html, visible_text):
+            return (
+                f"{landing_url} loaded but rendered no listing content "
+                f"(single-page-app shell); refusing to record an authoritative "
+                f"zero-job result."
+            )
+        if not getattr(self, "_page_job_list_reason", ""):
+            return (
+                f"{landing_url} rendered no recognizable job-list structure and did "
+                f"not state that there are no openings; the zero-job result is "
+                f"uncertain and is not authoritative."
+            )
+        return ""
 
     def collect_with_http(self, company: dict[str, Any], url: str, source_type: str) -> list[JobRecord]:
         response = self.get(url)
@@ -144,6 +183,8 @@ class GenericCollector(BaseCollector):
         source_type: str,
     ) -> list[JobRecord]:
         soup = BeautifulSoup(html, "html.parser")
+        self._careers_context_reason = careers_page_context_reason(final_url, soup)
+        self._page_job_list_reason = page_job_list_structure_reason(soup)
         schema_jobs = self.extract_json_ld_jobs(company, final_url, soup, source_type)
         if schema_jobs:
             return schema_jobs
@@ -167,6 +208,24 @@ class GenericCollector(BaseCollector):
             raw_title = extract_card_title(card)
             is_document_posting = is_job_document_url(href)
             self.record_candidate(raw_title or card_text[:120], href)
+
+            # Cheap structural rejections first: site chrome and destinations
+            # that cannot be a posting are discarded before any detail fetch,
+            # so a footer link never costs a request and never reaches storage.
+            chrome_reason = navigation_chrome_reason(card)
+            if chrome_reason:
+                self.reject_candidate(
+                    raw_title or card_text[:120], chrome_reason, href,
+                    surrounding_text=card_text, company=company, job_board_url=board_url,
+                )
+                continue
+            destination_reason = non_job_destination_reason(href, page_url=final_url)
+            if destination_reason:
+                self.reject_candidate(
+                    raw_title or card_text[:120], destination_reason, href,
+                    surrounding_text=card_text, company=company, job_board_url=board_url,
+                )
+                continue
 
             detail_attempted = False
             detail_title = ""
@@ -222,8 +281,33 @@ class GenericCollector(BaseCollector):
                 self.record_pay_extraction(str(pay_info.get("payExtractionSource") or "detail_or_card_text"), description or card_text, pay_info)
             pay_text = str(pay_info.get("payText") or "")
             posted_date = detail.get("postedDate") or extract_posted_date(card_text)
-            if not any([description, location, posted_date, href, pay_text]):
-                self.reject_candidate(title, "not enough posting evidence", href, surrounding_text=card_text, company=company, job_board_url=board_url)
+
+            # Positive evidence is required before anything is stored. A card
+            # that merely clears the title blocklist is not a posting: the page
+            # must identify it as one, through a recognized ATS job-detail URL,
+            # a requisition identifier, or placement in a verified job list that
+            # publishes job metadata.
+            evidence_text = " ".join(
+                part for part in [card_text, description, location, posted_date, pay_text] if part
+            )
+            verdict = evaluate_generic_candidate(
+                title=title,
+                href=href,
+                node=card,
+                text=evidence_text,
+                page_url=final_url,
+                document_posting=is_document_posting,
+                careers_context=bool(getattr(self, "_careers_context_reason", "")),
+            )
+            if not verdict.accepted:
+                self.reject_candidate(
+                    title, verdict.reason, href,
+                    surrounding_text=card_text,
+                    detail_attempted=detail_attempted,
+                    detail_title=detail_title,
+                    company=company,
+                    job_board_url=board_url,
+                )
                 continue
 
             self.save_candidate(title, href)
@@ -250,6 +334,7 @@ class GenericCollector(BaseCollector):
                         "sourceType": source_type,
                         "finalUrl": final_url,
                         "officialJobDocument": is_document_posting,
+                        "jobEvidence": list(verdict.signals),
                     },
                 )
             )
@@ -381,18 +466,35 @@ class GenericCollector(BaseCollector):
         section_heading: Tag,
         source_type: str,
     ) -> list[JobRecord]:
+        # A bare run of links only means "these are the openings" on a page that
+        # is itself a careers page. On a marketing page the same shape is a menu,
+        # so refuse to read it as a posting list at all.
+        careers_reason = getattr(self, "_careers_context_reason", "")
+        if not careers_reason:
+            return []
         rows, section_text = static_openings_link_rows(section_heading)
         if not rows or not section_has_apply_signal(section_text):
             return []
         company_id = str(company.get("Company ID") or stable_company_id(company))
         jobs: list[JobRecord] = []
         seen: set[str] = set()
-        for anchor_text, href in rows:
+        for anchor, anchor_text, href in rows:
             raw_title = normalize_job_title(anchor_text)
             title, location = split_static_title_location(raw_title)
             title = title or raw_title
             destination = urljoin(page_url, href) if href else static_posting_url(page_url, raw_title)
             self.record_candidate(title, destination)
+            row_reason = (
+                navigation_chrome_reason(anchor)
+                or non_job_text_reason(title)
+                or non_job_destination_reason(destination, page_url=page_url)
+            )
+            if row_reason:
+                self.reject_candidate(
+                    title, row_reason, destination,
+                    surrounding_text=section_text[:400], company=company, job_board_url=page_url,
+                )
+                continue
             if not is_valid_job_title(title) or destination in seen:
                 self.reject_candidate(
                     title, rejection_reason(title), destination,
@@ -420,6 +522,7 @@ class GenericCollector(BaseCollector):
                         "officialCareersPageListing": True,
                         "officialJobDocument": is_document,
                         "sectionHeading": clean_text(section_heading.get_text(" ", strip=True)),
+                        "jobEvidence": ["openings heading link list", careers_reason],
                     },
                 )
             )
@@ -567,12 +670,12 @@ def section_has_apply_signal(section_text: str) -> bool:
     return any(signal in low for signal in _APPLY_SIGNALS)
 
 
-def static_openings_link_rows(section_heading: Tag) -> tuple[list[tuple[str, str]], str]:
-    """Anchor ``(text, href)`` rows that follow an openings heading, until the next
-    same-or-higher heading, plus the collected text for an apply-signal check."""
+def static_openings_link_rows(section_heading: Tag) -> tuple[list[tuple[Tag, str, str]], str]:
+    """Anchor ``(anchor, text, href)`` rows that follow an openings heading, until
+    the next same-or-higher heading, plus the collected text for an apply check."""
 
     rank = _HEADING_RANK.get(str(section_heading.name or "").lower(), 6)
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[Tag, str, str]] = []
     text_parts: list[str] = []
     for sibling in section_heading.next_siblings:
         if not isinstance(sibling, Tag):
@@ -585,7 +688,7 @@ def static_openings_link_rows(section_heading: Tag) -> tuple[list[tuple[str, str
             label = clean_text(anchor.get_text(" ", strip=True))
             if not label or href.lower().startswith(("mailto:", "tel:", "#", "javascript:")):
                 continue
-            rows.append((label, href))
+            rows.append((anchor, label, href))
     return rows, " ".join(part for part in text_parts if part)
 
 
