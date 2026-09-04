@@ -1,0 +1,33 @@
+{
+  "success": true,
+  "message": "This is where the full jobs list will show",
+  "data": {
+    "jobs": [
+      {
+        "id": 5550001,
+        "title": "Branch Manager",
+        "city": "Otherville",
+        "subdomain": "otherbank",
+        "abbreviation": "OH",
+        "siteId": 9999,
+        "startDateRef": "Aug 01, 2026",
+        "orgTitle": "Retail Banking",
+        "domainName": "applicantpro.com",
+        "stateName": "Ohio",
+        "workplaceType": "Onsite",
+        "employmentType": "Full Time",
+        "payRate": null,
+        "payType": null,
+        "minSalary": "",
+        "maxSalary": "",
+        "jobLocation": "200 Other Street, Otherville, OH, USA",
+        "jobUrl": "https://otherbank.applicantpro.com/jobs/5550001"
+      }
+    ],
+    "jobCount": 1,
+    "searchResultText": "Number of Jobs: 1",
+    "displayText": "<p>Below is a list of the current openings with our company.</p>",
+    "showPostingDate": false,
+    "showWorkplaceType": false
+  }
+}

@@ -17,8 +17,13 @@ from job_validation import is_valid_structured_job_title, normalize_job_title, r
 UKG_PAGE_SIZE = 50
 UKG_MAX_PAGES = 20
 UKG_MAX_OPPORTUNITIES = UKG_PAGE_SIZE * UKG_MAX_PAGES
+# A stored UKG URL is often one currently open posting
+# (".../JobBoard/<uuid>/OpportunityDetail?opportunityId=...") or a board view
+# (".../JobBoard/<uuid>/JobBoardView/..."). Both name the same tenant board, so
+# accept the trailing segments and normalize back to the board root instead of
+# dropping the company to the generic collector.
 UKG_BOARD_PATH = re.compile(
-    r"^/(?P<tenant>[A-Za-z0-9_-]+)/JobBoard/(?P<board>[0-9A-Fa-f-]{36})/?$",
+    r"^/(?P<tenant>[A-Za-z0-9_-]+)/JobBoard/(?P<board>[0-9A-Fa-f-]{36})(?:/[A-Za-z0-9_./-]*)?$",
     flags=re.IGNORECASE,
 )
 UKG_RECRUITING_HOSTS = {"recruiting.ultipro.com", "recruiting2.ultipro.com"}

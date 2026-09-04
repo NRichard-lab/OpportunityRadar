@@ -145,6 +145,7 @@ def pick_collector(
     debug_dir: Path | None = None,
 ) -> BaseCollector:
     from collectors.adp_collector import ADPCollector
+    from collectors.applicantpro_collector import ApplicantProCollector, IsolvedHireCollector
     from collectors.clearcompany_collector import ClearCompanyCollector
     from collectors.csod_collector import CSODCollector
     from collectors.dayforce_collector import DayforceCollector
@@ -165,10 +166,23 @@ def pick_collector(
     # A verified vendor URL is stronger evidence than stale stored metadata.
     # Keep the stored value as a fallback for official pages that embed an ATS.
     platform = detected_platform or stored_platform
-    direct_workforce_api = "workforcenow.adp.com" in url and "/mdf/recruitment/recruitment.html" in url
+    # Any Workforce Now board that carries a tenant (cid + ccId) is collectable:
+    # the collector canonicalizes the recruitment path itself, so an alias or
+    # detail URL no longer falls through to the generic page collector.
+    direct_workforce_api = "workforcenow.adp.com" in url and adp_url_has_tenant(url)
     embedded_workforce_board = platform.strip() == "adp workforce now" and "workforcenow.adp.com" not in url
     if direct_workforce_api or embedded_workforce_board:
         return with_reason(ADPCollector(delay_seconds, debug, debug_dir), "Job Board URL matched or embeds the ADP Workforce Now public API.")
+    if "applicantpro" in platform or "applicantpro.com" in url:
+        return with_reason(
+            ApplicantProCollector(delay_seconds, debug, debug_dir),
+            "Job Platform or Job Board URL matched ApplicantPro.",
+        )
+    if "isolved" in platform or "isolvedhire.com" in url:
+        return with_reason(
+            IsolvedHireCollector(delay_seconds, debug, debug_dir),
+            "Job Platform or Job Board URL matched isolved Hire.",
+        )
     if "hrmdirect.com" in url:
         return with_reason(
             ClearCompanyCollector(delay_seconds, debug, debug_dir),
@@ -197,6 +211,18 @@ def pick_collector(
     if "ukg" in platform or "ultipro.com" in url or "ukg.com" in url:
         return with_reason(UKGCollector(delay_seconds, debug, debug_dir), "Job Platform or Job Board URL matched UKG.")
     return with_reason(GenericCollector(delay_seconds, debug, debug_dir), "No supported platform detected; using generic public page collector.")
+
+
+def adp_url_has_tenant(url: str) -> bool:
+    """Whether a Workforce Now URL carries the cid/ccId pair that names a tenant.
+
+    A board link, a career-center alias, and a job-detail link all carry both, and
+    all three resolve to the same public requisition API. Requiring only the
+    recruitment.html path meant the other two fell through to the generic
+    collector, which cannot read an ADP single-page board at all.
+    """
+    lowered = str(url or "").casefold()
+    return "cid=" in lowered and "ccid=" in lowered
 
 
 def with_reason(collector: BaseCollector, reason: str) -> BaseCollector:

@@ -1,0 +1,37 @@
+<!--
+  Sanitized ApplicantPro / isolved Hire career-site board page.
+
+  Reproduces the real page shape: the listing is a Vue component and the tenant
+  metadata the collector needs (organizationId, domainId, subdomainName,
+  domainName) is embedded in a componentData literal. Only the tenant name,
+  identifiers and site colour are synthetic; no real company, address, phone
+  number or staff email appears here.
+-->
+<html>
+  <head><title>Current Career Opportunities at Example Community Credit Union</title></head>
+  <body>
+    <div id="headerbar" class="header header-image">
+      <ul class="nav navbar-nav navbar-right">
+        <li><a href="https://www.example-credit-union.invalid/">Home</a></li>
+        <li><a href="https://www.example-credit-union.invalid/contact">Contact</a></li>
+      </ul>
+    </div>
+
+    <div id="content_area" class="container">
+      <div id="job_listings" class="bootstrap-area"><job-listings v-bind="componentData"></div>
+      <script type="text/javascript">
+        $(function() {
+          window.bootstrapVue(
+            "#job_listings",
+            [ 'JobListings' ],
+            { componentData: { organizationId : 5150, domainId : 8271, getParams : {"cityUrl":"","countryAbbreviation":"","stateAbbreviation":"","isInternal":0,"showPayFrequency":1,"showLocation":1,"locationTitle":"Location","locationWeight":2,"showEmploymentType":1,"employmentTypeTitle":"Employment Type","employmentTypeWeight":5,"showDate":0,"dateTitle":"Closing Date","dateWeight":3,"chatToApplyButton":"0","chatToApplySort":""}, domainName : "applicantpro.com", subdomainName : "examplecu", siteCss : {"accent":"#123456"}, airaEnabled : false, }}
+          );
+        });
+      </script>
+    </div>
+
+    <div id="social_media_widget">
+      <a href="https://www.facebook.com/examplecu">Facebook</a>
+    </div>
+  </body>
+</html>

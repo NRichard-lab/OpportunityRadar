@@ -9,11 +9,14 @@ from bs4 import BeautifulSoup
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_tools import JobRecord, make_job_id
-from job_validation import is_valid_job_title, normalize_job_title, rejection_reason
+from job_validation import is_valid_structured_job_title, normalize_job_title, rejection_reason
 
 
 ADP_HOST = "workforcenow.adp.com"
 ADP_RECRUITMENT_PATH = "/mdf/recruitment/recruitment.html"
+# ADP's standard career-center shell path, used when a stored Workforce Now URL
+# names a tenant but carries no career-center prefix of its own.
+ADP_DEFAULT_CAREER_CENTER_PREFIX = "/mascsr/default"
 ADP_API_SUFFIX = "/careercenter/public/events/staffing/v1/job-requisitions"
 ADP_PAGE_SIZE = 20
 ADP_MAX_PAGES = 25
@@ -107,7 +110,7 @@ class ADPCollector(BaseCollector):
                         )
                         continue
                     seen_external_ids.add(external_id)
-                    if not is_valid_job_title(title):
+                    if not is_valid_structured_job_title(title):
                         self.reject_candidate(
                             title,
                             rejection_reason(title),
@@ -199,15 +202,7 @@ def build_adp_api_request(board_url: str) -> tuple[str, dict[str, str]]:
     if parsed.scheme != "https" or host != ADP_HOST:
         raise ValueError("ADP collector requires an HTTPS workforcenow.adp.com job board URL")
 
-    marker_index = parsed.path.lower().find(ADP_RECRUITMENT_PATH)
-    if marker_index < 0:
-        raise ValueError("ADP collector requires a Workforce Now recruitment.html job board URL")
-    path_suffix = parsed.path[marker_index + len(ADP_RECRUITMENT_PATH):]
-    if path_suffix not in {"", "/"}:
-        raise ValueError("ADP Workforce Now job board URL has an unexpected path suffix")
-    prefix = parsed.path[:marker_index].rstrip("/")
-    if not prefix:
-        raise ValueError("ADP Workforce Now job board URL is missing its tenant path")
+    prefix = adp_career_center_prefix(parsed.path)
 
     query = parse_qs(parsed.query)
     cid = first_query_value(query, "cid")
@@ -217,6 +212,41 @@ def build_adp_api_request(board_url: str) -> tuple[str, dict[str, str]]:
     language = first_query_value(query, "lang") or "en_US"
     tenant_params = {"cid": cid, "ccId": cc_id, "lang": language, "locale": language}
     return urlunsplit(("https", ADP_HOST, f"{prefix}{ADP_API_SUFFIX}", "", "")), tenant_params
+
+
+def adp_career_center_prefix(path: str) -> str:
+    """Return the career-center path prefix that owns the requisition API.
+
+    A Workforce Now tenant is identified by ``cid``/``ccId``, not by the page it
+    is linked from. The same tenant is published as the recruitment board, as a
+    bare career-center alias, and as a job-detail link, and all three sit under
+    the same career-center prefix. Only the prefix is needed to address the API,
+    so accept any of them and fall back to ADP's standard shell path when the
+    stored URL carries no prefix of its own.
+    """
+    value = str(path or "")
+    marker_index = value.lower().find(ADP_RECRUITMENT_PATH)
+    if marker_index >= 0:
+        suffix = value[marker_index + len(ADP_RECRUITMENT_PATH):]
+        if suffix not in {"", "/"}:
+            raise ValueError("ADP Workforce Now job board URL has an unexpected path suffix")
+        prefix = value[:marker_index].rstrip("/")
+        if not prefix:
+            raise ValueError("ADP Workforce Now job board URL is missing its tenant path")
+        return prefix
+
+    # No recruitment.html: keep the leading path segments that precede any
+    # recruitment/career-center page name.
+    segments = [segment for segment in value.split("/") if segment]
+    kept: list[str] = []
+    for segment in segments:
+        lowered = segment.casefold()
+        if lowered in {"mdf", "recruitment", "careercenter", "career-center"} or lowered.endswith(".html"):
+            break
+        kept.append(segment)
+    if not kept:
+        return ADP_DEFAULT_CAREER_CENTER_PREFIX
+    return "/" + "/".join(kept)
 
 
 def build_api_url(api_url: str, tenant_params: dict[str, str], *, skip: int | None = None) -> str:
@@ -233,6 +263,9 @@ def build_detail_url(api_url: str, tenant_params: dict[str, str], external_id: s
 
 def build_destination_url(board_url: str, external_id: str) -> str:
     parsed = urlsplit(board_url)
+    # Always link to the recruitment board page, even when the stored URL was an
+    # alias or a detail link: that is the page that renders a given jobId.
+    canonical_path = f"{adp_career_center_prefix(parsed.path)}{ADP_RECRUITMENT_PATH}"
     allowed_names = {"cid": "cid", "ccid": "ccId", "type": "type", "lang": "lang"}
     query: list[tuple[str, str]] = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
@@ -240,7 +273,7 @@ def build_destination_url(board_url: str, external_id: str) -> str:
         if canonical_name and all(existing_key != canonical_name for existing_key, _value in query):
             query.append((canonical_name, value))
     query.append(("jobId", external_id))
-    return urlunsplit(("https", ADP_HOST, parsed.path, urlencode(query), ""))
+    return urlunsplit(("https", ADP_HOST, canonical_path, urlencode(query), ""))
 
 
 def response_json_object(response: Any) -> dict[str, Any]:

@@ -1,0 +1,13 @@
+{
+  "success": true,
+  "message": "No job found",
+  "data": {
+    "jobs": [],
+    "jobCount": 0,
+    "jobInfoOrder": {"payInfo": 9, "postingDate": "10"},
+    "searchResultText": "Number of Jobs: 0",
+    "displayText": "<p>Sorry, we have no current job openings. Thanks for your interest and please check back on this site for changes.</p>",
+    "showPostingDate": true,
+    "showWorkplaceType": false
+  }
+}

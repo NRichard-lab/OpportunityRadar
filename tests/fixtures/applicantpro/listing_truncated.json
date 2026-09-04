@@ -1,0 +1,33 @@
+{
+  "success": true,
+  "message": "This is where the full jobs list will show",
+  "data": {
+    "jobs": [
+      {
+        "id": 4179340,
+        "title": "Consumer Loan Processor I",
+        "city": "Riverton",
+        "subdomain": "examplecu",
+        "abbreviation": "PA",
+        "siteId": 8271,
+        "startDateRef": "Aug 17, 2026",
+        "orgTitle": "Consumer Lending",
+        "domainName": "applicantpro.com",
+        "stateName": "Pennsylvania",
+        "workplaceType": "Onsite",
+        "employmentType": "Full Time",
+        "payRate": null,
+        "payType": "Hourly",
+        "minSalary": "23",
+        "maxSalary": "34",
+        "jobLocation": "100 Example Street, Riverton, PA, USA",
+        "jobUrl": "https://examplecu.applicantpro.com/jobs/4179340"
+      }
+    ],
+    "jobCount": 9,
+    "searchResultText": "Number of Jobs: 9",
+    "displayText": "<p>Below is a list of the current openings with our company.</p>",
+    "showPostingDate": false,
+    "showWorkplaceType": false
+  }
+}
