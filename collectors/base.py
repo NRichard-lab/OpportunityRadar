@@ -173,15 +173,21 @@ def pick_collector(
     embedded_workforce_board = platform.strip() == "adp workforce now" and "workforcenow.adp.com" not in url
     if direct_workforce_api or embedded_workforce_board:
         return with_reason(ADPCollector(delay_seconds, debug, debug_dir), "Job Board URL matched or embeds the ADP Workforce Now public API.")
-    if "applicantpro" in platform or "applicantpro.com" in url:
+    # These two are matched on the board URL alone, not on stored platform
+    # metadata. Their collectors address a tenant by name, so a company whose
+    # stored board URL is its own careers page has no tenant to resolve; such a
+    # page is collectable by the generic collector, which renders the embedded
+    # board, and routing it here would only turn a working company into a
+    # permanently non-authoritative one.
+    if "applicantpro.com" in url:
         return with_reason(
             ApplicantProCollector(delay_seconds, debug, debug_dir),
-            "Job Platform or Job Board URL matched ApplicantPro.",
+            "Job Board URL matched an ApplicantPro tenant board.",
         )
-    if "isolved" in platform or "isolvedhire.com" in url:
+    if "isolvedhire.com" in url:
         return with_reason(
             IsolvedHireCollector(delay_seconds, debug, debug_dir),
-            "Job Platform or Job Board URL matched isolved Hire.",
+            "Job Board URL matched an isolved Hire tenant board.",
         )
     if "hrmdirect.com" in url:
         return with_reason(

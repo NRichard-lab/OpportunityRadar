@@ -370,18 +370,19 @@ class CollectorSelectionTests(unittest.TestCase):
             IsolvedHireCollector,
         )
 
-    def test_a_stored_platform_alone_selects_the_dedicated_collector(self) -> None:
-        # An official careers page that embeds the board still routes correctly.
-        selected = pick_collector(
-            company("https://www.example-credit-union.invalid/careers", "ApplicantPro"),
-            delay_seconds=0,
-        )
-        self.assertIsInstance(selected, ApplicantProCollector)
-        selected = pick_collector(
-            company("https://www.example-credit-union.invalid/careers", "isolved Hire"),
-            delay_seconds=0,
-        )
-        self.assertIsInstance(selected, IsolvedHireCollector)
+    def test_a_stored_platform_alone_does_not_select_the_dedicated_collector(self) -> None:
+        # These collectors address a tenant by name, so a company whose stored
+        # board URL is its own careers page has no tenant to resolve. Routing it
+        # here would make a working company permanently non-authoritative; the
+        # generic collector renders the embedded board instead.
+        for platform in ("ApplicantPro", "isolved Hire"):
+            with self.subTest(platform=platform):
+                selected = pick_collector(
+                    company("https://www.example-credit-union.invalid/careers", platform),
+                    delay_seconds=0,
+                )
+                self.assertNotIsInstance(selected, (ApplicantProCollector, IsolvedHireCollector))
+                self.assertEqual(type(selected).__name__, "GenericCollector")
 
 
 if __name__ == "__main__":
