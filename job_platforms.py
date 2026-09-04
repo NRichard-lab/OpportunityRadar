@@ -46,6 +46,31 @@ DAYFORCE_BOARD_PATH = re.compile(
     r"(?:/jobs/[0-9]+)?/?$",
     flags=re.IGNORECASE,
 )
+# Dayforce boards are frequently linked without the leading culture segment
+# (e.g. https://jobs.dayforcehcm.com/golden1/CANDIDATEPORTAL); the site itself
+# redirects those to the en-US board. Accept that shape and default the culture.
+DAYFORCE_BOARD_PATH_NO_CULTURE = re.compile(
+    r"^/(?P<namespace>[A-Za-z0-9_-]+)/(?P<board>[A-Za-z0-9_-]+)"
+    r"(?:/jobs/[0-9]+)?/?$",
+    flags=re.IGNORECASE,
+)
+DAYFORCE_DEFAULT_CULTURE = "en-US"
+
+
+def match_dayforce_board_path(path: str) -> tuple[str, str, str] | None:
+    """(culture, namespace, board) for a Dayforce board path, or None.
+
+    Falls back to the culture-less ``/<namespace>/<board>`` shape with the
+    default en-US culture so a board URL stored without the culture prefix is
+    still collectable.
+    """
+    match = DAYFORCE_BOARD_PATH.fullmatch(path or "")
+    if match:
+        return match.group("culture"), match.group("namespace"), match.group("board")
+    match = DAYFORCE_BOARD_PATH_NO_CULTURE.fullmatch(path or "")
+    if match:
+        return DAYFORCE_DEFAULT_CULTURE, match.group("namespace"), match.group("board")
+    return None
 
 
 def hostname_matches_domain(hostname: str, domain: str) -> bool:
@@ -89,8 +114,9 @@ def canonical_job_board_url(url: str) -> str:
         return value
     if port not in {None, 443}:
         return value
-    match = DAYFORCE_BOARD_PATH.fullmatch(parsed.path)
-    if not match:
+    matched = match_dayforce_board_path(parsed.path)
+    if matched is None:
         return value
-    board_path = "/{culture}/{namespace}/{board}".format(**match.groupdict())
+    culture, namespace, board = matched
+    board_path = f"/{culture}/{namespace}/{board}"
     return urlunsplit(("https", DAYFORCE_HOST, board_path, "", ""))

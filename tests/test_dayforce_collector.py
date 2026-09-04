@@ -198,11 +198,34 @@ class DayforceCollectorTests(unittest.TestCase):
         self.assertIsInstance(pick_collector(self.company, delay_seconds=0), DayforceCollector)
         with self.assertRaisesRegex(ValueError, "requires an HTTPS"):
             build_dayforce_urls("https://attacker.example/en-US/bellco/CANDIDATEPORTAL/jobs/9191")
-        with self.assertRaisesRegex(ValueError, "culture, tenant namespace"):
+        with self.assertRaisesRegex(ValueError, "tenant namespace"):
             build_dayforce_urls("https://jobs.dayforcehcm.com/api/geo/bellco/jobposting/search")
         attacker = "https://jobs.dayforcehcm.com.attacker.example/en-US/bellco/CANDIDATEPORTAL/jobs/9191"
         self.assertEqual(canonical_job_board_url(attacker), attacker)
         self.assertEqual(detect_job_platform(attacker), "")
+
+    def test_culture_less_board_url_is_normalised_to_the_en_us_board(self) -> None:
+        # Dayforce boards are commonly linked without the leading culture segment
+        # (e.g. .../golden1/CANDIDATEPORTAL); the site redirects those to en-US.
+        raw = "https://jobs.dayforcehcm.com/golden1/CANDIDATEPORTAL"
+        self.assertEqual(
+            canonical_job_board_url(raw),
+            "https://jobs.dayforcehcm.com/en-US/golden1/CANDIDATEPORTAL",
+        )
+        board_url, search_url, namespace, board_code, culture = build_dayforce_urls(raw)
+        self.assertEqual(board_url, "https://jobs.dayforcehcm.com/en-US/golden1/CANDIDATEPORTAL")
+        self.assertEqual((namespace, board_code, culture), ("golden1", "CANDIDATEPORTAL", "en-US"))
+        self.assertEqual(search_url, "https://jobs.dayforcehcm.com/api/geo/golden1/jobposting/search")
+        # a culture-less job-detail URL also resolves to the board root
+        self.assertEqual(
+            canonical_job_board_url("https://jobs.dayforcehcm.com/golden1/CANDIDATEPORTAL/jobs/4242"),
+            "https://jobs.dayforcehcm.com/en-US/golden1/CANDIDATEPORTAL",
+        )
+        # an explicit culture is still honoured, not overridden
+        self.assertEqual(
+            build_dayforce_urls("https://jobs.dayforcehcm.com/fr-CA/affinity/CANDIDATEPORTAL")[4],
+            "fr-CA",
+        )
 
     def test_official_h5_job_links_discover_the_canonical_dayforce_board(self) -> None:
         html = f"""

@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
-from job_platforms import DAYFORCE_BOARD_PATH, DAYFORCE_HOST, canonical_job_board_url
+from job_platforms import DAYFORCE_HOST, canonical_job_board_url, match_dayforce_board_path
 from job_tools import JobRecord, make_job_id
 from job_validation import is_valid_structured_job_title, normalize_job_title, rejection_reason
 
@@ -255,12 +255,10 @@ def build_dayforce_urls(board_url: str) -> tuple[str, str, str, str, str]:
         raise ValueError("Dayforce job board URL contains an invalid port") from exc
     if port not in {None, 443}:
         raise ValueError("Dayforce job board URL contains unsupported authority components")
-    match = DAYFORCE_BOARD_PATH.fullmatch(parsed.path)
-    if not match:
-        raise ValueError("Dayforce collector requires a culture, tenant namespace, and job board code")
-    culture = match.group("culture")
-    namespace = match.group("namespace")
-    board_code = match.group("board")
+    matched = match_dayforce_board_path(parsed.path)
+    if matched is None:
+        raise ValueError("Dayforce collector requires a tenant namespace and job board code")
+    culture, namespace, board_code = matched
     root_path = f"/{culture}/{namespace}/{board_code}"
     normalized_board = urlunsplit(("https", DAYFORCE_HOST, root_path, "", ""))
     search_url = f"https://{DAYFORCE_HOST}/api/geo/{namespace}/jobposting/search"
