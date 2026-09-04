@@ -104,14 +104,165 @@ Expect a usable DOM and no `page.on("crash")`.
 `test_content_heavy_page_renders_without_a_page_crash`) and is not skipped when
 the protected boundary validates.
 
-## Known follow-ups (not Release 3)
+## Release 4 -- the driver-crash spin, as it actually happened
 
-- **Playwright *driver* assertion crash** (`coreBundle.js` `_CRSession._onMessage`
-  assertion, Node driver exits) on a target-crash race can leave a
-  `concurrent.futures` collection worker spinning a CPU. `cab3e46`'s
-  `_CloseGuard` bounds the *lease*, not this. Recommended: a hard wall-clock
-  timeout around each company's collection in `run_collection_group` so a dead
-  driver cannot pin a core.
+Release 3 listed the Playwright *driver* assertion crash as a known follow-up. On
+**2026-09-04T21:23:07Z** it happened in production and took company refresh down.
+
+### What was observed
+
+```
+21:23:07  coreBundle.js:463  throw new Error(message || "Assertion error");
+          Error: Invalid InterceptionId.
+            at assert (coreBundle.js:463:11)
+            at _CRSession._onMessage (coreBundle.js:34801:11)
+            at CRConnection._onMessage (coreBundle.js:34738:20)
+            at Immediate.<anonymous> (coreBundle.js:39185:28)
+          Node.js v24.18.1                       <- driver process exits
+21:23:12  Future exception was never retrieved
+          TargetClosedError('Page crashed ... navigating to
+          "https://careers.fcsamerica.com/", waiting until "domcontentloaded"')
+```
+
+For the next 37 minutes the backend held **88.9% -> 97.5% of its one CPU** with
+resident memory byte-identical across samples (238,865,612.8 B) -- no allocation,
+no work. `docker inspect` reported `healthy` throughout, because `/api/health`
+checks storage only. Every company refresh in that window failed.
+
+`py-spy dump` against the live container named the thread exactly:
+
+```
+Thread 1195 (active+gil): "AnyIO worker thread"
+    _sync (playwright/_impl/_sync_base.py:113)
+    close (playwright/sync_api/_generated.py:16425)      <- Browser.close()
+    close (backend/outbound_security.py:1200)
+    discover_job_board_with_browser (browser_tools.py:97)
+    enrich_company (main.py:177)
+    refresh_single_company_information (backend/utility_tasks.py:54)
+    run_single_company_refresh (server.py:1270)
+    refresh_company_endpoint (server.py:740)             <- inside api_mutation
+```
+
+### Diagnosis
+
+**The driver death.** `CRSession._onMessage` ends with
+`assert(!object.id, object?.error?.message)`. It fires when a CDP *error response*
+arrives carrying an `id` whose callback has already been cleared by session
+teardown, and whose error code is not the whitelisted `-32001`. A renderer crash
+clears the callbacks; Chromium then answers the already-cancelled
+`Fetch.continueRequest` with `Invalid InterceptionId`; the assert throws from
+`processImmediate`, i.e. at Node's top level, so the driver process dies.
+
+This is an upstream race, and **no Python-side check can prevent it**: our command
+is already in flight when the renderer dies, and the throw happens in the driver's
+*receive* path. Playwright **1.62.0 is the newest release**, so there is no
+upstream fix to adopt. The window can be narrowed; the failure must be survivable.
+
+**The spin.** Playwright's sync pump is
+
+```python
+task.add_done_callback(lambda _: g_self.switch())
+while not task.done():
+    self._dispatcher_fiber.switch()
+```
+
+Pure Python bytecode with no syscall. When the driver dies abruptly mid-dispatch
+the dispatcher stops completing the task, `switch()` returns immediately, and the
+loop runs forever at 100% of a core. Nothing external reaches it: it never blocks,
+so signals, socket timeouts and `SIGKILL`ing the (already dead) driver all miss.
+`_CloseGuard` cannot help either -- its escalation assumes `close()` is *blocked*
+on a live-but-wedged driver, so it frees a blocked reader, never a spinner.
+
+What was measured in the pinned image, under the full production posture:
+
+| operation on a connection whose driver is dead | result |
+|---|---|
+| `BrowserContext.new_context`, `Page.goto` | raises in 0.01s |
+| `Playwright.stop()` | returns |
+| `Browser.close()` right after a `SIGKILL`ed driver | raises in 0.2s, 1 tick |
+| **`chromium.launch()` after that close** | **1186 ticks / 12s = 99% of one core, forever** |
+
+So a cleanly killed driver is handled; **reusing the Playwright instance
+afterwards is what spins**. Two hypotheses were tested and rejected: file-descriptor
+inheritance (no Chromium process holds the driver's stdio pipes, so death does
+produce EOF) and `Browser.close()` awaiting a `_closed_future` (1.62.0 has no such
+await). An exception escaping a route handler does not spin, but it does leave the
+request unsettled and resurfaces on a later unrelated call -- also measured.
+
+The production stack spun in `close()` rather than in a relaunch, so the exact
+interleaving of that one incident (driver dying from its own assertion
+*mid-dispatch*, rather than by signal) was not reproduced bit-for-bit. That is why
+the fix is built to be indifferent to which call wedges: every Playwright call that
+can wedge carries the same outer bound.
+
+`tests/integration/test_browser_lease_real_chromium.py::test_relaunch_after_driver_death_cannot_spin_a_core`
+pins the reproduced spin. An 8-round alternating crash/relaunch stress run finished
+every round at 0% CPU with no Chromium left.
+
+**The blast radius.** The wedged thread was inside `refresh_company_endpoint`,
+which runs under `with api_mutation("refresh-company")`. Its `finally:
+lease.release()` never ran, so `MutationGate._active` stayed set and every later
+mutating request was rejected with `409 Another mutating operation is active`.
+That 409 is what the Companies page rendered in its refresh panel.
+
+### The fix
+
+1. **`_settle_route`** (`backend/outbound_security.py`). Every intercepted request
+   is completed exactly once, and the handler never raises. A route handler runs
+   inside Playwright's dispatcher: an escaping exception leaves the request
+   unsettled (the page load then hangs to its timeout) and resurfaces on an
+   unrelated later call -- measured. Settlement is idempotent, and every failure
+   path is fail-closed: an unverified request is never continued.
+2. **`hard_bounded_playwright_call`** + **`protected_playwright_session`**. Every
+   Playwright call that can wedge -- `chromium.launch()`, `Browser.close()`,
+   `Playwright.stop()` -- carries an outer hard bound. On expiry the owning thread
+   is unwound with `BrowserTeardownAbandoned` via `PyThreadState_SetAsyncExc`, the
+   only mechanism that reaches a thread executing an uninterruptible pure-Python
+   loop. Verified to land exactly at the spin site:
+
+   ```
+   File ".../playwright/_impl/_sync_base.py", line 113, in _sync
+       self._dispatcher_fiber.switch()
+   backend.outbound_security.BrowserTeardownAbandoned
+   ```
+
+   The Chromium tree and driver are then reaped (`_reap_orphaned_launch` covers an
+   abandoned launch, which has no `_LeasedBrowser` to reap through), the abandoned
+   connection's loop is muted so it cannot emit `Task exception was never
+   retrieved` for orphaned tasks, and the lease is released only once termination
+   is proven -- the existing fail-closed lease behaviour is unchanged.
+3. **Gate observability** (`backend/operation_gate.py`). `ActiveOperation` now
+   records the owning thread id/name, start time, elapsed seconds and last
+   reported progress; `StalledOperationWatcher` logs a `CRITICAL` line once a
+   mutation has been held past its threshold. The gate is **still never cleared
+   automatically** -- see below.
+4. **`GET /api/diagnostics/runtime`** (administrator-only) reports gate state,
+   browser lease state, last browser progress/completion, and the last driver
+   failure.
+
+### Deliberate limitations
+
+- **The gate is not auto-released, ever.** It serialises writes to the shared
+  SQLite database and the export snapshots. Releasing it on a timer, while the
+  original operation might still be writing, would admit a second writer and
+  corrupt precisely what the gate protects. A thread cannot prove another thread
+  has stopped writing. `ownerAlive: false` identifies a genuinely leaked lease and
+  a large `secondsSinceProgress` identifies a wedged one, but the only recovery
+  that conclusively ends every owner is a backend restart.
+- **No CPU-spin check in the application.** A process cannot reliably tell its own
+  busy loop from legitimate heavy work, and an ordinary spike must never mark the
+  public service unhealthy. Spin detection belongs to host metrics: `docker stats`
+  (sustained CPU with flat memory) and per-thread `utime` in
+  `/proc/<pid>/task/*/stat`. `py-spy dump --pid <uvicorn pid>` from a
+  `--pid=host --cap-add SYS_PTRACE` container names the wedged thread.
+- **`/api/health` is unchanged** and stays storage-only: it is public, so it must
+  not leak internal identifiers, and it must not flap on load.
+
+## Known follow-ups
+
 - **Host CPU contention.** 1 shared vCPU with heavy steal is marginal for
   headless Chromium; a dedicated core or a second vCPU would remove the residual
   watchdog-timeout crashes that no container limit can fix.
+- **Process isolation for browser collection.** Running each company's collection
+  in a child process would make driver death a `SIGKILL`-able unit and remove the
+  need to unwind a thread at all. That is a design change, not an emergency fix.

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -247,3 +249,242 @@ def test_content_heavy_page_renders_without_a_page_crash(runtime, playwright):
         leased.close()
         _reset_lease_state()
         _wait_clean(runtime)
+
+
+# --- Regression: 2026-09-04 Playwright driver death -> 100% CPU spin ----------
+#
+# The driver died from an uncaught assertion ("Invalid InterceptionId" at
+# coreBundle.js:34801) and the worker thread then spun inside Browser.close() at
+# ~91-97% of one core for 37 minutes, holding the mutation gate the whole time
+# while /api/health -- which checks storage only -- kept reporting healthy.
+#
+# Each scenario runs in its OWN process. A dead driver poisons the Playwright
+# instance that owns it, so these cannot share the module-scoped fixture; and a
+# separate process is the only honest way to assert "this work returned to idle",
+# because the whole failure mode is a thread that never returns.
+
+_DRIVER_DEATH_SCENARIO = '''
+import os, signal, sys, time
+sys.path.insert(0, "/app")
+import backend.outbound_security as ob
+from playwright.sync_api import sync_playwright
+
+ROUNDS = int(sys.argv[1])
+
+
+def ticks():
+    with open("/proc/self/stat") as handle:
+        rest = handle.read().split(") ", 1)[1].split()
+    return int(rest[11]) + int(rest[12])
+
+
+for attempt in range(ROUNDS):
+    playwright = sync_playwright().start()
+    leased = ob.launch_playwright_chromium(playwright, headless=True)
+    context = leased.new_context()
+    ob.install_playwright_url_guard(context)
+    page = context.new_page()
+    page.goto("data:text/html,<h1>careers</h1>", wait_until="domcontentloaded")
+
+    driver_pid, driver_start = leased._driver_proc
+    assert ob._proc_alive(driver_pid, driver_start), "driver not alive before the kill"
+    os.kill(driver_pid, signal.SIGKILL)
+    deadline = time.monotonic() + 15
+    while ob._proc_alive(driver_pid, driver_start) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not ob._proc_alive(driver_pid, driver_start), "driver did not die"
+    print("DRIVER_DEAD attempt=%d" % attempt, flush=True)
+
+    started = time.monotonic()
+    before = ticks()
+    try:
+        leased.close()
+        outcome = "returned"
+    except ob.BrowserTeardownAbandoned:
+        outcome = "abandoned"
+    except Exception as exc:
+        outcome = "raised:%s" % type(exc).__name__
+    elapsed = time.monotonic() - started
+    during = ticks() - before
+    print("CLOSE attempt=%d outcome=%s elapsed=%.1f ticks=%d" % (attempt, outcome, elapsed, during), flush=True)
+
+    try:
+        playwright.stop()
+    except Exception:
+        pass
+
+    ob._reset = None
+    with ob._browser_lease_state_lock:
+        ob._current_leased_browser = None
+    if ob._browser_launch_lease.locked():
+        try:
+            ob._browser_launch_lease.release()
+        except RuntimeError:
+            pass
+
+    idle_before = ticks()
+    time.sleep(3.0)
+    idle = ticks() - idle_before
+    print("IDLE attempt=%d ticks_per_3s=%d" % (attempt, idle), flush=True)
+
+print("SCENARIO_COMPLETE", flush=True)
+'''
+
+
+def _run_driver_death_scenario(rounds: int, timeout: int):
+    completed = subprocess.run(
+        [sys.executable, "-c", _DRIVER_DEATH_SCENARIO, str(rounds)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd="/app",
+    )
+    return completed
+
+
+def _parse(prefix: str, stdout: str) -> list[dict]:
+    rows = []
+    for line in stdout.splitlines():
+        if not line.startswith(prefix + " "):
+            continue
+        row = {}
+        for token in line.split()[1:]:
+            key, _, value = token.partition("=")
+            row[key] = value
+        rows.append(row)
+    return rows
+
+
+def test_driver_death_teardown_is_bounded_and_returns_to_idle(runtime):
+    """The exact production failure: kill the driver, then tear down.
+
+    The process must finish at all (the bug was an unbounded spin), close() must
+    complete inside its hard bound, and the process must go back to idle.
+    """
+    completed = _run_driver_death_scenario(rounds=1, timeout=300)
+    assert "SCENARIO_COMPLETE" in completed.stdout, (
+        f"scenario did not finish\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr[-3000:]}"
+    )
+    assert completed.returncode == 0, completed.stderr[-3000:]
+
+    close_rows = _parse("CLOSE", completed.stdout)
+    assert close_rows, completed.stdout
+    bound = 200.0
+    for row in close_rows:
+        assert float(row["elapsed"]) < bound, f"close() took {row['elapsed']}s: {completed.stdout}"
+        assert row["outcome"] in {"returned", "abandoned"} or row["outcome"].startswith("raised:"), row
+
+    for row in _parse("IDLE", completed.stdout):
+        burned = int(row["ticks_per_3s"])
+        assert burned < 100, (
+            f"process burned {burned} ticks in 3s after teardown "
+            f"({burned / 3.0:.0f}% of one core) -- it is spinning, not idle\n{completed.stdout}"
+        )
+
+
+def test_repeated_driver_death_always_returns_to_idle(runtime):
+    """Stress: recovery must hold over repeated crashes, not just the first."""
+    completed = _run_driver_death_scenario(rounds=3, timeout=600)
+    assert "SCENARIO_COMPLETE" in completed.stdout, (
+        f"scenario did not finish\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr[-3000:]}"
+    )
+    assert completed.returncode == 0, completed.stderr[-3000:]
+    idle_rows = _parse("IDLE", completed.stdout)
+    assert len(idle_rows) == 3, completed.stdout
+    for index, row in enumerate(idle_rows):
+        burned = int(row["ticks_per_3s"])
+        assert burned < 100, f"attempt {index} still burning CPU ({burned} ticks/3s)\n{completed.stdout}"
+
+
+_RELAUNCH_SPIN_SCENARIO = '''
+import os, signal, sys, time
+sys.path.insert(0, "/app")
+import backend.outbound_security as ob
+from playwright.sync_api import sync_playwright
+
+
+def ticks():
+    with open("/proc/self/stat") as handle:
+        rest = handle.read().split(") ", 1)[1].split()
+    return int(rest[11]) + int(rest[12])
+
+
+playwright = sync_playwright().start()
+leased = ob.launch_playwright_chromium(playwright, headless=True)
+context = leased.new_context()
+ob.install_playwright_url_guard(context)
+page = context.new_page()
+page.goto("data:text/html,<h1>careers</h1>", wait_until="domcontentloaded")
+
+driver_pid, driver_start = leased._driver_proc
+os.kill(driver_pid, signal.SIGKILL)
+deadline = time.monotonic() + 15
+while ob._proc_alive(driver_pid, driver_start) and time.monotonic() < deadline:
+    time.sleep(0.1)
+assert not ob._proc_alive(driver_pid, driver_start), "driver did not die"
+
+try:
+    leased.close()
+except Exception:
+    pass
+with ob._browser_lease_state_lock:
+    ob._current_leased_browser = None
+if ob._browser_launch_lease.locked():
+    try:
+        ob._browser_launch_lease.release()
+    except RuntimeError:
+        pass
+
+# Reusing this Playwright instance is what spun a whole core in production.
+start = time.monotonic()
+before = ticks()
+try:
+    ob.launch_playwright_chromium(playwright, headless=True)
+    outcome = "returned"
+except ob.BrowserTeardownAbandoned:
+    outcome = "abandoned"
+except BaseException as exc:
+    outcome = "raised:%s" % type(exc).__name__
+print("RELAUNCH outcome=%s elapsed=%.1f ticks=%d" % (outcome, time.monotonic() - start, ticks() - before), flush=True)
+
+idle_before = ticks()
+time.sleep(3.0)
+print("IDLE ticks_per_3s=%d" % (ticks() - idle_before), flush=True)
+print("SCENARIO_COMPLETE", flush=True)
+'''
+
+
+def test_relaunch_after_driver_death_cannot_spin_a_core(runtime):
+    """Regression for the measured 99%-of-a-core spin.
+
+    A Playwright instance whose driver has died is poisoned: a later
+    ``chromium.launch()`` on it busy-loops in Playwright's sync pump instead of
+    failing. It must be abandoned by the hard bound, and the process must return
+    to idle rather than pinning a CPU.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", _RELAUNCH_SPIN_SCENARIO],
+        capture_output=True,
+        text=True,
+        timeout=400,
+        env={**os.environ, "OPPORTUNITY_RADAR_BROWSER_LAUNCH_BOUND_SECONDS": "15"},
+        cwd="/app",
+    )
+    assert "SCENARIO_COMPLETE" in completed.stdout, (
+        f"the relaunch never finished -- it is still spinning\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr[-3000:]}"
+    )
+    relaunch = _parse("RELAUNCH", completed.stdout)
+    assert relaunch, completed.stdout
+    assert relaunch[0]["outcome"] in {"abandoned", "returned"} or relaunch[0]["outcome"].startswith(
+        "raised:"
+    ), relaunch[0]
+    assert float(relaunch[0]["elapsed"]) < 60.0, completed.stdout
+
+    idle = _parse("IDLE", completed.stdout)
+    assert idle, completed.stdout
+    burned = int(idle[0]["ticks_per_3s"])
+    assert burned < 100, (
+        f"still burning CPU after the abandonment: {burned} ticks in 3s "
+        f"({burned / 3.0:.0f}% of one core)\n{completed.stdout}"
+    )

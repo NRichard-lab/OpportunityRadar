@@ -126,6 +126,21 @@ class CollectionRetentionTests(unittest.TestCase):
         retained = next(item for item in summary["collection_results"] if item["companyName"] == "Alpha Bank")
         self.assertEqual(retained["dataDisposition"], "retained")
 
+    def test_abandoned_browser_teardown_retains_last_known_jobs(self) -> None:
+        """A hard-bounded teardown that had to be abandoned is a failure, not an
+        authoritative "this company has no jobs". Regression for 2026-09-04."""
+        from backend.outbound_security import BrowserTeardownAbandoned
+
+        self.write_existing()
+        summary = self.run_collection({
+            "company-a": BrowserTeardownAbandoned("close() exceeded its hard bound"),
+            "company-b": [self.job("new-b", "company-b", "Beta Bank", "Senior Cloud Engineer")],
+        })
+        self.assertEqual(self.loaded_ids(), {"old-a", "new-b"})
+        self.assertEqual(summary["outcome_counts"]["failed"], 1)
+        retained = next(item for item in summary["collection_results"] if item["companyName"] == "Alpha Bank")
+        self.assertEqual(retained["dataDisposition"], "retained")
+
     def test_partial_discovery_is_added_while_existing_is_retained(self) -> None:
         from job_tools import CollectionNotAuthoritative
 

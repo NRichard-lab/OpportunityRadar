@@ -6,7 +6,7 @@ import logging
 import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Literal
@@ -48,8 +48,8 @@ from backend.email_service import EmailConfigurationError, EmailDeliveryError, E
 from backend.email_scheduler import EmailScheduler
 from backend.migration import excel_company_to_api
 from backend.maintenance_scheduler import DEFAULT_TIMEZONE, MaintenanceScheduler
-from backend.operation_gate import GLOBAL_MUTATION_GATE, OperationConflictError
-from backend.outbound_security import OutboundSecurityError, validate_outbound_url
+from backend.operation_gate import GLOBAL_MUTATION_GATE, GLOBAL_STALL_WATCHER, OperationConflictError
+from backend.outbound_security import OutboundSecurityError, browser_diagnostics, validate_outbound_url
 from backend.repository import DuplicateCompanyError, OpportunityRepository
 from backend.resume_files import build_resume_profile
 from backend.resume_matching import ResumeMatchService
@@ -386,6 +386,34 @@ def health_endpoint() -> JSONResponse:
     return JSONResponse(
         content=result.payload,
         status_code=result.status_code,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/diagnostics/runtime", dependencies=[Depends(require_administrator)])
+def runtime_diagnostics_endpoint() -> JSONResponse:
+    """Administrator-only view of the state ``/api/health`` deliberately cannot show.
+
+    ``/api/health`` is public and checks storage only, so a backend whose worker
+    is wedged -- holding the mutation gate and rejecting every refresh -- still
+    reports ``healthy``. That is the correct behaviour for a public probe: an
+    ordinary slow or busy operation must not mark the service unhealthy, and the
+    probe must not leak internal identifiers. The facts needed to diagnose a
+    wedge live here instead, behind administrator authentication.
+
+    Note on CPU: a spinning worker is only reliably identified from host-level
+    metrics (``docker stats``, per-thread ``utime`` in ``/proc``). This process
+    cannot distinguish its own busy loop from legitimate heavy work, so no CPU
+    check is reported here rather than reporting a misleading one.
+    """
+    return JSONResponse(
+        content={
+            "version": DEPLOYMENT_VERSION,
+            "checkedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "mutationGate": GLOBAL_MUTATION_GATE.diagnostics(),
+            "browser": browser_diagnostics(),
+            "features": feature_flags_payload(),
+        },
         headers={"Cache-Control": "no-store"},
     )
 
@@ -1587,6 +1615,9 @@ def configure_logging_once() -> None:
 @app.on_event("startup")
 def start_maintenance_scheduler() -> None:
     GLOBAL_MUTATION_GATE.start_accepting()
+    # Storage-only readiness cannot see a wedged worker, so a held gate is
+    # surfaced in the log instead. The watcher never touches the lease.
+    GLOBAL_STALL_WATCHER.start()
     if _utility_run_manager is not None:
         _utility_run_manager.start_accepting()
     validate_auth_configuration()
@@ -1619,6 +1650,7 @@ def start_maintenance_scheduler() -> None:
 @app.on_event("shutdown")
 def stop_maintenance_scheduler() -> None:
     GLOBAL_MUTATION_GATE.stop_accepting()
+    GLOBAL_STALL_WATCHER.stop()
     if _maintenance_scheduler is not None:
         _maintenance_scheduler.stop()
     if _email_scheduler is not None:

@@ -11,7 +11,12 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
 
-from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
+from backend.outbound_security import (
+    install_playwright_url_guard,
+    launch_playwright_chromium,
+    protected_playwright_session,
+    safe_page_goto,
+)
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_enrichment import extract_json_ld_pay_info, extract_pay_info
@@ -92,9 +97,8 @@ class GenericCollector(BaseCollector):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browser_path)
 
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as playwright:
+        with protected_playwright_session(__name__) as playwright:
             browser = launch_playwright_chromium(playwright, headless=True)
             context = None
             try:

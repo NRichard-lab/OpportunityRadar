@@ -11,7 +11,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
+from backend.outbound_security import (
+    install_playwright_url_guard,
+    launch_playwright_chromium,
+    protected_playwright_session,
+    safe_page_goto,
+)
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_platforms import DAYFORCE_HOST, canonical_job_board_url, match_dayforce_board_path
@@ -177,9 +182,8 @@ class DayforceCollector(BaseCollector):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browser_path)
 
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as playwright:
+        with protected_playwright_session(__name__) as playwright:
             browser = launch_playwright_chromium(playwright, headless=True)
             context = None
             try:

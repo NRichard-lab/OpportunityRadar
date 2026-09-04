@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
+import ctypes
 import functools
 import ipaddress
 import importlib.metadata
@@ -597,6 +599,76 @@ def _validate_redirect_limit(value: int) -> int:
     return value
 
 
+_ROUTE_SETTLED_ATTRIBUTE = "_opportunity_radar_settled"
+
+
+def _redact_url(value: str) -> str:
+    """URLs reach the log only as scheme://host/path, never with credentials or query."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "<unparsable-url>"
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{host}{port}{parts.path}"[:200]
+
+
+def _call_on_blocked(
+    on_blocked: Callable[[str, OutboundSecurityError], None],
+    request_url: str,
+    error: OutboundSecurityError,
+) -> None:
+    """A reporting callback must never break request settlement."""
+    try:
+        on_blocked(request_url, error)
+    except BaseException:  # noqa: BLE001
+        logger.warning("on_blocked callback raised; continuing to settle the route.", exc_info=True)
+
+
+def _settle_route(route: Any, *, allow: bool, request_url: str) -> str:
+    """Complete an intercepted request exactly once, and never raise.
+
+    Two hazards are handled here:
+
+    * **Staleness.** When a renderer crashes or its page/context closes, every
+      interception id that belonged to it dies with it. Playwright surfaces the
+      resulting ``continue``/``abort`` as an error, and Chromium may additionally
+      answer the already-cancelled command with ``Invalid InterceptionId``. There
+      is nothing to recover: the request cannot proceed either way, so the
+      failure is recorded and swallowed.
+    * **Dispatcher poisoning.** A route handler runs inside Playwright's
+      dispatcher. An exception escaping it leaves the intercepted request
+      unsettled (the page load then hangs until its timeout) and surfaces later
+      on an unrelated call. Nothing may escape.
+
+    Fail-closed: any failure leaves the request unsettled, which is a denial.
+    ``allow`` is only ever honoured when validation positively succeeded.
+    """
+
+    if getattr(route, _ROUTE_SETTLED_ATTRIBUTE, False):
+        return "duplicate"
+    try:
+        setattr(route, _ROUTE_SETTLED_ATTRIBUTE, True)
+    except BaseException:  # noqa: BLE001 - Playwright objects may use __slots__
+        pass
+
+    try:
+        if allow:
+            route.continue_()
+            return "continued"
+        route.abort("blockedbyclient")
+        return "aborted"
+    except BaseException as exc:  # noqa: BLE001
+        logger.debug(
+            "Intercepted request %s could not be settled (%s: %s); its target is gone, "
+            "so the request does not proceed.",
+            _redact_url(request_url),
+            type(exc).__name__,
+            str(exc).splitlines()[0][:160] if str(exc) else "",
+        )
+        return "unsettled"
+
+
 def install_playwright_url_guard(
     context: Any,
     *,
@@ -611,6 +683,7 @@ def install_playwright_url_guard(
 
     def guard(route: Any, request: Any) -> None:
         request_url = str(getattr(request, "url", ""))
+        allow = False
         try:
             if _playwright_redirect_depth(request) > redirect_limit:
                 raise OutboundRedirectLimitExceeded(
@@ -621,12 +694,25 @@ def install_playwright_url_guard(
                 resolver=resolver,
                 allowed_ports=allowed_ports,
             )
+            allow = True
         except OutboundSecurityError as exc:
             if on_blocked is not None:
-                on_blocked(request_url, exc)
-            route.abort("blockedbyclient")
-            return
-        route.continue_()
+                _call_on_blocked(on_blocked, request_url, exc)
+        except BaseException as exc:  # noqa: BLE001
+            # An unexpected validator failure is NOT permission to proceed. Fail
+            # closed and keep the exception out of Playwright's dispatcher.
+            logger.error(
+                "Outbound URL validation failed unexpectedly for %s; refusing the request.",
+                _redact_url(request_url),
+                exc_info=True,
+            )
+            if on_blocked is not None:
+                _call_on_blocked(
+                    on_blocked,
+                    request_url,
+                    UnsafeOutboundDestination(f"Validation failed: {type(exc).__name__}"),
+                )
+        _settle_route(route, allow=allow, request_url=request_url)
 
     context.route("**/*", guard)
     route_web_socket = getattr(context, "route_web_socket", None)
@@ -637,8 +723,16 @@ def install_playwright_url_guard(
                 "Browser WebSocket connections are not allowed by the HTTP(S)-only outbound policy."
             )
             if on_blocked is not None:
-                on_blocked(request_url, error)
-            web_socket_route.close(code=1008, reason="Outbound WebSocket blocked")
+                _call_on_blocked(on_blocked, request_url, error)
+            try:
+                web_socket_route.close(code=1008, reason="Outbound WebSocket blocked")
+            except BaseException:  # noqa: BLE001
+                # Same dispatcher rule as _settle_route: a dead target cannot be
+                # closed, and the socket is denied either way.
+                logger.debug(
+                    "Blocked WebSocket %s could not be closed; its target is gone.",
+                    _redact_url(request_url),
+                )
 
         route_web_socket("**/*", block_web_socket)
     return guard
@@ -651,6 +745,46 @@ _browser_launch_lease = threading.Lock()
 # owning thread released it.
 _browser_lease_state_lock = threading.Lock()
 _current_leased_browser: "_LeasedBrowser | None" = None
+# Browser-side observability. Storage checks alone cannot see a wedged or
+# abandoned browser teardown, so the facts a responder needs are recorded here
+# and surfaced through ``browser_diagnostics()``.
+_browser_diagnostics_lock = threading.Lock()
+_browser_diagnostics: dict[str, Any] = {
+    "last_launch_at": None,
+    "last_progress_at": None,
+    "last_completion_at": None,
+    "last_driver_failure": None,
+    "driver_failures": 0,
+    "abandoned_teardowns": 0,
+}
+
+
+def _utc_stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def note_browser_progress() -> None:
+    """Record that browser work is still making forward progress."""
+    with _browser_diagnostics_lock:
+        _browser_diagnostics["last_progress_at"] = _utc_stamp()
+
+
+def browser_diagnostics() -> dict[str, Any]:
+    """A point-in-time, non-secret view of browser-subsystem health."""
+    with _browser_diagnostics_lock:
+        snapshot = dict(_browser_diagnostics)
+    with _browser_lease_state_lock:
+        leased = _current_leased_browser
+    snapshot["leaseHeld"] = _browser_launch_lease.locked()
+    snapshot["leaseOwnerActive"] = leased is not None
+    live = 0
+    if leased is not None:
+        try:
+            live = len(_live_recorded_procs(leased._procs))
+        except BaseException:  # noqa: BLE001 - pragma: no cover
+            live = -1
+    snapshot["liveBrowserProcesses"] = live
+    return snapshot
 _browser_boundary_lock = threading.Lock()
 _browser_proxy_process: subprocess.Popen[bytes] | None = None
 _browser_boundary_directory: Path | None = None
@@ -720,19 +854,40 @@ def _launch_protected_playwright_chromium(playwright: Any, supplied: Mapping[str
     _require_browser_proxy_ready(runtime)
     _acquire_browser_launch_lease(runtime)
     try:
+        before_procs = _capture_browser_procs(runtime.chromium_executable)
+    except BaseException:  # noqa: BLE001 - pragma: no cover - defensive
+        before_procs = {}
+    try:
         launch_options.update({
             "args": [*arguments, *_PROTECTED_BROWSER_ARGUMENTS],
             "chromium_sandbox": True,
             "env": _browser_child_environment(runtime),
             "executable_path": runtime.wrapper_executable,
         })
-        browser = playwright.chromium.launch(**launch_options)
-    except BaseException:
+        # A launch issued on a connection whose driver has already died spins in
+        # Playwright's sync pump at ~99% of a core instead of failing -- measured
+        # in the pinned image, and the shape of the 2026-09-04 production incident.
+        # Reusing a Playwright instance after a driver death is what makes this
+        # reachable, so the launch carries the same hard bound as teardown.
+        with hard_bounded_playwright_call(
+            "Protected chromium launch", _browser_launch_bound_seconds()
+        ):
+            browser = playwright.chromium.launch(**launch_options)
+    except BaseException as exc:
+        if isinstance(exc, BrowserTeardownAbandoned):
+            _silence_abandoned_playwright_loop(playwright)
+        # An abandoned launch has no _LeasedBrowser to reap through, so anything
+        # it did manage to start would otherwise be orphaned. Reap it here before
+        # the lease is handed to the next caller.
+        _reap_orphaned_launch(runtime, before_procs)
         _release_browser_launch_lease_locked()
         raise
     leased = _LeasedBrowser(browser, _browser_launch_lease, runtime)
     with _browser_lease_state_lock:
         globals()["_current_leased_browser"] = leased
+    with _browser_diagnostics_lock:
+        _browser_diagnostics["last_launch_at"] = _utc_stamp()
+        _browser_diagnostics["last_progress_at"] = _utc_stamp()
     return leased
 
 
@@ -759,6 +914,55 @@ def _browser_driver_grace_seconds() -> float:
     """Extra seconds after the Chromium tree is gone before the guard kills the
     wedged Playwright node driver so a blocked ``close()`` can return."""
     return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_DRIVER_GRACE_SECONDS", 6.0)
+
+
+def _reap_orphaned_launch(runtime: "BrowserRuntimeBoundary", before: Mapping[int, int]) -> None:
+    """Terminate any Chromium a failed/abandoned launch left behind.
+
+    Only processes that appeared *after* the launch began and pass the same
+    identity check as a normal reap are ever signalled.
+    """
+    try:
+        after = _capture_browser_procs(runtime.chromium_executable)
+    except BaseException:  # noqa: BLE001 - pragma: no cover - defensive
+        return
+    orphans = {pid: start for pid, start in after.items() if before.get(pid) != start}
+    if not orphans:
+        return
+    logger.warning("Reaping %s Chromium process(es) orphaned by a failed launch.", len(orphans))
+    _reap_browser_process_tree(orphans)
+
+
+def _browser_launch_bound_seconds() -> float:
+    """Hard bound on ``chromium.launch()`` before the call is abandoned.
+
+    Generous: a cold Chromium start on a contended single vCPU is legitimately
+    slow, so this must only catch a call that can never finish.
+    """
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_LAUNCH_BOUND_SECONDS", 180.0)
+
+
+def _browser_stop_bound_seconds() -> float:
+    """Hard bound on ``Playwright.stop()`` before the call is abandoned."""
+    return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_STOP_BOUND_SECONDS", 30.0)
+
+
+def _browser_close_bound_seconds() -> float:
+    """Hard bound on ``Browser.close()`` before the call is abandoned.
+
+    Sits strictly outside the ``_CloseGuard`` escalation budget: the guard is
+    given every chance to unblock a merely-slow close before the thread is
+    unwound.
+    """
+    explicit = os.environ.get("OPPORTUNITY_RADAR_BROWSER_CLOSE_BOUND_SECONDS", "").strip()
+    if explicit:
+        return _positive_env_float("OPPORTUNITY_RADAR_BROWSER_CLOSE_BOUND_SECONDS", 0.0) or 60.0
+    return (
+        _browser_chromium_grace_seconds()
+        + _browser_driver_grace_seconds()
+        + 4 * _browser_kill_grace_seconds()
+        + 15.0
+    )
 
 
 def _browser_kill_grace_seconds() -> float:
@@ -1056,6 +1260,175 @@ def _reap_browser_process_tree(recorded: Mapping[int, int]) -> bool:
     return _wait_until(roots_gone, _browser_kill_grace_seconds())
 
 
+class BrowserTeardownAbandoned(RuntimeError):
+    """A Playwright call exceeded its hard bound and was abandoned.
+
+    Raised *into* the wedged worker thread so it can unwind. The browser and its
+    Playwright connection are unusable afterwards; the caller must treat the
+    collection as failed (non-authoritative) and must not reuse either object.
+
+    CPython delivers an asynchronous exception by *type*, so this carries its own
+    default message: callers that format ``str(exc)`` must not get an empty
+    string.
+    """
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(
+            *(args or ("A Playwright call exceeded its hard bound and was abandoned.",))
+        )
+
+
+def _last_playwright_driver_failure() -> dict[str, Any] | None:
+    with _browser_diagnostics_lock:
+        return dict(_browser_diagnostics["last_driver_failure"] or {}) or None
+
+
+def _record_driver_failure(label: str, detail: str) -> None:
+    with _browser_diagnostics_lock:
+        _browser_diagnostics["last_driver_failure"] = {
+            "label": label,
+            "detail": detail[:300],
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        _browser_diagnostics["driver_failures"] = int(
+            _browser_diagnostics.get("driver_failures", 0)
+        ) + 1
+
+
+def _async_raise_in_thread(thread_id: int, exc_type: type[BaseException]) -> bool:
+    """Ask CPython to raise ``exc_type`` in ``thread_id`` at its next bytecode.
+
+    This is the only mechanism that can free a thread wedged in Playwright's sync
+    pump. ``SyncBase._sync`` runs ``while not task.done(): dispatcher.switch()``.
+    If the dispatcher greenlet has died -- which is what an abrupt Playwright
+    *driver* death during dispatch does -- ``switch()`` returns immediately and
+    the task can never complete, so the thread executes that loop forever at
+    100% CPU. It never blocks in a syscall, so no signal, timeout, or process
+    kill can reach it; but because it is executing pure Python bytecode it does
+    observe an asynchronous exception.
+    """
+
+    if not isinstance(thread_id, int) or thread_id <= 0:
+        return False
+    try:
+        changed = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread_id), ctypes.py_object(exc_type)
+        )
+    except BaseException:  # noqa: BLE001 - pragma: no cover - CPython API only
+        logger.exception("Could not deliver an asynchronous exception to thread %s.", thread_id)
+        return False
+    if changed > 1:  # pragma: no cover - defensive: never leave >1 thread marked
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), ctypes.c_long(0))
+        return False
+    return changed == 1
+
+
+def _silence_abandoned_playwright_loop(candidate: Any) -> None:
+    """Stop an abandoned Playwright connection reporting orphaned task exceptions.
+
+    The call we unwound left a task on Playwright's private event loop. It will
+    finish with a connection error nobody can retrieve, and asyncio reports each
+    one as ``Task exception was never retrieved`` -- the same noise that appeared
+    beside the production incident. The connection is unusable from here on, so
+    its loop is muted rather than left to narrate its own teardown.
+
+    Entirely best-effort: it reaches into Playwright internals, so every step is
+    guarded and a failure changes nothing.
+    """
+
+    seen: set[int] = set()
+    targets = [candidate, getattr(candidate, "_impl_obj", None), getattr(candidate, "_browser", None)]
+    for target in targets:
+        if target is None:
+            continue
+        loop = getattr(target, "_loop", None)
+        if loop is None:
+            impl = getattr(target, "_impl_obj", None)
+            loop = getattr(impl, "_loop", None)
+        if loop is None or id(loop) in seen:
+            continue
+        seen.add(id(loop))
+        try:
+            loop.set_exception_handler(
+                lambda _loop, context: logger.debug(
+                    "Ignoring orphaned task from an abandoned Playwright connection: %s",
+                    context.get("message"),
+                )
+            )
+        except BaseException:  # noqa: BLE001 - pragma: no cover - defensive
+            logger.debug("Could not mute an abandoned Playwright loop.", exc_info=True)
+
+
+@contextlib.contextmanager
+def hard_bounded_playwright_call(label: str, timeout: float):
+    """Run a Playwright call that must never be allowed to wedge its worker.
+
+    On expiry the calling thread is unwound with :class:`BrowserTeardownAbandoned`.
+    The caller is expected to catch it, treat the browser work as failed, and
+    stop using the Playwright objects involved.
+    """
+
+    owner = threading.get_ident()
+    finished = threading.Event()
+    fired = threading.Event()
+
+    def watchdog() -> None:
+        if finished.wait(timeout):
+            return
+        fired.set()
+        _record_driver_failure(label, f"exceeded its {timeout:.1f}s hard bound")
+        logger.critical(
+            "%s exceeded its %.1fs hard bound. The Playwright driver is unreachable and the "
+            "worker thread cannot make progress; abandoning the call so it cannot spin.",
+            label,
+            timeout,
+        )
+        _async_raise_in_thread(owner, BrowserTeardownAbandoned)
+
+    thread = threading.Thread(target=watchdog, name=f"pw-bound-{label}"[:14], daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        thread.join(timeout=5.0)
+        if fired.is_set():
+            # The exception may still be in flight if the call returned just as
+            # the watchdog fired. Absorb it here rather than let it surface on
+            # unrelated work later in this thread.
+            try:
+                for _ in range(64):
+                    pass
+            except BrowserTeardownAbandoned:  # pragma: no cover - timing dependent
+                pass
+
+
+@contextlib.contextmanager
+def protected_playwright_session(label: str):
+    """``sync_playwright()`` whose teardown can never wedge the calling thread.
+
+    ``sync_playwright().__exit__`` calls ``stop()``, which is itself a sync
+    Playwright call and therefore subject to the same wedge as ``close()``.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    playwright = sync_playwright().start()
+    try:
+        yield playwright
+    finally:
+        try:
+            with hard_bounded_playwright_call(f"{label} playwright.stop()", _browser_stop_bound_seconds()):
+                playwright.stop()
+        except BrowserTeardownAbandoned:
+            logger.critical(
+                "%s: Playwright.stop() was abandoned; its driver process is reaped separately.",
+                label,
+            )
+        except BaseException:  # noqa: BLE001
+            logger.warning("%s: Playwright.stop() raised; continuing.", label, exc_info=True)
+
+
 class _CloseGuard:
     """Bounds ``_LeasedBrowser.close()`` without touching Playwright objects.
 
@@ -1196,8 +1569,30 @@ class _LeasedBrowser:
         guard.start()
         result: Any = None
         close_error: BaseException | None = None
+        abandoned = False
         try:
-            result = self._browser.close(*args, **kwargs)
+            # The guard below can free a close() that is *blocked* on a live but
+            # wedged driver. It cannot free one that is *spinning*: when the
+            # driver dies abruptly mid-dispatch, Playwright's sync pump busy-loops
+            # on a dispatcher that will never complete the task, consuming a whole
+            # core and never returning. Only unwinding the thread ends that, so
+            # the whole call carries an outer hard bound.
+            with hard_bounded_playwright_call(
+                "Leased browser close()", _browser_close_bound_seconds()
+            ):
+                result = self._browser.close(*args, **kwargs)
+        except BrowserTeardownAbandoned as exc:
+            abandoned = True
+            close_error = exc
+            _silence_abandoned_playwright_loop(self._browser)
+            with _browser_diagnostics_lock:
+                _browser_diagnostics["abandoned_teardowns"] = int(
+                    _browser_diagnostics.get("abandoned_teardowns", 0)
+                ) + 1
+            logger.critical(
+                "Leased browser close() was abandoned after its hard bound; the Playwright "
+                "connection is unusable. Continuing to the bounded process reap.",
+            )
         except Exception as exc:  # noqa: BLE001 - a dead/hung browser is expected here
             close_error = exc
             logger.warning(
@@ -1211,7 +1606,15 @@ class _LeasedBrowser:
                 + 3 * _browser_kill_grace_seconds()
                 + 5.0
             )
+            if abandoned and self._driver_proc is not None:
+                # The Playwright connection is unusable; make sure its driver
+                # cannot linger holding the Chromium tree open.
+                driver_pid, driver_start = self._driver_proc
+                if _proc_alive(driver_pid, driver_start):
+                    _signal_pids({driver_pid}, _SIGKILL)
             terminated = _reap_browser_process_tree(self._procs)
+            with _browser_diagnostics_lock:
+                _browser_diagnostics["last_completion_at"] = _utc_stamp()
             if terminated and guard_finished:
                 self._release()
             else:

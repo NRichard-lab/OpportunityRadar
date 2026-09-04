@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
+from backend.outbound_security import (
+    install_playwright_url_guard,
+    launch_playwright_chromium,
+    protected_playwright_session,
+    safe_page_goto,
+)
 from collectors.base import BaseCollector
 from excel_tools import stable_company_id
 from job_tools import CollectionNotAuthoritative, JobRecord, make_job_id
@@ -23,7 +28,6 @@ class PaycorCollector(BaseCollector):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_browser_path)
 
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
 
         source_url, source_type = self.source_url(company)
         if not source_url:
@@ -31,7 +35,7 @@ class PaycorCollector(BaseCollector):
         source_url = self.resolve_embedded_job_board_url(source_url, "Paycor")
 
         jobs: list[JobRecord] = []
-        with sync_playwright() as playwright:
+        with protected_playwright_session(__name__) as playwright:
             browser = launch_playwright_chromium(playwright, headless=True)
             # Releasing this leased browser is mandatory on every exit path so the
             # single-Chromium launch lease is never stranded by a mid-scrape error.

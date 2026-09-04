@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin
 
-from backend.outbound_security import install_playwright_url_guard, launch_playwright_chromium, safe_page_goto
+from backend.outbound_security import (
+    install_playwright_url_guard,
+    launch_playwright_chromium,
+    protected_playwright_session,
+    safe_page_goto,
+)
 from job_platforms import detect_job_platform
 
 
@@ -73,7 +78,6 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
 
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
     except ImportError:
         return {
             "final_url": None,
@@ -83,7 +87,7 @@ def discover_job_board_with_browser(careers_url: str, company_name: str) -> dict
             "clicked_text": None,
         }
 
-    with sync_playwright() as playwright:
+    with protected_playwright_session(__name__) as playwright:
         browser = launch_playwright_chromium(playwright, headless=True)
         try:
             return _discover_with_launched_browser(
