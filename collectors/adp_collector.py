@@ -352,6 +352,12 @@ def build_job(
         collectedAt=datetime.now().astimezone().replace(microsecond=0).isoformat(),
         rawData={
             "collector": ADPCollector.__name__,
+            # The requisition API already identifies every item as a posting.
+            # Without this flag the record-level check re-validates the title with
+            # the generic-page heuristic, which discards real ADP roles whose
+            # titles contain page-furniture tokens ("benefits", "locations",
+            # "culture", "accessibility") or that are short.
+            "structuredSource": True,
             "sourceType": source_type,
             "externalJobId": external_id,
             "itemID": str(listing.get("itemID") or ""),

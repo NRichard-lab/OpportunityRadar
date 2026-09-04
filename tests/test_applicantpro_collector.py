@@ -137,6 +137,36 @@ class ApplicantProCollectionTests(unittest.TestCase):
         self.assertIn("Collector I", [job.title for job in jobs])
         self.assertEqual(self.collector.rejected_count, 0)
 
+    def test_records_are_marked_as_a_structured_source(self) -> None:
+        # is_valid_job_record re-checks every title, and without this flag it uses
+        # the generic-page heuristic instead of the structured one. That silently
+        # discarded real postings after collection: "Payroll and Benefits
+        # Administrator" ("benefits" is a page-furniture token) and short roles
+        # such as "Collector I" never reached storage.
+        from job_tools import is_valid_job_record
+
+        jobs = run(ApplicantProCollector(delay_seconds=0), Transport())
+        for job in jobs:
+            with self.subTest(title=job.title):
+                self.assertTrue(job.rawData["structuredSource"])
+                self.assertTrue(is_valid_job_record(job))
+
+    def test_a_title_containing_page_furniture_words_survives_record_validation(self) -> None:
+        from job_tools import is_valid_job_record
+
+        jobs = run(ApplicantProCollector(delay_seconds=0), Transport())
+        template = jobs[0]
+        for title in [
+            "Payroll and Benefits Administrator",
+            "Branch Locations Manager",
+            "Culture and Engagement Manager",
+            "Accessibility Analyst",
+            "Collector I",
+        ]:
+            with self.subTest(title=title):
+                template.title = title
+                self.assertTrue(is_valid_job_record(template))
+
     def test_job_ids_are_stable_across_refreshes(self) -> None:
         first = run(ApplicantProCollector(delay_seconds=0), Transport())
         second = run(ApplicantProCollector(delay_seconds=0), Transport())

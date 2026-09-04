@@ -262,6 +262,12 @@ class ApplicantProFamilyCollector(BaseCollector):
             collectedAt=datetime.now(timezone.utc).isoformat(),
             rawData={
                 "collector": self.__class__.__name__,
+                # The listing endpoint already identifies every item as a posting.
+                # Without this flag the record-level check falls back to the
+                # generic-page title heuristic, which drops real structured roles
+                # such as "Payroll and Benefits Administrator" ("benefits" is a
+                # page-furniture token) and short titles like "Collector I".
+                "structuredSource": True,
                 "sourceType": source_type,
                 "tenant": tenant,
                 "vendorDomain": self.vendor_domain,

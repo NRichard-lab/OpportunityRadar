@@ -158,6 +158,26 @@ class ADPCollectorTests(unittest.TestCase):
         self.assertEqual(receptionist.workType, "Not Listed")
         application_support = next(job for job in jobs if job.title == "Application Support Analyst")
         self.assertFalse(application_support.rawData["detailRetrieved"])
+        # The requisition API identifies each item as a posting. Without this flag
+        # is_valid_job_record re-checks the title with the generic-page heuristic
+        # and discards real roles containing page-furniture words.
+        self.assertTrue(all(job.rawData["structuredSource"] for job in jobs))
+
+    def test_structured_titles_survive_record_validation(self) -> None:
+        from job_tools import is_valid_job_record
+
+        pages = {1: {"jobRequisitions": self.records[:1], "meta": {"startSequence": 1, "totalNumber": 1}}}
+        with patch.object(ADPCollector, "get", new=response_router(pages, self.details, [])):
+            job = ADPCollector(delay_seconds=0).collect(self.company)[0]
+        for title in [
+            "Payroll and Benefits Administrator",
+            "Branch Locations Manager",
+            "Culture and Engagement Manager",
+            "Controller",
+        ]:
+            with self.subTest(title=title):
+                job.title = title
+                self.assertTrue(is_valid_job_record(job))
 
     def test_duplicate_external_id_is_not_saved_twice(self) -> None:
         same_title_different_id = requisition("102", "Community Banking Specialist")
